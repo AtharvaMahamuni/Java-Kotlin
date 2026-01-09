@@ -1,4 +1,4 @@
-package DS;
+package Java.DS;
 
 import java.util.HashMap;
 

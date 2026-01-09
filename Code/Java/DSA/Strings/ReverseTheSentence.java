@@ -1,4 +1,4 @@
-package DSA.Strings;
+package Java.DSA.Strings;
 
 public class ReverseTheSentence {
 

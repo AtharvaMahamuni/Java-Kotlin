@@ -1,4 +1,4 @@
-package DSA.Strings;
+package Java.DSA.Strings;
 
 import java.util.HashSet;
 
