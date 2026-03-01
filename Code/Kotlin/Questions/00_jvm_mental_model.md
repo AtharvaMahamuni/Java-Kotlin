@@ -1,0 +1,504 @@
+# Phase 0: JVM Mental Model
+
+> **Must be understood first — every phase builds on this.**
+
+## Navigation
+| Phase | File |
+|-------|------|
+| **0 — JVM Mental Model** | ← You are here |
+| 1 — Type System | [01_type_system_foundations.md](01_type_system_foundations.md) |
+| 2 — Classes & Objects | [02_classes_and_objects.md](02_classes_and_objects.md) |
+| 2.5 — Initialization | [02_5_initialization_mechanics.md](02_5_initialization_mechanics.md) |
+| 3 — Generics & Variance | [03_generics_and_variance.md](03_generics_and_variance.md) |
+| 4 — Functions & Lambdas | [04_functions_lambdas_inlining.md](04_functions_lambdas_inlining.md) |
+| 5 — Properties & Delegation | [05_properties_and_delegation.md](05_properties_and_delegation.md) |
+| 6 — Extension Functions | [06_extension_functions.md](06_extension_functions.md) |
+| 7 — Collections & Sequences | [07_collections_and_sequences.md](07_collections_and_sequences.md) |
+| 8 — Other Kotlin Features | [08_other_kotlin_features.md](08_other_kotlin_features.md) |
+| 9 — Coroutines Mechanics | [09_coroutines_execution_mechanics.md](09_coroutines_execution_mechanics.md) |
+| 10 — Structured Concurrency | [10_structured_concurrency.md](10_structured_concurrency.md) |
+| 11 — Flow | [11_flow.md](11_flow.md) |
+| 12 — Reflection & References | [12_reference_operators_and_reflection.md](12_reference_operators_and_reflection.md) |
+| 13 — Android Architecture | [13_android_architecture.md](13_android_architecture.md) |
+| 14 — Jetpack Components | [14_jetpack_components.md](14_jetpack_components.md) |
+| 15 — Networking | [15_networking.md](15_networking.md) |
+| 16 — Android System Internals | [16_android_system_internals.md](16_android_system_internals.md) |
+| 17 — Performance & Memory | [17_performance_and_memory.md](17_performance_and_memory.md) |
+| Master Chains | [master_chains.md](master_chains.md) |
+
+---
+
+## Q0.1 — Primitives vs References
+
+> **Connects to:** [Q1.1 (val stores primitives)](01_type_system_foundations.md#q11--val-vs-const-val) · [Q5.1 (lateinit can't use null with primitives)](05_properties_and_delegation.md#q51--lateinit-internals) · [Q3.3 (reified erases to Object)](03_generics_and_variance.md#q33--reified-type-parameters)
+
+### First Principles: Why Two Kinds of Types?
+
+The JVM was designed in the mid-1990s to run on machines with limited memory. Two competing needs:
+1. **Performance** — numeric data must be fast (no pointer indirection)
+2. **Polymorphism** — everything must fit into a common `Object` container
+
+The solution: **two type systems** living side by side.
+
+---
+
+### What is a JVM Primitive?
+
+A **primitive** is a value that lives **directly** in memory — no pointer, no header, no identity.
+
+| Primitive | Size | Default | JVM mnemonic |
+|-----------|------|---------|--------------|
+| `byte` | 8 bits | `0` | `B` |
+| `short` | 16 bits | `0` | `S` |
+| `int` | 32 bits | `0` | `I` |
+| `long` | 64 bits | `0L` | `J` |
+| `float` | 32 bits | `0.0f` | `F` |
+| `double` | 64 bits | `0.0` | `D` |
+| `boolean` | 1 bit (JVM uses int) | `false` | `Z` |
+| `char` | 16 bits (Unicode) | `'\u0000'` | `C` |
+
+A **reference type** is a pointer (4 or 8 bytes) to an object on the heap. The object itself has:
+- **Object header** (8–16 bytes): class pointer + mark word (GC/lock info)
+- **Fields**: actual data
+
+```
+PRIMITIVE (int x = 42):            REFERENCE (Integer x = 42):
+
+Stack Frame                         Stack Frame        Heap
+┌──────────────┐                   ┌──────────────┐   ┌──────────────────┐
+│  x = 42      │ ← value is HERE   │  x = 0x7f3a  │──▶│ Object header    │
+└──────────────┘                   └──────────────┘   │ (16 bytes)       │
+                                                       │ value = 42       │
+                                                       └──────────────────┘
+```
+
+### Why Do Primitives Have Default Values But References Default to `null`?
+
+**Primitives default to zero** because the JVM guarantees that class fields are zero-initialized before the `<init>` method runs. This maps naturally: `0` for numbers, `false` for boolean, `'\u0000'` for char.
+
+**Reference types default to `null`** because `null` is the "no object pointed to" sentinel — a zero/empty pointer (typically the literal address `0x0` or a reserved null-pointer region).
+
+```kotlin
+class Example {
+    var count: Int = 0          // JVM guarantee: zero-initialized → 0
+    var name: String? = null    // JVM guarantee: zero-initialized → null pointer
+    var flag: Boolean = false   // zero-initialized → false
+}
+```
+
+> **Interview Answer:** Primitives are value types stored directly; the JVM zeroes all memory before initialization, so their zero-value IS the default. References are pointers; a pointer-to-nothing is `null` (address zero). This isn't a language choice — it's the JVM memory model.
+
+---
+
+### Stack vs Heap
+
+```
+                    JVM Memory Layout
+┌─────────────────────────────────────────────────────┐
+│  METHOD AREA (Metaspace)                            │
+│  Class definitions, static fields, bytecode        │
+├─────────────────────────────────────────────────────┤
+│  HEAP                                               │
+│  ┌─────────────────────────────────────────────┐   │
+│  │  Young Gen    │  Old Gen   │  (String pool)  │   │
+│  │  new objects  │  survived  │                 │   │
+│  └─────────────────────────────────────────────┘   │
+├─────────────────────────────────────────────────────┤
+│  STACK (one per thread)                             │
+│  ┌────────────────────┐                             │
+│  │  Frame: main()     │ ← current method            │
+│  │   int x = 5        │   primitive stored HERE     │
+│  │   String* s = ───────────────────────────────▶  │
+│  ├────────────────────┤                             │
+│  │  Frame: foo()      │ ← calling method            │
+│  └────────────────────┘                             │
+└─────────────────────────────────────────────────────┘
+```
+
+- **Local primitive variables** (`int`, `boolean`, `long`) live on the **stack** inside their method's frame.
+- **Objects** always live on the **heap**.
+- **Local reference variables** are on the **stack** — but they *point into* the heap.
+- **Instance/static fields** live in the object on the heap (or Metaspace for `static`).
+
+```kotlin
+fun compute() {
+    val x = 42          // int on stack — no heap allocation
+    val s = "hello"     // reference on stack → String object on heap
+    val n = Integer(42) // reference on stack → Integer object on heap
+}
+```
+
+---
+
+### Boxing and Unboxing
+
+**Boxing** = wrapping a primitive in a reference type object.
+**Unboxing** = extracting the primitive from the wrapper object.
+
+```java
+// Java — explicit boxing visible
+int x = 5;
+Integer boxed = Integer.valueOf(x);  // Boxing: allocates heap object
+int back = boxed.intValue();          // Unboxing: reads field, discards object
+```
+
+```kotlin
+// Kotlin — same thing happens invisibly
+var x: Int = 5          // → int (primitive)
+var y: Int? = x         // → Integer (boxed!) — Int? maps to java.lang.Integer
+```
+
+**Bytecode for boxing:**
+```bytecode
+BIPUSH 5
+INVOKESTATIC java/lang/Integer.valueOf (I)Ljava/lang/Integer;  // Boxing
+```
+
+**Runtime cost of boxing:**
+1. **Heap allocation** — GC must eventually collect the wrapper
+2. **Cache miss** — wrapper on heap, value accessed via pointer (indirection)
+3. **Integer cache only -128 to 127** — outside this range, every box is a fresh allocation
+
+```kotlin
+// TRAP: boxing in a hot loop
+fun sumBoxed(list: List<Int>): Int {  // List<Int> = List<Integer> on JVM
+    var sum = 0
+    for (item in list) {              // unbox Integer → int on every iteration
+        sum += item
+    }
+    return sum
+}
+
+// BETTER: use IntArray (primitive array)
+fun sumPrimitive(arr: IntArray): Int {
+    var sum = 0
+    for (item in arr) {   // no boxing — directly reads int
+        sum += item
+    }
+    return sum
+}
+```
+
+> **Key Takeaway:** Boxing is automatic but not free. Every `Int?`, every `List<Int>`, every generic container that holds an `Int` forces boxing. In tight loops or large datasets, this causes measurable GC pressure.
+
+---
+
+## Q0.2 — JVM Type Mapping
+
+> **Connects to:** [Q5.1 (why lateinit forbids Int)](05_properties_and_delegation.md#q51--lateinit-internals) · [Q3.1 (erasure works on Object)](03_generics_and_variance.md#q31--type-erasure) · [Q7.1 (IntArray vs Array)](07_collections_and_sequences.md#q71--kotlins-collection-hierarchy)
+
+### Kotlin Type → JVM Type Mapping
+
+| Kotlin Type | JVM Type | Boxed? | Notes |
+|-------------|----------|--------|-------|
+| `Int` | `int` | No | When not nullable or in generics |
+| `Int?` | `java.lang.Integer` | Yes | Always boxed |
+| `Long` | `long` | No | |
+| `Long?` | `java.lang.Long` | Yes | |
+| `Boolean` | `boolean` | No | |
+| `Boolean?` | `java.lang.Boolean` | Yes | |
+| `Double` | `double` | No | |
+| `Double?` | `java.lang.Double` | Yes | |
+| `String` | `java.lang.String` | N/A | Already a reference type |
+| `String?` | `java.lang.String` | N/A | Same type, null allowed |
+| `IntArray` | `int[]` | No | Primitive array |
+| `Array<Int>` | `Integer[]` | Yes | Object array, always boxed |
+| `List<Int>` | `List<Integer>` | Yes | Generics erase to Object |
+
+### The Rule: When Does Kotlin Box?
+
+```
+Kotlin boxes Int when:
+1. The type is nullable: Int?
+2. The type appears in a generic position: List<Int>, Map<String, Int>
+3. The receiver of an extension function on a nullable type
+4. Any position that requires an Object (e.g., interface Any)
+```
+
+```kotlin
+// Decompiled view of what the Kotlin compiler does:
+
+val a: Int = 5           // → int a = 5;          (primitive)
+val b: Int? = 5          // → Integer b = 5;       (boxed)
+val c: Any = 5           // → Object c = Integer.valueOf(5); (boxed — Any = Object)
+
+fun takes(x: Int) {}     // → takes(int x)         (primitive param)
+fun takes(x: Int?) {}    // → takes(Integer x)      (boxed param)
+```
+
+### Why `List<Int>` Always Boxes
+
+Java's generics use **type erasure** — at runtime, `List<String>`, `List<Int>`, and `List<Animal>` are ALL just `List`. The JVM only knows the *erased* type, which must be an **Object**.
+
+Since `int` (primitive) is not an Object, the JVM cannot store it in `List`. It must box it to `Integer`.
+
+```kotlin
+val list = listOf(1, 2, 3)
+// At JVM level: List<Integer> containing boxed Integer objects
+// NOT: List<int> — that's impossible in Java generics
+```
+
+### `IntArray` vs `Array<Int>` Performance
+
+```kotlin
+// IntArray = int[] in JVM (primitive array — no boxing)
+val primitiveArray = IntArray(1_000_000) { it }
+
+// Array<Int> = Integer[] in JVM (object array — all boxed)
+val boxedArray = Array<Int>(1_000_000) { it }
+```
+
+**Memory comparison for 1 million integers:**
+```
+IntArray:   4 bytes × 1,000,000 = ~4 MB (+ small array header)
+Array<Int>: 16 bytes × 1,000,000 = ~16 MB (Integer object headers)
+            + 4 bytes × 1,000,000 =  ~4 MB (references in array)
+            Total: ~20 MB — 5× more memory!
+```
+
+**Iteration bytecode:**
+
+```bytecode
+// IntArray iteration:
+IALOAD   ; load int from primitive array — direct memory read
+
+// Array<Int> iteration:
+AALOAD   ; load reference (Integer) from object array
+INVOKEVIRTUAL java/lang/Integer.intValue  ; unbox on every access
+```
+
+> **Key Takeaway:** For numeric arrays in performance-sensitive code (data processing, image manipulation, game loops), always use `IntArray`, `LongArray`, `FloatArray` — never `Array<Int>`.
+
+---
+
+## Q0.3 — Class Loading and the `static {}` Block
+
+> **Connects to:** [Q2.4 (object singleton thread safety)](02_classes_and_objects.md#q24--the-object-keyword) · [Q2.5.4 (companion object init time)](02_5_initialization_mechanics.md#q254--companion-object-and-object-initialization)
+
+### JVM Class Loading Lifecycle
+
+```
+               JVM Class Loading Pipeline
+┌──────────────────────────────────────────────────────┐
+│                                                      │
+│  1. LOAD                                             │
+│     ClassLoader reads .class file from disk/jar     │
+│     Creates Class object in Metaspace                │
+│                    │                                 │
+│                    ▼                                 │
+│  2. LINK                                             │
+│     a. VERIFY   — bytecode safety checks             │
+│     b. PREPARE  — allocate static fields, set to 0  │
+│     c. RESOLVE  — resolve symbolic references        │
+│                    │                                 │
+│                    ▼                                 │
+│  3. INITIALIZE                                       │
+│     Run <clinit> (class initializer / static block) │
+│     Assign static field values                       │
+│     Run companion object initializers                │
+│                                                      │
+└──────────────────────────────────────────────────────┘
+```
+
+### When Does `static {}` Run?
+
+The class initializer (`<clinit>`) runs **exactly once**, the first time any of the following occur:
+1. An instance of the class is created (`new`)
+2. A static method of the class is called
+3. A static field of the class is **read or written** (unless it's a `compile-time constant`)
+
+```kotlin
+object DatabaseConfig {
+    val URL = "jdbc:sqlite:app.db"  // triggers <clinit> on first access
+    init {
+        println("DatabaseConfig initialized!")
+    }
+}
+
+// This triggers class loading + initialization:
+val url = DatabaseConfig.URL  // prints: "DatabaseConfig initialized!"
+
+// Second access: NO re-initialization (already done)
+val url2 = DatabaseConfig.URL  // prints nothing
+```
+
+**Exception:** `const val` (compile-time constant) is **inlined at the call site** — the class is never loaded!
+
+```kotlin
+object Constants {
+    const val TAG = "MyApp"   // inlined at call site, never triggers class loading
+    val VERSION = "1.0"       // triggers class loading when accessed
+}
+
+// This compiles to: Log.d("MyApp", ...) — no class loading!
+Log.d(Constants.TAG, "message")
+```
+
+### Thread Safety Guarantee
+
+The JVM specification (§5.5) guarantees that class initialization is **thread-safe by design**:
+- Only one thread executes `<clinit>`
+- Other threads trying to access the class block until initialization completes
+- The JVM uses an internal lock per class
+
+This is why Kotlin `object` (singleton) is thread-safe:
+
+```kotlin
+object Singleton {
+    // Initialized in <clinit> — JVM guarantees single-threaded execution
+    val instance = ExpensiveResource()
+}
+```
+
+```java
+// Decompiled — what JVM sees:
+public final class Singleton {
+    public static final Singleton INSTANCE;
+
+    static {  // <clinit> — JVM guarantees: runs once, thread-safe
+        INSTANCE = new Singleton();
+    }
+
+    private Singleton() {}
+}
+```
+
+> **Key Takeaway:** The JVM class initialization lock is what makes Kotlin `object` a free, thread-safe singleton — no `synchronized`, no `volatile`, no double-checked locking needed.
+
+---
+
+## Q0.4 — The JVM Call Stack
+
+> **Connects to:** [Q1.1 (val getter overhead)](01_type_system_foundations.md#q11--val-vs-const-val) · [Q4.2 (inline eliminates method call)](04_functions_lambdas_inlining.md#q42-inline-noinline-crossinline)
+
+### What Is a Stack Frame?
+
+Every method call creates a **stack frame** on the thread's call stack. The frame contains:
+- **Local variable table** — parameters and local variables (primitives stored directly, references stored as addresses)
+- **Operand stack** — working area for computations (the JVM's "registers")
+- **Return address** — where to jump when the method returns
+- **Reference to constant pool** — for resolving class/method names
+
+```
+           Thread Stack (grows downward)
+┌──────────────────────────────────────┐  ← Stack top (current frame)
+│  Frame: processUser(user: User)      │
+│  ┌─────────────────────────────┐    │
+│  │ Local vars: user=0x7f3a     │    │  ← reference to User on heap
+│  │             result=0        │    │  ← int stored directly
+│  │ Operand stack: [temp vals]  │    │
+│  └─────────────────────────────┘    │
+├──────────────────────────────────────┤
+│  Frame: loadData()                   │
+│  ┌─────────────────────────────┐    │
+│  │ Local vars: ...             │    │
+│  └─────────────────────────────┘    │
+├──────────────────────────────────────┤
+│  Frame: main()                       │
+└──────────────────────────────────────┘  ← Stack bottom
+```
+
+**Stack frame allocation cost:** Pushing a frame requires updating the stack pointer and initializing local variable slots. It's fast (nanoseconds), but not zero — calling a method has overhead vs reading a field directly.
+
+### Why Does Calling a Getter Cost More Than Reading a Field?
+
+**Accessing a field directly:**
+```bytecode
+GETFIELD com/example/MyClass.value : I   ; 1 instruction — read from object offset
+```
+
+**Calling a getter:**
+```bytecode
+ALOAD_0                                 ; push `this` onto operand stack
+INVOKEVIRTUAL com/example/MyClass.getValue ()I  ; dispatch + new stack frame
+; ... inside getValue():
+ALOAD_0                                 ; push `this` again
+GETFIELD com/example/MyClass.value : I  ; read field
+IRETURN                                 ; return, pop frame
+```
+
+The getter requires:
+1. Virtual method dispatch (look up vtable)
+2. New stack frame pushed
+3. Field access inside getter
+4. Frame popped on return
+
+For a simple getter on a `final` class, the JIT compiler will **inline it** and eliminate the overhead. But in hot paths with non-final classes, the virtual dispatch overhead is real.
+
+### Virtual Method Dispatch vs Direct Call
+
+```
+Virtual Dispatch (open/interface methods):
+┌──────────────────────────────────────────────────────┐
+│  Object has vtable pointer                           │
+│  object.method()                                     │
+│     │                                                │
+│     ├─ Load vtable address from object header        │
+│     ├─ Look up method index in vtable               │
+│     └─ Jump to method address                       │
+│                                                      │
+│  Vtable for Dog (extends Animal):                    │
+│  [0] → Object.toString()                            │
+│  [1] → Animal.breathe()                             │
+│  [2] → Dog.speak()  ← overridden                   │
+└──────────────────────────────────────────────────────┘
+
+Direct Call (final/private methods):
+┌──────────────────────────────────────────────────────┐
+│  INVOKESPECIAL or INVOKESTATIC                       │
+│  Compile-time resolved — no vtable lookup            │
+│  Jump directly to method address                     │
+└──────────────────────────────────────────────────────┘
+```
+
+| Call Type | Bytecode Instruction | When Used | Cost |
+|-----------|---------------------|-----------|------|
+| Virtual dispatch | `INVOKEVIRTUAL` | Open/override methods | vtable lookup |
+| Interface dispatch | `INVOKEINTERFACE` | Interface methods | vtable lookup (slower!) |
+| Direct call | `INVOKESPECIAL` | Private, constructors, `super` | No lookup |
+| Static call | `INVOKESTATIC` | Static methods, extensions | No lookup |
+
+**Why Kotlin's `final` default matters:**
+When a class is `final`, the JIT compiler knows there's only ONE possible implementation. It can devirtualize the call — replacing the vtable lookup with a direct jump. This is a significant optimization for frequently called methods.
+
+```kotlin
+// Kotlin: final by default → INVOKEVIRTUAL but JIT can devirtualize
+class Calculator {
+    fun add(a: Int, b: Int) = a + b  // JIT can inline this
+}
+
+// open: JIT must keep virtual dispatch (unknown subclass might override)
+open class OpenCalculator {
+    open fun add(a: Int, b: Int) = a + b  // harder for JIT to optimize
+}
+```
+
+> **Key Takeaway:** Virtual dispatch adds indirection. Kotlin's `final` default isn't just about safety — it's about enabling JIT optimizations. Every `open` method is a potential polymorphism point the JIT must remain pessimistic about.
+
+---
+
+## Master Summary: JVM Mental Model in 5 Points
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  1. PRIMITIVES live on the stack, hold their value directly.   │
+│     REFERENCES live on the stack too, but point to the heap.   │
+│                                                                 │
+│  2. Kotlin maps Int → int (primitive) unless nullable or in     │
+│     a generic position, where it maps to Integer (boxed).      │
+│                                                                 │
+│  3. Class initialization (<clinit>) runs once, thread-safely,  │
+│     on first meaningful access. This is the foundation of      │
+│     Kotlin `object` singleton safety.                          │
+│                                                                 │
+│  4. Method calls cost more than field reads: vtable lookup +   │
+│     stack frame push. JIT eliminates this for final classes.   │
+│                                                                 │
+│  5. Generics are erased at runtime — List<Int> is just List.   │
+│     This forces boxing wherever generics and primitives meet.  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+*Next: [Phase 1 — Type System Foundations →](01_type_system_foundations.md)*
