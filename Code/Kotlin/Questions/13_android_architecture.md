@@ -618,41 +618,278 @@ fun <T, E> networkBoundResource(
 }
 ```
 
-### Error Handling Across Layers
+### Optimistic Updates — Write Locally, Sync in Background
+
+Optimistic updates improve perceived performance: show the result immediately in the UI, then sync to the server in the background. If the server rejects it, roll back.
 
 ```kotlin
-// Data layer — map HTTP errors to domain errors:
-class UserRepositoryImpl : UserRepository {
-    override suspend fun getUser(id: String): Result<User> {
+// Repository — optimistic update with rollback:
+class PostRepository(private val api: PostApi, private val postDao: PostDao) {
+
+    suspend fun likePost(postId: String): Result<Unit> {
+        // 1. Optimistic write — update DB immediately:
+        postDao.updateLikeCount(postId, increment = +1)
+
         return try {
-            val response = api.getUser(id)
-            Result.success(response.toDomain())
-        } catch (e: HttpException) {
-            when (e.code()) {
-                401 -> Result.failure(AppError.Unauthorized)
-                404 -> Result.failure(AppError.NotFound("User $id"))
-                else -> Result.failure(AppError.ServerError(e.code()))
+            // 2. Sync to server:
+            api.likePost(postId)
+            Result.success(Unit)
+        } catch (e: Exception) {
+            // 3. Rollback on failure:
+            postDao.updateLikeCount(postId, increment = -1)
+            Result.failure(e)
+        }
+    }
+}
+```
+
+```
+Timeline:
+t=0ms:   User taps Like → DB updated immediately → UI shows "Liked" ✓
+t=0ms:   Network call starts in background
+t=300ms: Network succeeds → no action needed (DB already correct)
+         OR
+t=300ms: Network fails → DB rolled back → UI shows "Not liked" again
+```
+
+**Why Room + Flow makes rollback automatic:** Because UI observes Room via Flow, the rollback write automatically triggers a new emission — the UI reverts without any manual state management.
+
+### Conflict Resolution Strategies
+
+When offline edits and server data diverge, you need a strategy:
+
+| Strategy | Description | Use When |
+|----------|-------------|----------|
+| **Last-Write-Wins (LWW)** | Most recent timestamp wins, overwriting earlier writes | Simple data with infrequent edits; user settings |
+| **Server-Wins** | Server data always overrides local | Financial data, inventory; correctness > UX |
+| **Client-Wins** | Local data overrides server | Drafts; user's own content |
+| **Field-Level Merge** | Merge non-conflicting fields, flag conflicts for user | Collaborative documents; contact edits |
+| **CRDTs** (Conflict-free Replicated Data Types) | Mathematically guaranteed convergence, no conflicts possible | Counters, sets, distributed text editing |
+
+```kotlin
+// Last-Write-Wins implementation:
+data class Note(
+    val id: String,
+    val content: String,
+    val updatedAt: Long  // timestamp — LWW key
+)
+
+fun resolveConflict(local: Note, server: Note): Note {
+    return if (local.updatedAt > server.updatedAt) local else server
+    // Whoever wrote most recently wins
+}
+
+// Field-level merge (non-conflicting fields):
+fun mergeUser(local: User, server: User): User {
+    return User(
+        id = server.id,
+        name = if (local.nameUpdatedAt > server.nameUpdatedAt) local.name else server.name,
+        email = if (local.emailUpdatedAt > server.emailUpdatedAt) local.email else server.email,
+        // Fields not modified locally always take server value:
+        avatar = server.avatar
+    )
+}
+```
+
+---
+
+## Q13.7 — Error Handling Across Layers
+
+> **Builds on:** [Q10.3 — CancellationException](10_structured_concurrency.md#103-exception-handling-rules) · [Q13.2 — Clean Architecture](13_android_architecture.md#q132--clean-architecture-layer-boundaries)
+
+### First Principles: Why Layers Need Different Error Types
+
+The Data layer speaks HTTP (status codes, IOExceptions). The Domain layer should speak business language (UserNotFound, Unauthorized). The UI layer speaks user experience (show error dialog, navigate to login). Each layer has its own vocabulary — translation happens at the boundary.
+
+```
+HTTP 401 (Data layer term)
+    │ translated at Data→Domain boundary
+    ▼
+AppError.Unauthorized (Domain term)
+    │ translated at Domain→Presentation boundary
+    ▼
+UiState.Error.SessionExpired (UI term)
+    │
+    ▼
+Navigate to LoginScreen (user experience)
+```
+
+### Where HTTP Exceptions Should Be Converted
+
+**In the Data layer** — specifically in the repository implementation. Never let `HttpException` or `IOException` leak into the domain or presentation layers. Those are framework/library types — the domain should be framework-agnostic.
+
+```kotlin
+// WRONG — HttpException leaks into Domain/ViewModel:
+class UserViewModel : ViewModel() {
+    fun loadUser(id: String) {
+        viewModelScope.launch {
+            try {
+                val user = repository.getUser(id)
+                _state.value = UiState.Content(user)
+            } catch (e: HttpException) {       // HttpException is a Retrofit type!
+                if (e.code() == 401) { ... }   // domain logic knows about HTTP — BAD
             }
-        } catch (e: IOException) {
-            Result.failure(AppError.NetworkError)
         }
     }
 }
 
-// ViewModel — handles domain errors:
-fun loadUser(id: String) {
-    viewModelScope.launch {
-        when (val result = repository.getUser(id)) {
-            is Result.Success -> _uiState.value = UiState.Content(result.value)
-            is Result.Failure -> when (val error = result.exception) {
-                is AppError.Unauthorized -> _uiState.value = UiState.Error.Unauthorized
-                is AppError.NetworkError -> _uiState.value = UiState.Error.Offline
-                else -> _uiState.value = UiState.Error.Generic
+// CORRECT — Data layer translates, ViewModel speaks domain language:
+// Data layer:
+class UserRepositoryImpl : UserRepository {
+    override suspend fun getUser(id: String): User {
+        try {
+            return api.getUser(id).toDomain()
+        } catch (e: HttpException) {
+            throw when (e.code()) {
+                401 -> AppError.Unauthorized           // domain error
+                404 -> AppError.NotFound("User $id")   // domain error
+                500, 503 -> AppError.ServerError        // domain error
+                else -> AppError.Unknown(e.message())
+            }
+        } catch (e: IOException) {
+            throw AppError.NetworkError                 // domain error
+        }
+    }
+}
+```
+
+### The `sealed class AppError` Pattern
+
+A sealed class for domain errors gives the ViewModel exhaustive, type-safe error handling:
+
+```kotlin
+// Domain layer — AppError sealed hierarchy:
+sealed class AppError : Exception() {
+    object Unauthorized : AppError()            // needs re-login
+    object NetworkError : AppError()            // no connection
+    object ServerError : AppError()             // 5xx
+    data class NotFound(val resource: String) : AppError()
+    data class ValidationError(val field: String, val message: String) : AppError()
+    data class Unknown(val cause: String?) : AppError()
+}
+```
+
+**What this enables in the ViewModel:**
+
+```kotlin
+class UserViewModel(private val repository: UserRepository) : ViewModel() {
+
+    fun loadUser(id: String) {
+        viewModelScope.launch {
+            _state.value = UiState.Loading
+            try {
+                val user = repository.getUser(id)
+                _state.value = UiState.Content(user)
+            } catch (e: CancellationException) {
+                throw e  // MUST re-throw — never swallow!
+            } catch (e: AppError) {
+                _state.value = when (e) {
+                    is AppError.Unauthorized -> UiState.Error.SessionExpired
+                    is AppError.NetworkError -> UiState.Error.Offline
+                    is AppError.NotFound -> UiState.Error.NotFound(e.resource)
+                    is AppError.ServerError -> UiState.Error.ServerError
+                    else -> UiState.Error.Generic
+                }
             }
         }
     }
 }
 ```
+
+The `when (e)` is **exhaustive** — if you add a new `AppError` subtype and forget to handle it in the ViewModel, the compiler forces you to add the case. No silent unhandled errors.
+
+### Differentiating 401 vs 500 in the ViewModel
+
+```kotlin
+// UI state models for different error types:
+sealed class UiState {
+    object Loading : UiState()
+    data class Content(val user: User) : UiState()
+    sealed class Error : UiState() {
+        object SessionExpired : Error()   // 401 → navigate to login
+        object Offline : Error()          // no network → show retry
+        object ServerError : Error()      // 5xx → show "try again later"
+        data class NotFound(val resource: String) : Error()
+        object Generic : Error()
+    }
+}
+
+// Activity/Fragment observes and routes:
+viewModel.uiState.collect { state ->
+    when (state) {
+        is UiState.Error.SessionExpired -> {
+            // Clear auth tokens, navigate to login
+            authManager.clearTokens()
+            navController.navigate(R.id.loginFragment)
+        }
+        is UiState.Error.Offline -> {
+            snackbar.show("No internet connection. Tap to retry.")
+            retryButton.isVisible = true
+        }
+        is UiState.Error.ServerError -> {
+            snackbar.show("Something went wrong. Try again later.")
+        }
+        // ...
+    }
+}
+```
+
+### What Happens When `CancellationException` Hits `catch (e: Exception)`
+
+`CancellationException` is a subclass of `Exception` (via `IllegalStateException`). A `catch (e: Exception)` block will catch it — and if you don't re-throw, the coroutine continues running despite being cancelled.
+
+```kotlin
+// WRONG — swallows CancellationException:
+viewModelScope.launch {
+    try {
+        val user = repository.getUser(id)
+        _state.value = UiState.Content(user)
+    } catch (e: Exception) {          // catches CancellationException!
+        _state.value = UiState.Error.Generic  // runs even after cancel!
+    }
+}
+// viewModel.onCleared() calls viewModelScope.cancel()
+// → CancellationException thrown at repository.getUser()
+// → catch(e: Exception) catches it
+// → _state.value = UiState.Error.Generic  ← wrong! Should not show error on cancel
+// → coroutine finishes "normally" from scope's perspective — but scope is cancelled
+```
+
+```kotlin
+// CORRECT — always re-throw CancellationException:
+viewModelScope.launch {
+    try {
+        val user = repository.getUser(id)
+        _state.value = UiState.Content(user)
+    } catch (e: CancellationException) {
+        throw e  // re-throw FIRST, before general catch
+    } catch (e: AppError) {
+        _state.value = mapToUiError(e)
+    }
+}
+
+// OR: use the coroutines helper:
+try {
+    ...
+} catch (e: Exception) {
+    if (e is CancellationException) throw e  // re-throw
+    // handle other exceptions
+}
+```
+
+```
+CancellationException flow when swallowed vs re-thrown:
+
+Swallowed:
+  cancel() → CancellationException → catch(Exception) catches → coroutine
+  runs error handling → scope thinks it's still running → LEAK
+
+Re-thrown:
+  cancel() → CancellationException → re-thrown → coroutine terminates
+  cleanly → scope cleanup completes → no leak
+```
+
+> **Interview Trap:** This is one of the most common production bugs. `catch (e: Exception)` blocks in ViewModels that don't re-throw `CancellationException` cause coroutine leaks and show error UI when the user simply navigated away.
 
 ---
 
