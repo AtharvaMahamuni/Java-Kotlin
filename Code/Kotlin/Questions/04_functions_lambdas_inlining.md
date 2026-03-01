@@ -1,13 +1,14 @@
 # Phase 4: Functions, Lambdas, and Inlining
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 3 — Generics & Variance | [03_generics_and_variance.md](03_generics_and_variance.md) |
-| **4 — Functions & Lambdas** | ← You are here |
-| 5 — Properties & Delegation | [05_properties_and_delegation.md](05_properties_and_delegation.md) |
-| 6 — Extension Functions | [06_extension_functions.md](06_extension_functions.md) |
-| 7 — Collections & Sequences | [07_collections_and_sequences.md](07_collections_and_sequences.md) |
+[← Master Index](master_chains.md)
+
+## Questions in This File
+- [Q4.1 — Lambda Compilation](#q41--lambda-compilation)
+- [Q4.2 — `inline`, `noinline`, `crossinline`](#q42--inline-noinline-crossinline)
+- [Q4.3 — Higher-Order Functions with `suspend`](#q43--higher-order-functions-with-suspend)
+- [Q4.4 — Scope Functions](#q44--scope-functions)
+- [Q4.5 — Named and Default Parameters](#q45--named-and-default-parameters)
 
 ---
 
@@ -352,7 +353,8 @@ Without `inline`, every call to `.map {}` would allocate a `Function1` object fo
 
 ## Q4.3 — Higher-Order Functions with `suspend`
 
-> **Connects to:** [Q9.1 (what suspend does)](09_coroutines_execution_mechanics.md) · [Q10.3 (CancellationException)](10_structured_concurrency.md)
+> **Builds on:** [Q4.1 — Lambda Compilation](04_functions_lambdas_inlining.md#q41--lambda-compilation) · [Q4.2 — inline](04_functions_lambdas_inlining.md#q42--inline-noinline-crossinline)
+> **Connects to:** [Q9.1 — What suspend does](09_coroutines_execution_mechanics.md#q91--what-suspend-actually-does) · [Q10.3 — CancellationException rules](10_structured_concurrency.md#q103--exception-handling-rules)
 
 ### How a `suspend` Lambda Differs from a Regular Lambda
 
@@ -409,7 +411,7 @@ delay(1000) inside suspend:
 
 `Thread.sleep` is a blocking JVM call — it tells the OS to put the thread to sleep. The coroutine runtime doesn't know about it, so it can't use the thread for other work.
 
-`delay` is coroutine-aware — it registers a timer callback and returns `COROUTINE_SUSPENDED`, freeing the thread for other coroutines.
+[`delay`](09_coroutines_execution_mechanics.md#q91--what-suspend-actually-does) is coroutine-aware — it registers a timer callback and returns `COROUTINE_SUSPENDED`, freeing the thread for other coroutines.
 
 ### `retryWithBackoff` — The `CancellationException` Rule
 
@@ -439,7 +441,7 @@ suspend fun <T> retryWithBackoff(
 
 **Why `CancellationException` must ALWAYS be re-thrown:**
 
-`CancellationException` is the coroutine cancellation signal. When a coroutine is cancelled (e.g., `job.cancel()`), the runtime throws `CancellationException` at the next suspension point. If you catch it and don't re-throw, the coroutine doesn't know it's been cancelled — it continues running.
+[`CancellationException`](10_structured_concurrency.md#q103--exception-handling-rules) is the coroutine cancellation signal. When a coroutine is cancelled (e.g., `job.cancel()`), the runtime throws `CancellationException` at the next suspension point. If you catch it and don't re-throw, the coroutine doesn't know it's been cancelled — it continues running.
 
 ```kotlin
 // WRONG — swallowing CancellationException causes coroutine leak:
@@ -478,6 +480,8 @@ throws CancellationException
 
 ## Q4.4 — Scope Functions
 
+> **Builds on:** [Q4.2 — inline functions](04_functions_lambdas_inlining.md#q42--inline-noinline-crossinline) · [Q4.1 — lambda compilation](04_functions_lambdas_inlining.md#q41--lambda-compilation)
+> **Connects to:** [Q6.2 — Extension Functions as API Design](06_extension_functions.md#q62--extension-functions-as-api-design)
 > **Reference:** [Kotlin Docs — Scope Functions](https://kotlinlang.org/docs/scope-functions.html)
 
 ### The Five Scope Functions — Bytecode Reality
@@ -561,7 +565,8 @@ Do you want to...
 
 ## Q4.5 — Named and Default Parameters
 
-> **Connects to:** [Q2.5.2 (secondary constructors)](02_5_initialization_mechanics.md#q252--primary-vs-secondary-constructors)
+> **Builds on:** [Q2.5.2 — Secondary Constructors](02_5_initialization_mechanics.md#q252--primary-vs-secondary-constructors)
+> **Connects to:** [Q2.5.6 — @JvmOverloads and Java interop](02_5_initialization_mechanics.md#q256--constructor-visibility-and-factory-patterns)
 > **Reference:** [Kotlin Docs — Default arguments](https://kotlinlang.org/docs/functions.html#default-arguments)
 
 ### What Bytecode Does a Function With Default Parameters Compile To?

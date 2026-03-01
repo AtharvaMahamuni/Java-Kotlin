@@ -1,36 +1,20 @@
 # Phase 9: Coroutines — Execution Mechanics
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 00 | JVM Mental Model |
-| 01 | Type System Foundations |
-| 02 | Classes and Objects |
-| 02.5 | Initialization and Construction Mechanics |
-| 03 | Generics and Variance |
-| 04 | Functions, Lambdas, and Inlining |
-| 05 | Properties and Delegation |
-| 06 | Extension Functions |
-| 07 | Collections and Sequences |
-| 08 | Other Kotlin Features |
-| **09** | **Coroutines — Execution Mechanics (THIS FILE)** |
-| 10 | [Structured Concurrency](./10_structured_concurrency.md) |
-| 11 | Flow |
-| 12 | Reference Operators and Reflection |
-| 13 | Android Architecture |
-| 14 | Jetpack Components |
-| 15 | Networking |
-| 16 | Android System Internals |
-| 17 | Performance and Memory |
-| master | Master Follow-Up Chains |
+[← Master Index](master_chains.md)
 
-**Cross-references in this file:**
-- Builds on: Q4.3 (suspend lambdas), Q0.1 (stack vs heap), Q0.4 (call stack)
-- Leads to: Q10 (structured concurrency), Q11 (Flow), Q17.4 (testing coroutines)
+## Questions in This File
+- [Q9.1 — What `suspend` Actually Does](#q91--what-suspend-actually-does)
+- [Q9.2 — Coroutine Context and Dispatchers](#q92--coroutine-context-and-dispatchers)
+- [Q9.3 — `launch` vs `async`](#q93--launch-vs-async)
+- [Q9.4 — Coroutine Start Modes](#q94--coroutine-start-modes)
 
 ---
 
-## 9.1 What `suspend` Actually Does
+## Q9.1 — What `suspend` Actually Does
+
+> **Builds on:** [Q0.1 — Stack vs Heap (locals become heap fields)](00_jvm_mental_model.md#q01--primitives-vs-references) · [Q0.4 — JVM Call Stack](00_jvm_mental_model.md#q04--the-jvm-call-stack)
+> **Connects to:** [Q9.2 — Dispatchers](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers) · [Q10.1 — Job Hierarchy](10_structured_concurrency.md#q101--the-job-hierarchy) · [Q4.3 — suspend lambdas](04_functions_lambdas_inlining.md#q43--higher-order-functions-with-suspend)
 
 ### The Core Question: What Is Continuation Passing Style (CPS)?
 
@@ -256,7 +240,7 @@ The `COROUTINE_SUSPENDED` return value is the signal: "do not call me again dire
 - It participates in the CPS transformation
 - It can only be called from other `suspend` functions or coroutine builders
 
-It says absolutely **nothing** about threading. The thread on which a `suspend` function runs is determined entirely by the **Dispatcher** in the coroutine's context.
+It says absolutely **nothing** about threading. The thread on which a `suspend` function runs is determined entirely by the [**Dispatcher**](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers) in the coroutine's context.
 
 ```kotlin
 // This runs on the Main thread:
@@ -297,7 +281,10 @@ These are orthogonal concerns. A `suspend` function on `Dispatchers.Main` runs o
 
 ---
 
-## 9.2 Coroutine Context and Dispatchers
+## Q9.2 — Coroutine Context and Dispatchers
+
+> **Builds on:** [Q9.1 — CPS and suspend](09_coroutines_execution_mechanics.md#q91--what-suspend-actually-does)
+> **Connects to:** [Q10.4 — Lifecycle Scopes](10_structured_concurrency.md#q104--lifecycle-scopes-and-process-death) · [Q13.3 — viewModelScope](13_android_architecture.md#q133--viewmodel-internals)
 
 ### What Is a `CoroutineContext`?
 
@@ -330,7 +317,7 @@ interface CoroutineContext {
 
 ### The `+` Operator: Combining Contexts
 
-The `+` operator on two `CoroutineContext` objects **merges them, with the right-hand side winning on key conflicts**.
+The `+` operator on two `CoroutineContext` objects **merges them, with the right-hand side winning on key conflicts** (see [Q10.1 — Job Hierarchy](10_structured_concurrency.md#q101--the-job-hierarchy) for the Job tree structure).
 
 ```kotlin
 val context1 = Dispatchers.IO + CoroutineName("Fetcher")
@@ -492,7 +479,10 @@ This is useful when you have a resource that supports limited simultaneous acces
 
 ---
 
-## 9.3 `launch` vs `async`
+## Q9.3 — `launch` vs `async`
+
+> **Builds on:** [Q9.1 — suspend mechanics](09_coroutines_execution_mechanics.md#q91--what-suspend-actually-does) · [Q9.2 — CoroutineContext](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
+> **Connects to:** [Q10.2 — coroutineScope vs supervisorScope](10_structured_concurrency.md#q102--coroutinescope-vs-supervisorscope) · [Q10.3 — Exception handling](10_structured_concurrency.md#q103--exception-handling-rules)
 
 ### Type Hierarchy: `Job` vs `Deferred<T>`
 
@@ -608,7 +598,7 @@ try {
 }
 ```
 
-The coroutine body executes asynchronously. It has its own call stack, which is completely separate from the stack that contains the `try-catch`. Exceptions from inside `launch` travel through the **coroutine hierarchy** (via `childCancelled`), not through the JVM call stack.
+The coroutine body executes asynchronously. It has its own call stack, which is completely separate from the stack that contains the `try-catch`. Exceptions from inside `launch` travel through the **coroutine hierarchy** (via `childCancelled`) — see [Job hierarchy](10_structured_concurrency.md#q101--the-job-hierarchy) — not through the JVM call stack.
 
 **What DOES work:**
 
@@ -697,7 +687,10 @@ val result = a.await() + b.await() // now truly parallel
 
 ---
 
-## 9.4 Coroutine Start Modes
+## Q9.4 — Coroutine Start Modes
+
+> **Builds on:** [Q9.3 — launch vs async](09_coroutines_execution_mechanics.md#q93--launch-vs-async) · [Q9.2 — Dispatchers](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
+> **Connects to:** [Q11.4 — Flow collection and lifecycle](11_flow.md#q114--flow-collection-and-lifecycle)
 
 ### The Four Start Modes
 
@@ -786,7 +779,7 @@ launch(start = CoroutineStart.UNDISPATCHED) {
 
 **Why is `UNDISPATCHED` useful for guaranteed initialization before an emitter fires?**
 
-Consider a `SharedFlow` or `Channel` where you want to collect from it before the producer starts emitting. With `DEFAULT`, there is a scheduling gap:
+Consider a [`SharedFlow`](11_flow.md#q113--stateflow-vs-sharedflow) or `Channel` where you want to collect from it before the producer starts emitting. With `DEFAULT`, there is a scheduling gap:
 
 ```kotlin
 // Problem with DEFAULT:
@@ -872,11 +865,11 @@ launch returns Job immediately
 
 ## Cross-References
 
-- Q4.3: suspend lambdas — how they differ from regular lambdas (`CPS` + extra `Continuation` param)
-- Q10.1: Job hierarchy — how the Job/parent-child tree connects to coroutine scopes
-- Q10.3: Exception handling rules — why `CoroutineExceptionHandler` root-only, `CancellationException` rules
-- Q11.1: Flow — how `Flow` uses `suspend` and the CPS model for reactive streams
-- Q17.4: Testing — `StandardTestDispatcher`, `UnconfinedTestDispatcher`, `runTest`
+- [Q4.3](04_functions_lambdas_inlining.md#q43--higher-order-functions-with-suspend): suspend lambdas — how they differ from regular lambdas (`CPS` + extra `Continuation` param)
+- [Q10.1](10_structured_concurrency.md#q101--the-job-hierarchy): Job hierarchy — how the Job/parent-child tree connects to coroutine scopes
+- [Q10.3](10_structured_concurrency.md#q103--exception-handling-rules): Exception handling rules — why `CoroutineExceptionHandler` root-only, `CancellationException` rules
+- [Q11.1](11_flow.md#q111--cold-vs-hot-streams): Flow — how `Flow` uses `suspend` and the CPS model for reactive streams
+- [Q17.4](17_performance_and_memory.md#q174--testing): Testing — `StandardTestDispatcher`, `UnconfinedTestDispatcher`, `runTest`
 
 ---
 

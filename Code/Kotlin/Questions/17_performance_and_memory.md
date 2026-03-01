@@ -1,16 +1,20 @@
 # Phase 17: Performance and Memory
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 16 — Android System Internals | [16_android_system_internals.md](16_android_system_internals.md) |
-| **17 — Performance & Memory** | ← You are here |
-| Master Chains | [master_chains.md](master_chains.md) |
+[← Master Index](master_chains.md)
+
+## Questions in This File
+- [Q17.1 — Memory Leaks — Top 5 Causes](#q171--memory-leaks--top-5-causes)
+- [Q17.2 — RecyclerView Internals](#q172--recyclerview-internals)
+- [Q17.3 — The 16ms Budget](#q173--the-16ms-budget)
+- [Q17.4 — Testing](#q174--testing)
 
 ---
 
 ## Q17.1 — Memory Leaks — Top 5 Causes
 
+> **Builds on:** [Q0.1 — Heap allocation and GC](00_jvm_mental_model.md#q01--primitives-vs-references) · [Q2.4 — Anonymous objects and inner classes](02_classes_and_objects.md#q24--the-object-keyword)
+> **Connects to:** [Q17.2 — RecyclerView](17_performance_and_memory.md#q172--recyclerview-internals) · [Q16.1 — Activity lifecycle](16_android_system_internals.md#q161--activity-and-fragment-lifecycle)
 > **Reference:** [Android Docs — Inspect your app's memory usage](https://developer.android.com/studio/profile/memory-profiler)
 
 ### First Principles: What Is a Memory Leak?
@@ -76,6 +80,8 @@ class MyActivity : Activity() {
 // Handler still in MessageQueue (10-second delay not expired)
 // Handler holds MyActivity reference → MyActivity not GC'd → LEAK!
 ```
+
+Non-static inner classes and anonymous objects (see [Q2.4 — The object keyword](02_classes_and_objects.md#q24--the-object-keyword)) hold an implicit reference to their outer class.
 
 **Fix:**
 ```kotlin
@@ -160,7 +166,7 @@ class MyActivity : Activity() {
 }
 ```
 
-**`GlobalScope` leak chain:** `GlobalScope.Job` → coroutine → lambda → `this` (Activity). GlobalScope's Job is never cancelled → Activity never freed.
+**`GlobalScope` leak chain:** `GlobalScope.Job` → coroutine → lambda → `this` (Activity). GlobalScope's Job is never cancelled → Activity never freed ([Q10.3 — Exception handling rules](10_structured_concurrency.md#q103--exception-handling-rules)).
 
 ---
 
@@ -202,6 +208,8 @@ class MyFragment : Fragment() {
 
 ## Q17.2 — RecyclerView Internals
 
+> **Builds on:** [Q17.1 — Memory Leaks](17_performance_and_memory.md#q171--memory-leaks--top-5-causes) · [Q16.1 — Fragment Lifecycle](16_android_system_internals.md#q161--activity-and-fragment-lifecycle)
+> **Connects to:** [Q17.3 — The 16ms Budget](17_performance_and_memory.md#q173--the-16ms-budget)
 > **Reference:** [Android Docs — RecyclerView](https://developer.android.com/develop/ui/views/layout/recyclerview)
 
 ### The 4-Level Cache
@@ -311,6 +319,8 @@ DiffUtil uses Myers' diff algorithm to find the minimum set of edits (insertions
 
 ## Q17.3 — The 16ms Budget
 
+> **Builds on:** [Q17.2 — RecyclerView](17_performance_and_memory.md#q172--recyclerview-internals) · [Q16.5 — Handler/Looper (main thread)](16_android_system_internals.md#q165--handler-looper-and-messagequeue)
+> **Connects to:** [Q17.4 — Testing](17_performance_and_memory.md#q174--testing)
 > **Reference:** [Android Docs — Slow rendering](https://developer.android.com/topic/performance/vitals/render)
 
 ### First Principles: Why 16ms?
@@ -410,6 +420,8 @@ class BaselineProfileGenerator {
 
 ## Q17.4 — Testing
 
+> **Builds on:** [Q9.2 — Dispatchers (TestDispatcher)](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers) · [Q10.3 — Exception handling in tests](10_structured_concurrency.md#q103--exception-handling-rules)
+> **Connects to:** [Q13.1 — MVVM testability](13_android_architecture.md#q131--mvvm-and-unidirectional-data-flow)
 > **Reference:** [Kotlin Coroutines Testing Docs](https://kotlinlang.org/docs/coroutines-test.html)
 
 ### `runTest` vs `runBlockingTest`
@@ -437,7 +449,7 @@ Key feature: `runTest` uses a **virtual clock**. `delay(5000)` doesn't pause the
 
 ### `StandardTestDispatcher` vs `UnconfinedTestDispatcher`
 
-**`StandardTestDispatcher` (default in `runTest`):**
+[**`StandardTestDispatcher`**](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers) (default in `runTest`):
 - Coroutines do NOT run until you explicitly advance time or call `runCurrent()`
 - Gives you full control: test assertions can happen "between" coroutine steps
 

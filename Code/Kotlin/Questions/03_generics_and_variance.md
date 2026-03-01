@@ -1,20 +1,13 @@
 # Phase 3: Generics and Variance
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 0 — JVM Mental Model | [00_jvm_mental_model.md](00_jvm_mental_model.md) |
-| 1 — Type System | [01_type_system_foundations.md](01_type_system_foundations.md) |
-| 2 — Classes & Objects | [02_classes_and_objects.md](02_classes_and_objects.md) |
-| 2.5 — Initialization | [02_5_initialization_mechanics.md](02_5_initialization_mechanics.md) |
-| **3 — Generics & Variance** | ← You are here |
-| 4 — Functions & Lambdas | [04_functions_lambdas_inlining.md](04_functions_lambdas_inlining.md) |
-| 5 — Properties & Delegation | [05_properties_and_delegation.md](05_properties_and_delegation.md) |
-| 6 — Extension Functions | [06_extension_functions.md](06_extension_functions.md) |
-| 7 — Collections & Sequences | [07_collections_and_sequences.md](07_collections_and_sequences.md) |
-| 8 — Other Kotlin Features | [08_other_kotlin_features.md](08_other_kotlin_features.md) |
-| 9 — Coroutines Mechanics | [09_coroutines_execution_mechanics.md](09_coroutines_execution_mechanics.md) |
-| 10 — Structured Concurrency | [10_structured_concurrency.md](10_structured_concurrency.md) |
+[← Master Index](master_chains.md)
+
+## Questions in This File
+- [Q3.1 — Type Erasure](#q31--type-erasure)
+- [Q3.2 — Variance](#q32--variance)
+- [Q3.3 — Reified Type Parameters](#q33--reified-type-parameters)
+- [Q3.4 — Type Parameter Bounds](#q34--type-parameter-bounds)
 
 ---
 
@@ -567,7 +560,196 @@ This chain is impossible for classes:
 
 ---
 
-## Master Summary: Generics and Variance in 5 Points
+## Q3.4 — Type Parameter Bounds
+
+> **Builds on:** [Q3.1 — Type Erasure](03_generics_and_variance.md#q31--type-erasure) · [Q3.2 — Variance](03_generics_and_variance.md#q32--variance)
+> **Connects to:** [Q3.3 — Reified](03_generics_and_variance.md#q33--reified-type-parameters) · [Q1.3 — Nothing and Any](01_type_system_foundations.md#q13--nothing-unit-and-the-type-hierarchy)
+
+### What Are Type Parameter Bounds?
+
+By default, a type parameter `T` can be substituted with *any* Kotlin type — `String`, `Int`, `UserActivity`, anything. But often you need to restrict what types callers can use. **Type parameter bounds** let you say "T must be a subtype of X".
+
+```kotlin
+// Unrestricted: T can be anything
+fun <T> identity(value: T): T = value
+
+// Bounded: T must be a subtype of Number
+fun <T : Number> double(value: T): Double = value.toDouble() * 2
+```
+
+Without the bound, `value.toDouble()` would be a compile error — `Any` doesn't have `toDouble()`. With `T : Number`, the compiler knows T has all of Number's methods.
+
+---
+
+### Upper Bounds: `T : SomeType`
+
+An **upper bound** means T must be `SomeType` itself or a subtype of it:
+
+```kotlin
+fun <T : Comparable<T>> max(a: T, b: T): T {
+    return if (a > b) a else b   // OK: Comparable has compareTo(), so > works
+}
+
+max(3, 5)            // T = Int, Int : Comparable<Int> ✓
+max("apple", "fig")  // T = String, String : Comparable<String> ✓
+max(listOf(1), listOf(2))  // COMPILE ERROR: List is not Comparable
+```
+
+**The implicit default bound:** When you write `<T>` with no bound, the implicit bound is `T : Any?` — T can be any type including nullable types. If you write `<T : Any>`, T cannot be nullable:
+
+```kotlin
+fun <T> acceptsNull(value: T) { }
+acceptsNull<String?>(null)  // OK — T : Any? by default, nullable allowed
+
+fun <T : Any> refusesNull(value: T) { }
+refusesNull<String?>(null)  // COMPILE ERROR: String? doesn't satisfy T : Any
+refusesNull<String>("hello")  // OK — String : Any ✓
+```
+
+This is why generic functions that call `value.hashCode()` or do null-unsafe operations need `T : Any`.
+
+---
+
+### Multiple Upper Bounds: `where T : A, T : B`
+
+A type parameter can only have ONE bound in the `<T : Bound>` syntax. For multiple bounds, use the `where` clause:
+
+```kotlin
+// T must be both Serializable AND Comparable<T>:
+fun <T> sortAndSave(list: List<T>): List<T>
+        where T : Serializable,
+              T : Comparable<T> {
+    return list.sorted()     // OK: Comparable<T> provides sorted()
+    // and then serialize... // OK: Serializable interface available
+}
+```
+
+At the call site, T must satisfy ALL constraints:
+```kotlin
+sortAndSave(listOf(1, 2, 3))     // Int : Serializable AND Int : Comparable<Int> ✓
+sortAndSave(listOf(File(".")))   // File : Serializable AND File : Comparable<File>?
+                                 // File is Comparable<File> ✓
+sortAndSave(listOf(listOf(1)))   // List is NOT Serializable → COMPILE ERROR
+```
+
+---
+
+### Recursive (Self-Referential) Bounds
+
+Some bounds reference the type parameter itself. The most common pattern is `T : Comparable<T>` — "T can be compared with itself":
+
+```kotlin
+fun <T : Comparable<T>> clamp(value: T, min: T, max: T): T {
+    return when {
+        value < min -> min   // uses Comparable<T>.compareTo
+        value > max -> max
+        else -> value
+    }
+}
+
+clamp(5, 1, 10)         // T = Int, uses Int.compareTo(Int)
+clamp("c", "a", "z")    // T = String, uses String.compareTo(String)
+```
+
+Another common pattern in builder DSLs:
+```kotlin
+// Builder pattern: each method returns THIS type (not the base Builder type)
+abstract class Builder<T : Builder<T>> {
+    abstract fun self(): T
+
+    fun setName(name: String): T {
+        this.name = name
+        return self()  // returns the concrete subtype, not Builder<T>
+    }
+}
+
+class UserBuilder : Builder<UserBuilder>() {
+    override fun self() = this
+}
+
+UserBuilder()
+    .setName("Alice")  // returns UserBuilder (not Builder<UserBuilder>)
+    .build()
+```
+
+---
+
+### Bounds in JVM Bytecode: The Erased Type
+
+At runtime, bounds are erased just like all generic information. The JVM sees the **upper bound type** (or `Object` if no bound):
+
+```kotlin
+// Source:
+fun <T : Number> process(value: T): Double = value.toDouble()
+```
+
+```bytecode
+; Compiled bytecode:
+process(Ljava/lang/Number;)D    ; T erased to its bound: Number
+; NOT process(Ljava/lang/Object;)D  -- the bound determines the erasure!
+```
+
+This means:
+- With `T : Number` → T erases to `Number`
+- With `T : Any` → T erases to `Object`
+- With no bound (implicit `T : Any?`) → T erases to `Object`
+- With `T : Serializable` → T erases to `Serializable`
+
+The erased type is what the JVM uses for casting and method lookup. Using `T : Number` means the JVM can call `Number` methods directly without any cast.
+
+---
+
+### Use Case: Bounds in Android/Kotlin APIs
+
+```kotlin
+// Real pattern: bound ensures the ViewModel is properly typed
+inline fun <reified VM : ViewModel> Fragment.viewModels(): VM {
+    // VM must be a ViewModel or subclass — ensures lifecycle attachment
+    return ViewModelProvider(this)[VM::class.java]
+}
+
+// Usage:
+val viewModel: MyViewModel by viewModels()
+// T = MyViewModel, MyViewModel : ViewModel ✓
+```
+
+```kotlin
+// Bound to ensure we can log anything that has a tag:
+interface Loggable { val tag: String }
+
+fun <T : Loggable> logAll(items: List<T>) {
+    items.forEach { println("[${it.tag}] $it") }  // .tag available because T : Loggable
+}
+```
+
+---
+
+### Star Projection vs Bound — When to Use Each
+
+```kotlin
+// Star projection: I don't care what T is, I won't produce or use T
+fun printList(list: List<*>) {
+    list.forEach { println(it) }  // item is Any? — minimal info
+}
+
+// Bounded: I need T to have specific capabilities
+fun sumList(list: List<out Number>): Double {
+    return list.sumOf { it.toDouble() }  // .toDouble() available because : Number
+}
+```
+
+| | Star Projection `List<*>` | Bounded `List<out Number>` |
+|---|---|---|
+| Element type available as | `Any?` | `Number` |
+| Can call Number methods | No | Yes |
+| Caller can pass | `List<String>`, `List<Int>`, anything | Only `List<Number>` or subtypes |
+| Use when | Don't care about element type | Need element behavior |
+
+> **Key Takeaway:** Type bounds are what let generic functions be useful rather than just holding `Any?`. `T : Number` means "I can call Number's methods on T"; `T : Comparable<T>` means "T can be sorted"; `T : Any` means "T is guaranteed non-null". At the JVM level, T erases to its upper bound — so `T : Number` compiles to use `Number` as the static type, with no cast needed.
+
+---
+
+## Master Summary: Generics and Variance in 6 Points
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -587,6 +769,11 @@ This chain is impossible for classes:
 │                                                                      │
 │  5. REIFIED: Inline function pasted at call site → T is concrete    │
 │     there → compiler substitutes T → defeats erasure locally.       │
+│                                                                      │
+│  6. TYPE BOUNDS constrain what T can be substituted with.          │
+│     T : Number gives T all of Number's methods; T : Any forbids    │
+│     nullable. Multiple bounds use `where`. T erases to its upper   │
+│     bound in bytecode, not to Object.                              │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 

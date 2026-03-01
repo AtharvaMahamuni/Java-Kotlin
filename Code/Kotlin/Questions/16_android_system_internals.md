@@ -1,16 +1,21 @@
 # Phase 16: Android System Internals
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 15 — Networking | [15_networking.md](15_networking.md) |
-| **16 — Android System Internals** | ← You are here |
-| 17 — Performance & Memory | [17_performance_and_memory.md](17_performance_and_memory.md) |
+[← Master Index](master_chains.md)
+
+## Questions in This File
+- [Q16.1 — Activity and Fragment Lifecycle](#q161--activity-and-fragment-lifecycle)
+- [Q16.2 — Background Work Evolution](#q162--background-work-evolution)
+- [Q16.3 — Binder IPC](#q163--binder-ipc)
+- [Q16.4 — Zygote and App Startup](#q164--zygote-and-app-startup)
+- [Q16.5 — Handler, Looper, and MessageQueue](#q165--handler-looper-and-messagequeue)
 
 ---
 
 ## Q16.1 — Activity and Fragment Lifecycle
 
+> **Builds on:** [Q13.3 — ViewModel survives rotation](13_android_architecture.md#q133--viewmodel-internals)
+> **Connects to:** [Q16.2 — Background Work](16_android_system_internals.md#q162--background-work-evolution) · [Q17.1 — Memory Leaks](17_performance_and_memory.md#q171--memory-leaks--top-5-causes) · [Q10.4 — lifecycleScope](10_structured_concurrency.md#q104--lifecycle-scopes-and-process-death)
 > **Reference:** [Android Docs — Activity lifecycle](https://developer.android.com/guide/components/activities/activity-lifecycle)
 
 ### Exact Callback Order During Rotation
@@ -101,6 +106,9 @@ When user presses back to the Fragment:
 ---
 
 ## Q16.2 — Background Work Evolution
+
+> **Builds on:** [Q16.1 — Activity Lifecycle](16_android_system_internals.md#q161--activity-and-fragment-lifecycle) · [Q10.4 — Lifecycle Scopes](10_structured_concurrency.md#q104--lifecycle-scopes-and-process-death)
+> **Connects to:** [Q14.2 — WorkManager](14_jetpack_components.md#q142--workmanager)
 
 ### Does a `Service` Run on a Background Thread?
 
@@ -195,6 +203,8 @@ WorkManager (current):
 
 ## Q16.3 — Binder IPC
 
+> **Builds on:** [Q16.4 — Zygote and App Startup](16_android_system_internals.md#q164--zygote-and-app-startup)
+> **Connects to:** [Q13.3 — SavedStateHandle uses Binder](13_android_architecture.md#q133--viewmodel-internals) · [Q16.5 — Handler/Looper](16_android_system_internals.md#q165--handler-looper-and-messagequeue)
 > **Reference:** [Android Docs — Bound services overview](https://developer.android.com/guide/components/bound-services)
 
 ### What Is Binder IPC?
@@ -247,7 +257,7 @@ android.os.TransactionTooLargeException: data parcel size N bytes
 
 This affects:
 - `onSaveInstanceState` (Binder IPC to persist Bundle)
-- `SavedStateHandle`
+- [`SavedStateHandle`](13_android_architecture.md#q133--viewmodel-internals)
 - Intents with large extras
 - AIDL method calls with large arguments
 
@@ -268,6 +278,9 @@ savedState["selectedUserId"] = "user_123"   // fetch from DB on restore
 ---
 
 ## Q16.4 — Zygote and App Startup
+
+> **Builds on:** [Q0.3 — Class Loading](00_jvm_mental_model.md#q03--class-loading-and-the-static--block)
+> **Connects to:** [Q16.3 — Binder IPC](16_android_system_internals.md#q163--binder-ipc) · [Q17.3 — The 16ms Budget](17_performance_and_memory.md#q173--the-16ms-budget)
 
 ### The Path from App Icon Tap to First Activity Frame
 
@@ -371,6 +384,8 @@ An **ANR** (Application Not Responding) occurs when a message in this queue take
 
 ## Q16.5 — Handler, Looper, and MessageQueue
 
+> **Builds on:** [Q16.4 — Zygote (main thread setup)](16_android_system_internals.md#q164--zygote-and-app-startup) · [Q9.2 — Dispatchers.Main uses Looper](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
+> **Connects to:** [Q9.2 — Dispatchers.Main.immediate](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
 > **Reference:** [Android Docs — Processes and threads overview](https://developer.android.com/guide/components/processes-and-threads)
 
 ### The Relationship: Thread → Looper → MessageQueue → Handlers
@@ -455,7 +470,7 @@ lifecycleScope.launch {
 }
 ```
 
-**Under the hood, `delay()` on `Dispatchers.Main` uses `Handler.postDelayed()`!** The `Dispatchers.Main` implementation (via `HandlerContext`) schedules coroutine resumptions by posting delayed messages to the main Looper's MessageQueue.
+**Under the hood, `delay()` on [`Dispatchers.Main`](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers) uses `Handler.postDelayed()`!** The `Dispatchers.Main` implementation (via `HandlerContext`) schedules coroutine resumptions by posting delayed messages to the main Looper's MessageQueue.
 
 Both are equivalent in behavior. Coroutines just make it cleaner and composable with other suspend functions.
 

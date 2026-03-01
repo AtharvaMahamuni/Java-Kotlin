@@ -1,36 +1,22 @@
 # Phase 10: Structured Concurrency
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 00 | JVM Mental Model |
-| 01 | Type System Foundations |
-| 02 | Classes and Objects |
-| 02.5 | Initialization and Construction Mechanics |
-| 03 | Generics and Variance |
-| 04 | Functions, Lambdas, and Inlining |
-| 05 | Properties and Delegation |
-| 06 | Extension Functions |
-| 07 | Collections and Sequences |
-| 08 | Other Kotlin Features |
-| 09 | [Coroutines — Execution Mechanics](./09_coroutines_execution_mechanics.md) |
-| **10** | **Structured Concurrency (THIS FILE)** |
-| 11 | Flow |
-| 12 | Reference Operators and Reflection |
-| 13 | Android Architecture |
-| 14 | Jetpack Components |
-| 15 | Networking |
-| 16 | Android System Internals |
-| 17 | Performance and Memory |
-| master | Master Follow-Up Chains |
+[← Master Index](master_chains.md)
 
-**Cross-references in this file:**
-- Builds on: Q9.1 (CPS / state machine), Q9.3 (launch vs async), Q4.3 (CancellationException re-throw)
-- Leads to: Q11 (Flow collection and lifecycle), Q13 (MVVM and ViewModel), Q17.1 (GlobalScope memory leak)
+## Questions in This File
+- [Q10.1 — The Job Hierarchy](#q101--the-job-hierarchy)
+- [Q10.2 — `coroutineScope` vs `supervisorScope`](#q102--coroutinescope-vs-supervisorscope)
+- [Q10.3 — Exception Handling Rules](#q103--exception-handling-rules)
+- [Q10.4 — Lifecycle Scopes and Process Death](#q104--lifecycle-scopes-and-process-death)
+- [Q10.5 — `select` Expression](#q105--select-expression)
+- [Q10.6 — Mutex and Synchronization Primitives](#q106--mutex-and-synchronization-primitives)
 
 ---
 
-## 10.1 The Job Hierarchy
+## Q10.1 — The Job Hierarchy
+
+> **Builds on:** [Q9.3 — launch vs async (Job vs Deferred)](09_coroutines_execution_mechanics.md#q93--launch-vs-async) · [Q9.2 — CoroutineContext](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
+> **Connects to:** [Q10.2 — coroutineScope](10_structured_concurrency.md#q102--coroutinescope-vs-supervisorscope) · [Q10.3 — Exception propagation](10_structured_concurrency.md#q103--exception-handling-rules) · [Q13.3 — viewModelScope](13_android_architecture.md#q133--viewmodel-internals)
 
 ### The Tree Structure of Coroutine Jobs
 
@@ -187,7 +173,7 @@ SupervisorJob / supervisorScope:
 sealed class JobCancellationException : CancellationException()
 ```
 
-When a child is cancelled (normal lifecycle event), it throws `CancellationException`. This is treated as a normal part of the structured concurrency lifecycle — it does NOT count as a failure. The parent ignores it (does not fail because a child was cancelled).
+When a child is cancelled (normal lifecycle event), it throws [`CancellationException`](#q103--exception-handling-rules). This is treated as a normal part of the structured concurrency lifecycle — it does NOT count as a failure. The parent ignores it (does not fail because a child was cancelled).
 
 ```
 Child throws CancellationException:
@@ -218,7 +204,10 @@ Child throws RuntimeException (or any non-CancellationException):
 
 ---
 
-## 10.2 `coroutineScope` vs `supervisorScope`
+## Q10.2 — `coroutineScope` vs `supervisorScope`
+
+> **Builds on:** [Q10.1 — Job Hierarchy](10_structured_concurrency.md#q101--the-job-hierarchy) · [Q9.3 — async exception propagation](09_coroutines_execution_mechanics.md#q93--launch-vs-async)
+> **Connects to:** [Q10.3 — Exception Handling Rules](10_structured_concurrency.md#q103--exception-handling-rules)
 
 ### The One Source-Code-Level Difference
 
@@ -401,7 +390,10 @@ The `SupervisorJob` root is what makes Android scopes resilient.
 
 ---
 
-## 10.3 Exception Handling Rules
+## Q10.3 — Exception Handling Rules
+
+> **Builds on:** [Q10.1 — Job Hierarchy](10_structured_concurrency.md#q101--the-job-hierarchy) · [Q10.2 — supervisorScope](10_structured_concurrency.md#q102--coroutinescope-vs-supervisorscope)
+> **Connects to:** [Q4.3 — CancellationException in suspend lambdas](04_functions_lambdas_inlining.md#q43--higher-order-functions-with-suspend) · [Q11.4 — Flow lifecycle](11_flow.md#q114--flow-collection-and-lifecycle)
 
 ### Why `CoroutineExceptionHandler` Only Works on Root Coroutines with `launch`
 
@@ -718,7 +710,10 @@ Thread B (coroutine dispatcher thread):  [later]
 
 ---
 
-## 10.4 Lifecycle Scopes and Process Death
+## Q10.4 — Lifecycle Scopes and Process Death
+
+> **Builds on:** [Q10.1 — Job Hierarchy](10_structured_concurrency.md#q101--the-job-hierarchy) · [Q13.3 — ViewModel internals](13_android_architecture.md#q133--viewmodel-internals)
+> **Connects to:** [Q11.4 — Flow collection with lifecycle](11_flow.md#q114--flow-collection-and-lifecycle) · [Q16.1 — Activity lifecycle](16_android_system_internals.md#q161--activity-and-fragment-lifecycle)
 
 ### What `viewModelScope` Uses Internally
 
@@ -743,7 +738,7 @@ val ViewModel.viewModelScope: CoroutineScope
 
 The two choices and why:
 
-**`SupervisorJob()`:** Children of `viewModelScope` are independent. A failing network call does not cancel the entire ViewModel's work. See 10.2 for full rationale.
+**`SupervisorJob()`:** Children of `viewModelScope` are independent. A failing network call does not cancel the entire [ViewModel](13_android_architecture.md#q133--viewmodel-internals)'s work. See 10.2 for full rationale.
 
 **`Dispatchers.Main.immediate`:** ViewModel coroutines are typically launched to update UI state (`_uiState.value = ...`). Using `Main.immediate` means that when the coroutine is launched from the main thread (which ViewModel code usually is), the first block runs synchronously without posting to the Handler queue. This reduces latency for UI updates.
 
@@ -934,7 +929,10 @@ class SearchViewModel @Inject constructor(
 
 ---
 
-## 10.5 `select` Expression
+## Q10.5 — `select` Expression
+
+> **Builds on:** [Q10.1 — Job Hierarchy](10_structured_concurrency.md#q101--the-job-hierarchy) · [Q9.3 — Deferred](09_coroutines_execution_mechanics.md#q93--launch-vs-async)
+> **Connects to:** [Q11.2 — Flow operators](11_flow.md#q112--flow-operators)
 
 ### What `select { }` Does — Racing Multiple Async Operations
 
@@ -1146,6 +1144,210 @@ suspend fun getDataWithCacheFallback(): Data = coroutineScope {
 | Bias | First clause in declaration order wins ties |
 | Loser cancellation | NOT automatic — caller must cancel losing coroutines |
 | vs `anyOf()` | `select` is type-safe, suspending, multi-clause-type, coroutine-native |
+
+---
+
+## Q10.6 — Mutex and Synchronization Primitives
+
+> **Builds on:** [Q10.1 — Job Hierarchy](10_structured_concurrency.md#q101--the-job-hierarchy) · [Q9.2 — Dispatchers](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
+> **Connects to:** [Q15.2 — Token Refresh Pattern](15_networking.md#q152--token-refresh-pattern) · [Q17.3 — Shared Mutable State](17_performance_and_memory.md#q173--shared-mutable-state)
+
+### The Problem: Shared Mutable State in Coroutines
+
+When multiple coroutines run concurrently and share mutable state, you get **race conditions** — the outcome depends on which coroutine runs first:
+
+```kotlin
+var counter = 0
+
+// Launch 1000 coroutines, each incrementing the counter
+repeat(1000) {
+    launch {
+        counter++  // NOT ATOMIC! Race condition!
+    }
+}
+
+delay(1000)
+println(counter)  // Might print 847, 993, or 1000 — unpredictable!
+```
+
+Why? `counter++` compiles to three steps:
+1. `ILOAD counter` — read the current value
+2. `IADD 1` — add 1
+3. `ISTORE counter` — write back
+
+Two coroutines can both read `42`, both add 1, both write `43` — result: 43 instead of 44. One increment was lost.
+
+---
+
+### `Mutex` — Coroutine-Native Mutual Exclusion
+
+`Mutex` (mutual exclusion) is a lock that only one coroutine can hold at a time. Unlike `synchronized` (which blocks a **thread**), a coroutine Mutex **suspends** the waiting coroutine — the thread is freed to run other work:
+
+```kotlin
+val mutex = Mutex()
+var counter = 0
+
+repeat(1000) {
+    launch {
+        mutex.withLock {   // suspends until lock acquired, then locks
+            counter++      // only ONE coroutine is here at a time — safe!
+        }                  // lock released automatically (even on exception)
+    }
+}
+```
+
+```
+Timeline (3 coroutines competing for mutex):
+
+Coroutine 1: acquire lock ──── counter++ ──── release lock
+Coroutine 2:             [suspended, waiting]   acquire lock ── counter++ ── release
+Coroutine 3:                      [suspended, waiting]               acquire ── ++ ── release
+                                  ^
+                            suspended (not blocking thread!)
+                            thread can run other coroutines while Coroutine 2 waits
+```
+
+This is the critical difference from `synchronized`:
+- `synchronized` → **blocks the thread** while waiting. One blocked thread = one fewer thread to serve other coroutines on that dispatcher.
+- `Mutex` → **suspends the coroutine** while waiting. The thread is freed to run other coroutines. Only when the lock is available does the coroutine resume.
+
+---
+
+### `Mutex.withLock` — The Only Pattern You Should Use
+
+Always use `withLock` (never `lock()`/`unlock()` manually) because it guarantees the lock is released in a `finally` block, even if the body throws:
+
+```kotlin
+val mutex = Mutex()
+
+// CORRECT — withLock always releases:
+mutex.withLock {
+    riskyOperation()  // if this throws, lock is STILL released
+}
+
+// DANGEROUS — manual lock/unlock:
+mutex.lock()
+riskyOperation()  // if this throws, mutex.unlock() is never called → DEADLOCK!
+mutex.unlock()
+```
+
+`withLock` is defined as:
+```kotlin
+suspend inline fun <T> Mutex.withLock(owner: Any? = null, action: () -> T): T {
+    lock(owner)
+    try {
+        return action()
+    } finally {
+        unlock(owner)   // always runs — even on exception or cancellation
+    }
+}
+```
+
+---
+
+### Mutex vs `@Volatile` vs `AtomicInteger`
+
+Each tool solves a different problem:
+
+```kotlin
+// @Volatile — visibility guarantee only (not atomicity)
+@Volatile var flag = false
+// Guarantees: every thread/coroutine sees the latest write to `flag`
+// Does NOT guarantee: read-modify-write atomicity (flag++ is still a race!)
+
+// AtomicInteger — single-variable atomicity without a lock
+val counter = AtomicInteger(0)
+counter.incrementAndGet()  // atomic: read-add-write as one uninterruptible operation
+// Use when: a single integer needs thread-safe increment/read
+// Limitation: only one variable; compound operations across two AtomicIntegers are NOT atomic
+
+// Mutex — arbitrary compound operations
+val mutex = Mutex()
+var a = 0; var b = 0
+mutex.withLock {
+    a++
+    b--  // both changes are atomic TOGETHER — no other coroutine sees an in-between state
+}
+```
+
+| Tool | Guarantees | When to Use |
+|------|-----------|-------------|
+| `@Volatile` | Visibility: latest write visible to all threads | Simple flag, no read-modify-write |
+| `AtomicInteger` | Atomic single-variable operations | Counter, single integer |
+| `Mutex` | Mutual exclusion for any code block | Multiple variables, compound operations |
+| `synchronized` | Mutex but blocks thread | Only in non-coroutine code |
+
+---
+
+### Deadlock — The Main Danger With Mutex
+
+A deadlock occurs when two coroutines each hold a lock the other needs:
+
+```kotlin
+val mutexA = Mutex()
+val mutexB = Mutex()
+
+// Coroutine 1: acquires A, then tries to acquire B
+launch {
+    mutexA.withLock {
+        delay(100)      // yield to let Coroutine 2 run
+        mutexB.withLock {   // ← waits for B... but Coroutine 2 holds B!
+            doWork()
+        }
+    }
+}
+
+// Coroutine 2: acquires B, then tries to acquire A
+launch {
+    mutexB.withLock {
+        delay(100)      // yield to let Coroutine 1 run
+        mutexA.withLock {   // ← waits for A... but Coroutine 1 holds A!
+            doWork()
+        }
+    }
+}
+
+// DEADLOCK: both coroutines suspended indefinitely, neither can proceed
+```
+
+**Prevention rules:**
+1. **Lock ordering:** Always acquire multiple locks in the same fixed order (e.g., always `mutexA` before `mutexB`).
+2. **Try-lock with timeout:** Use `tryLock()` and give up after a timeout.
+3. **Design:** Prefer one shared mutex over multiple to avoid the problem entirely.
+
+---
+
+### `Semaphore` — Limiting Concurrent Access
+
+A `Semaphore` allows a controlled NUMBER of coroutines to access a resource simultaneously (unlike `Mutex` which allows only one):
+
+```kotlin
+// Allow at most 3 concurrent network requests:
+val semaphore = Semaphore(3)
+
+suspend fun fetchWithLimit(url: String): String {
+    return semaphore.withPermit {
+        networkClient.get(url)  // at most 3 of these run concurrently
+    }
+}
+```
+
+Use cases:
+- Limiting concurrent API calls (avoid rate limiting)
+- Connection pool (max N database connections)
+- Throttling heavy background work
+
+```
+Semaphore(3) timeline:
+
+Request 1: ─ acquire permit(1) ──────────────── release(1)
+Request 2: ─ acquire permit(2) ────── release(2)
+Request 3: ─ acquire permit(3) ─────────────────────── release(3)
+Request 4:                [suspended]     acquire(after 2 releases) ──── release
+Request 5:                         [suspended]           acquire ──── release
+```
+
+> **Key Takeaway:** `Mutex.withLock` is the right tool when multiple coroutines share mutable state and a single `Atomic` isn't enough. The crucial advantage over `synchronized`: waiting coroutines **suspend** (freeing the thread) rather than blocking. Always use `withLock` (never manual lock/unlock) to avoid deadlocks on exceptions.
 
 ---
 

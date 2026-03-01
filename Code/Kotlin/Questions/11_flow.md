@@ -1,18 +1,21 @@
 # Phase 11: Flow
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 10 — Structured Concurrency | [10_structured_concurrency.md](10_structured_concurrency.md) |
-| **11 — Flow** | ← You are here |
-| 12 — Reference Operators & Reflection | [12_reference_operators_and_reflection.md](12_reference_operators_and_reflection.md) |
-| 13 — Android Architecture | [13_android_architecture.md](13_android_architecture.md) |
+[← Master Index](master_chains.md)
+
+## Questions in This File
+- [Q11.1 — Cold vs Hot Streams](#q111--cold-vs-hot-streams)
+- [Q11.2 — Flow Operators](#q112--flow-operators)
+- [Q11.3 — `StateFlow` vs `SharedFlow`](#q113--stateflow-vs-sharedflow)
+- [Q11.4 — Flow Collection and Lifecycle](#q114--flow-collection-and-lifecycle)
+- [Q11.5 — Channels: Hot Streams with Backpressure](#q115--channels-hot-streams-with-backpressure)
 
 ---
 
 ## Q11.1 — Cold vs Hot Streams
 
 > **Builds on:** [Q7.2 — Sequences](07_collections_and_sequences.md#q72--sequences-vs-eager-collections)
+> **Connects to:** [Q11.2 — Flow Operators](11_flow.md#q112--flow-operators) · [Q11.3 — StateFlow vs SharedFlow](11_flow.md#q113--stateflow-vs-sharedflow) · [Q11.4 — Flow Collection](11_flow.md#q114--flow-collection-and-lifecycle)
 > **Reference:** [Kotlin Docs — Flows](https://kotlinlang.org/docs/flow.html)
 
 ### First Principles: The Problem Flow Solves
@@ -159,6 +162,9 @@ flow { ... }.collectLatest { item ->
 ---
 
 ## Q11.2 — Flow Operators
+
+> **Builds on:** [Q11.1 — Cold Flows](11_flow.md#q111--cold-vs-hot-streams) · [Q4.2 — inline operators](04_functions_lambdas_inlining.md#q42--inline-noinline-crossinline)
+> **Connects to:** [Q11.3 — StateFlow vs SharedFlow](11_flow.md#q113--stateflow-vs-sharedflow) · [Q7.2 — Sequences (similar lazy pipeline)](07_collections_and_sequences.md#q72--sequences-vs-eager-collections)
 
 ### `map` vs `flatMapLatest`
 
@@ -307,6 +313,8 @@ output: ─────1a─2b─3c──      output: ─────(1,a)─(2
 
 ## Q11.3 — `StateFlow` vs `SharedFlow`
 
+> **Builds on:** [Q11.1 — Hot vs Cold](11_flow.md#q111--cold-vs-hot-streams) · [Q9.2 — CoroutineContext (scope for stateIn)](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
+> **Connects to:** [Q13.4 — LiveData vs StateFlow](13_android_architecture.md#q134--livedata-vs-stateflow-vs-sharedflow) · [Q11.4 — Collection lifecycle](11_flow.md#q114--flow-collection-and-lifecycle)
 > **Reference:** [Kotlin Docs — StateFlow and SharedFlow](https://kotlinlang.org/docs/flow.html#stateflow-and-sharedflow)
 
 ### Why `StateFlow` Skips Duplicate Consecutive Emissions
@@ -422,6 +430,8 @@ val userShared: SharedFlow<User> = userFlow.shareIn(
 
 ## Q11.4 — Flow Collection and Lifecycle
 
+> **Builds on:** [Q11.3 — StateFlow/SharedFlow](11_flow.md#q113--stateflow-vs-sharedflow) · [Q10.4 — Lifecycle Scopes](10_structured_concurrency.md#q104--lifecycle-scopes-and-process-death)
+> **Connects to:** [Q13.3 — ViewModel and StateFlow](13_android_architecture.md#q133--viewmodel-internals) · [Q10.3 — CancellationException](10_structured_concurrency.md#q103--exception-handling-rules)
 > **Reference:** [Android Docs — Collect flows from Android UIs](https://developer.android.com/kotlin/flow/stateflow-and-sharedflow)
 
 ### The Lifecycle Bug with `lifecycleScope.launch { flow.collect {} }`
@@ -500,6 +510,239 @@ sharedFlow.buffer(10).collect { value ->
     // but they may still be in the SharedFlow's own buffer for other collectors
 }
 ```
+
+---
+
+## Q11.5 — Channels: Hot Streams with Backpressure
+
+> **Builds on:** [Q11.1 — Cold vs Hot Streams](11_flow.md#q111--cold-vs-hot-streams) · [Q11.3 — StateFlow vs SharedFlow](11_flow.md#q113--stateflow-vs-sharedflow) · [Q9.3 — launch vs async](09_coroutines_execution_mechanics.md#q93--launch-vs-async)
+> **Connects to:** [Q10.6 — Mutex](10_structured_concurrency.md#q106--mutex-and-synchronization-primitives) · [Q10.5 — select Expression](10_structured_concurrency.md#q105--select-expression)
+> **Reference:** [Kotlin Docs — Channels](https://kotlinlang.org/docs/channels.html)
+
+### First Principles: The Problem Channels Solve
+
+Both `StateFlow` and `SharedFlow` are built on top of **Channels**. But Channels are more primitive and serve a different purpose: they are a **communication pipe** between coroutines. Where Flow is about transforming a stream of values, Channel is about one coroutine **sending** values and another **receiving** them — like a queue between coroutines.
+
+```
+Flow:                          Channel:
+  Producer creates              Producer sends    Consumer receives
+  values on demand     vs.      values when       values when
+  (cold — no sender)            ready (hot)       ready (hot)
+
+  No backpressure needed        Backpressure: if buffer full,
+  (consumer pulls)              send suspends (producer waits)
+```
+
+---
+
+### What Is a Channel?
+
+A `Channel` is a **coroutine-safe queue** with a suspension protocol:
+- **Sender** calls `send(value)` — suspends if the channel buffer is full
+- **Receiver** calls `receive()` — suspends if the channel is empty
+- Neither ever blocks a thread — they suspend their coroutine while waiting
+
+```kotlin
+val channel = Channel<Int>()
+
+// Producer coroutine: sends values
+launch {
+    for (i in 1..5) {
+        channel.send(i)   // suspends if channel buffer full
+        println("Sent $i")
+    }
+    channel.close()       // IMPORTANT: signal no more values coming
+}
+
+// Consumer coroutine: receives values
+launch {
+    for (value in channel) {  // receives until channel is closed
+        println("Received $value")
+    }
+}
+```
+
+Output (order may interleave depending on dispatcher):
+```
+Sent 1
+Received 1
+Sent 2
+Received 2
+...
+Received 5
+```
+
+---
+
+### Channel Types: The Buffer Strategy
+
+The buffer strategy determines what happens when the producer is faster than the consumer:
+
+```kotlin
+// 1. Rendezvous (buffer = 0, the default):
+val rendezvous = Channel<Int>()
+// send() suspends IMMEDIATELY until a receiver is ready
+// Most strict: sender and receiver must rendezvous at the same time
+// Use when: you want tight coupling (sender should wait for receiver to be ready)
+
+// 2. Buffered:
+val buffered = Channel<Int>(capacity = 64)
+// send() suspends only when buffer is full (64 items)
+// Consumer can lag up to 64 items behind producer before producer blocks
+// Use when: producer and consumer run at different speeds
+
+// 3. Conflated:
+val conflated = Channel<Int>(Channel.CONFLATED)
+// send() never suspends — but only the LATEST value is kept
+// Each new send overwrites the previous unread value
+// Same behavior as SharedFlow(replay=0, extraBufferCapacity=1, DROP_OLDEST)
+// Use when: only the latest state matters (UI updates, sensor readings)
+
+// 4. Unlimited:
+val unlimited = Channel<Int>(Channel.UNLIMITED)
+// send() never suspends — buffer grows as needed (unbounded!)
+// DANGER: memory leak if consumer can't keep up
+// Use when: you are certain production is finite and consumer will catch up
+```
+
+```
+Buffer behavior visualization (buffer size = 2):
+
+Producer sends: 1, 2, 3, 4, 5 (fast)
+Consumer reads: one every second (slow)
+
+Time 0: producer sends 1 → buffer [1]
+Time 1: producer sends 2 → buffer [1, 2]
+Time 2: producer sends 3 → BUFFER FULL → producer SUSPENDS
+         consumer reads 1 → buffer [2]
+         producer resumes → sends 3 → buffer [2, 3]
+...
+```
+
+---
+
+### Channel vs Flow — When to Use Which
+
+This is the key architectural question:
+
+| Aspect | `Flow` | `Channel` |
+|--------|--------|-----------|
+| Temperature | Cold (starts on each collect) | Hot (exists independently) |
+| Multiple collectors | Each gets own independent stream | All collectors share ONE stream |
+| Backpressure | Built-in (consumer pulls) | Configurable buffer + suspend |
+| Cancellation | Cancel collector → stops flow | Must close channel explicitly |
+| One-shot events | `SharedFlow(replay=0)` for events | Rendezvous Channel |
+| Communication between coroutines | Awkward (needs SharedFlow) | Natural (`send`/`receive`) |
+| Operators (`map`, `filter`) | Rich operator set | Limited (use `consumeAsFlow()`) |
+
+**Use Flow when:**
+- Transforming a data stream (database query, API results)
+- Multiple collectors need independent executions
+- You have rich operators to apply
+
+**Use Channel when:**
+- Two coroutines need to communicate (producer/consumer pipeline)
+- Work items must be processed exactly once (not replayed to each collector)
+- You need a bounded work queue with backpressure
+
+---
+
+### `produce` Builder — Channel as a Coroutine
+
+The `produce` coroutine builder creates a channel with a built-in producer coroutine. The channel closes automatically when the producer coroutine finishes:
+
+```kotlin
+fun CoroutineScope.generateNumbers(): ReceiveChannel<Int> = produce {
+    for (i in 1..10) {
+        send(i)         // sends to the channel
+        delay(100)      // producer can do async work between sends
+    }
+    // channel auto-closes when the produce block ends
+}
+
+// Usage:
+val numbers = generateNumbers()
+for (n in numbers) {
+    println(n)  // receives 1..10 with 100ms intervals
+}
+```
+
+This is the idiomatic way to create a channel-based producer.
+
+---
+
+### Critical: Channels Must Be Closed
+
+Unlike Flow (which ends naturally), a Channel stays open forever unless explicitly closed. Forgetting to close causes the receiver to suspend indefinitely:
+
+```kotlin
+val channel = Channel<String>()
+
+launch { channel.send("hello") }
+
+launch {
+    for (msg in channel) {  // iterates until channel is CLOSED
+        println(msg)
+    }
+    // if channel never closed: this coroutine suspends here forever!
+    println("Done")  // never reached if channel not closed
+}
+
+// FIX: always close the channel:
+// channel.close()  // signals no more values → for loop terminates
+```
+
+**The `produce` builder closes automatically** — it's the preferred approach precisely because it eliminates this footgun.
+
+---
+
+### `select` With Channels: First-Come, First-Served
+
+Channels integrate directly with the `select` expression (see [Q10.5](10_structured_concurrency.md#q105--select-expression)) to wait on multiple channels simultaneously:
+
+```kotlin
+val updates = Channel<String>()
+val alerts  = Channel<String>()
+
+// Process whichever channel has data first:
+select<Unit> {
+    updates.onReceive { msg ->
+        println("Update: $msg")
+    }
+    alerts.onReceive { msg ->
+        println("ALERT: $msg")
+    }
+}
+```
+
+This is a powerful pattern for coroutines that must respond to multiple event sources.
+
+---
+
+### Channel vs SharedFlow for Events
+
+A common Android pattern is routing UI events (button clicks, navigation) through a channel or SharedFlow. Channel is actually better for this specific case:
+
+```kotlin
+// Using Channel for one-shot events (preferred):
+class MyViewModel : ViewModel() {
+    private val _events = Channel<UiEvent>(Channel.BUFFERED)
+    val events: Flow<UiEvent> = _events.receiveAsFlow()
+
+    fun onButtonClick() {
+        viewModelScope.launch {
+            _events.send(UiEvent.NavigateToDetail)
+        }
+    }
+}
+
+// Why Channel over SharedFlow for events:
+// - Each event processed exactly ONCE (Channel guarantees delivery to one receiver)
+// - SharedFlow might deliver to multiple collectors or miss if no collector active
+// - Channel buffers if collector is momentarily inactive (Activity recreating)
+```
+
+> **Key Takeaway:** Channels are the low-level primitive beneath Flow, SharedFlow, and StateFlow. They're a coroutine-safe queue: `send()` suspends if buffer full, `receive()` suspends if empty — but never blocks a thread. Use Flow for data streams with operators; use Channel for coroutine-to-coroutine communication where each item must be processed exactly once. Always close channels (or use `produce` which auto-closes).
 
 ---
 

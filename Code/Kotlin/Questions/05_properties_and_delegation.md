@@ -1,11 +1,12 @@
 # Phase 5: Properties and Delegation
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 4 — Functions & Lambdas | [04_functions_lambdas_inlining.md](04_functions_lambdas_inlining.md) |
-| **5 — Properties & Delegation** | ← You are here |
-| 6 — Extension Functions | [06_extension_functions.md](06_extension_functions.md) |
+[← Master Index](master_chains.md)
+
+## Questions in This File
+- [Q5.1 — `lateinit` Internals](#q51--lateinit-internals)
+- [Q5.2 — `lazy` Internals](#q52--lazy-internals)
+- [Q5.3 — Delegates](#q53--delegates)
 
 ---
 
@@ -144,6 +145,8 @@ if (this.binding != null) {  // just a null check! No reflection!
 
 ## Q5.2 — `lazy` Internals
 
+> **Builds on:** [Q0.1 — Heap allocation](00_jvm_mental_model.md#q01--primitives-vs-references) · [Q0.3 — Class loading timing](00_jvm_mental_model.md#q03--class-loading-and-the-static--block)
+> **Connects to:** [Q5.3 — Delegates](05_properties_and_delegation.md#q53--delegates) · [Q2.5.5 — lazy vs eager init](02_5_initialization_mechanics.md#q255--property-initializer-order-traps)
 > **Reference:** [Kotlin Docs — Lazy properties](https://kotlinlang.org/docs/delegated-properties.html#lazy-properties)
 
 ### First Principles: What Problem Does `lazy` Solve?
@@ -283,7 +286,19 @@ class MyFragment : Fragment() {
 }
 ```
 
-**The problem:** `lazy` caches the first value forever. When a Fragment's view is destroyed and recreated, the cached adapter may hold references to the destroyed views. This is both a memory leak and a functional bug.
+**Why Fragment views are destroyed on backstack (not just rotation):** When a Fragment is placed on the back stack, Android calls `onDestroyView()` — destroying the Fragment's entire View hierarchy to reclaim memory — but **keeps the Fragment instance alive** (`onDestroy()` is NOT called). When the user navigates back, `onCreateView()` runs again, creating a fresh View hierarchy. This is by design: the Fragment object acts as a controller that outlives its views.
+
+```
+Back stack navigation lifecycle:
+                                                  Fragment instance: ALIVE throughout
+                                                          │
+navigate forward   ──►  onPause → onStop → onDestroyView()    ← view destroyed!
+navigate back      ──►  onCreateView() → onViewCreated()      ← fresh view created
+```
+
+This means anything held in a `lazy` property on the Fragment object **persists across backstack transitions** — but the Views it captured are gone (detached, null window token).
+
+**The problem:** `lazy` caches the first value forever. When a Fragment's view is destroyed and recreated (see [Q16.1 — Fragment Lifecycle](16_android_system_internals.md#q161--activity-and-fragment-lifecycle)), the cached adapter may hold references to the destroyed views. This is both a memory leak and a functional bug.
 
 **Fix:** Use `viewLifecycleOwner.lifecycleScope` and re-create view-related objects, or use `viewBinding` which is reset properly.
 
@@ -291,6 +306,8 @@ class MyFragment : Fragment() {
 
 ## Q5.3 — Delegates
 
+> **Builds on:** [Q5.1 — lateinit internals](05_properties_and_delegation.md#q51--lateinit-internals) · [Q0.1 — primitives vs references](00_jvm_mental_model.md#q01--primitives-vs-references)
+> **Connects to:** [Q5.1 — why primitives can't use lateinit](05_properties_and_delegation.md#q51--lateinit-internals) · [Q0.2 — boxing](00_jvm_mental_model.md#q02--jvm-type-mapping)
 > **Reference:** [Kotlin Docs — Delegated Properties](https://kotlinlang.org/docs/delegated-properties.html)
 
 ### First Principles: What Is Delegation?
@@ -361,9 +378,9 @@ public class Config {
 
 ### `Delegates.notNull<Int>()` — The `lateinit` Workaround for Primitives
 
-Recall: `lateinit` can't work with `Int` because `Int` maps to primitive `int` and there's no null sentinel.
+Recall: [`lateinit`](05_properties_and_delegation.md#q51--lateinit-internals) can't work with `Int` because `Int` maps to primitive `int` and there's no null sentinel.
 
-`Delegates.notNull<Int>()` stores the value as `Any?` internally (boxing the int), using `null` as the sentinel:
+`Delegates.notNull<Int>()` stores the value as `Any?` internally ([boxing](00_jvm_mental_model.md#q02--jvm-type-mapping) the int), using `null` as the sentinel:
 
 ```kotlin
 class Counter {

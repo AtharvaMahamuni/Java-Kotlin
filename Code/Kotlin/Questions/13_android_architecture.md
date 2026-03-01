@@ -1,16 +1,23 @@
 # Phase 13: Android Architecture
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 12 — Reflection & References | [12_reference_operators_and_reflection.md](12_reference_operators_and_reflection.md) |
-| **13 — Android Architecture** | ← You are here |
-| 14 — Jetpack Components | [14_jetpack_components.md](14_jetpack_components.md) |
+[← Master Index](master_chains.md)
+
+## Questions in This File
+- [Q13.1 — MVVM and Unidirectional Data Flow](#q131--mvvm-and-unidirectional-data-flow)
+- [Q13.2 — Clean Architecture Layer Boundaries](#q132--clean-architecture-layer-boundaries)
+- [Q13.3 — ViewModel Internals](#q133--viewmodel-internals)
+- [Q13.4 — LiveData vs StateFlow vs SharedFlow](#q134--livedata-vs-stateflow-vs-sharedflow)
+- [Q13.5 — Dependency Injection](#q135--dependency-injection)
+- [Q13.6 — Repository and Offline-First Patterns](#q136--repository-and-offline-first-patterns)
+- [Q13.7 — Error Handling Across Layers](#q137--error-handling-across-layers)
 
 ---
 
 ## Q13.1 — MVVM and Unidirectional Data Flow
 
+> **Builds on:** [Q10.4 — Lifecycle Scopes](10_structured_concurrency.md#q104--lifecycle-scopes-and-process-death) · [Q11.3 — StateFlow for state](11_flow.md#q113--stateflow-vs-sharedflow)
+> **Connects to:** [Q13.2 — Clean Architecture](13_android_architecture.md#q132--clean-architecture-layer-boundaries) · [Q13.3 — ViewModel](13_android_architecture.md#q133--viewmodel-internals)
 > **Reference:** [Android Docs — Guide to app architecture](https://developer.android.com/topic/architecture)
 
 ### First Principles: Why Architecture Patterns?
@@ -111,6 +118,8 @@ class UserViewModel(
 
 ## Q13.2 — Clean Architecture Layer Boundaries
 
+> **Builds on:** [Q13.1 — MVVM](13_android_architecture.md#q131--mvvm-and-unidirectional-data-flow)
+> **Connects to:** [Q13.5 — Dependency Injection](13_android_architecture.md#q135--dependency-injection) · [Q13.7 — Error Handling](13_android_architecture.md#q137--error-handling-across-layers)
 > **Reference:** [Android Docs — Presentation, domain, and data layers](https://developer.android.com/topic/architecture/domain-layer)
 
 ### First Principles: The Dependency Rule
@@ -222,6 +231,8 @@ class PlaceOrderUseCaseTest {
 
 ## Q13.3 — ViewModel Internals
 
+> **Builds on:** [Q10.4 — Lifecycle Scopes](10_structured_concurrency.md#q104--lifecycle-scopes-and-process-death) · [Q0.3 — Class loading (ViewModelStore)](00_jvm_mental_model.md#q03--class-loading-and-the-static--block)
+> **Connects to:** [Q11.3 — StateFlow in ViewModel](11_flow.md#q113--stateflow-vs-sharedflow) · [Q13.4 — LiveData vs StateFlow](13_android_architecture.md#q134--livedata-vs-stateflow-vs-sharedflow) · [Q16.1 — Activity lifecycle](16_android_system_internals.md#q161--activity-and-fragment-lifecycle)
 > **Reference:** [Android Docs — ViewModel overview](https://developer.android.com/topic/libraries/architecture/viewmodel)
 
 ### How ViewModel Survives Configuration Changes
@@ -271,7 +282,7 @@ class ComponentActivity : Activity() {
 }
 ```
 
-The `NonConfigurationInstances` mechanism is specifically designed for data that should survive configuration changes but NOT process death.
+The `NonConfigurationInstances` mechanism is specifically designed for data that should survive configuration changes but NOT process death ([Q16.1 — Activity lifecycle](16_android_system_internals.md#q161--activity-and-fragment-lifecycle)).
 
 ### Does ViewModel Survive Process Death?
 
@@ -300,7 +311,7 @@ Scenarios:
 
 ### `SavedStateHandle` — Process Death Survivor
 
-`SavedStateHandle` hooks into Android's `onSaveInstanceState` mechanism. Data stored in it is serialized to a Bundle (Binder IPC) and persisted.
+[`SavedStateHandle`](16_android_system_internals.md#q161--activity-and-fragment-lifecycle) hooks into Android's `onSaveInstanceState` mechanism. Data stored in it is serialized to a Bundle (Binder IPC) and persisted.
 
 ```kotlin
 class UserViewModel(
@@ -319,7 +330,7 @@ class UserViewModel(
 
 **How it works under the hood:**
 1. `SavedStateHandle` is backed by a `Bundle` that is saved in `onSaveInstanceState`
-2. `onSaveInstanceState` stores this Bundle via Binder IPC to the system server
+2. `onSaveInstanceState` stores this Bundle via [Binder IPC](16_android_system_internals.md#q163--binder-ipc) to the system server
 3. System server persists it
 4. On process restore, the Bundle is passed back via `intent.extras`
 
@@ -358,6 +369,9 @@ val viewModel: SharedViewModel by navGraphViewModels(R.id.nav_graph_orders)
 ---
 
 ## Q13.4 — LiveData vs StateFlow vs SharedFlow
+
+> **Builds on:** [Q11.3 — StateFlow vs SharedFlow](11_flow.md#q113--stateflow-vs-sharedflow) · [Q13.3 — ViewModel](13_android_architecture.md#q133--viewmodel-internals)
+> **Connects to:** [Q11.4 — Flow collection lifecycle](11_flow.md#q114--flow-collection-and-lifecycle)
 
 ### The Four Key Differences: LiveData vs StateFlow
 
@@ -424,6 +438,8 @@ viewModelScope.launch { _events.send(UiEvent.Navigate("Detail")) }
 
 ## Q13.5 — Dependency Injection
 
+> **Builds on:** [Q2.5.6 — Constructor visibility and factory](02_5_initialization_mechanics.md#q256--constructor-visibility-and-factory-patterns) · [Q2.5.2 — @Inject constructor](02_5_initialization_mechanics.md#q252--primary-vs-secondary-constructors)
+> **Connects to:** [Q13.2 — Clean Architecture layers](13_android_architecture.md#q132--clean-architecture-layer-boundaries)
 > **Reference:** [Hilt Docs](https://developer.android.com/training/dependency-injection/hilt-android)
 
 ### First Principles: DI vs Service Locator
@@ -541,6 +557,9 @@ You never write a `ViewModelFactory` — Hilt generates it from the `@HiltViewMo
 ---
 
 ## Q13.6 — Repository and Offline-First Patterns
+
+> **Builds on:** [Q13.2 — Clean Architecture](13_android_architecture.md#q132--clean-architecture-layer-boundaries) · [Q11.3 — StateFlow](11_flow.md#q113--stateflow-vs-sharedflow)
+> **Connects to:** [Q13.7 — Error Handling](13_android_architecture.md#q137--error-handling-across-layers) · [Q14.1 — Room](14_jetpack_components.md#q141--room--internals) · [Q15.1 — OkHttp](15_networking.md#q151--okhttp-interceptor-chain)
 
 ### The Single Source of Truth Pattern
 
@@ -695,7 +714,8 @@ fun mergeUser(local: User, server: User): User {
 
 ## Q13.7 — Error Handling Across Layers
 
-> **Builds on:** [Q10.3 — CancellationException](10_structured_concurrency.md#103-exception-handling-rules) · [Q13.2 — Clean Architecture](13_android_architecture.md#q132--clean-architecture-layer-boundaries)
+> **Builds on:** [Q13.6 — Repository](13_android_architecture.md#q136--repository-and-offline-first-patterns) · [Q10.3 — Coroutine exception handling](10_structured_concurrency.md#q103--exception-handling-rules)
+> **Connects to:** [Q4.3 — CancellationException](04_functions_lambdas_inlining.md#q43--higher-order-functions-with-suspend)
 
 ### First Principles: Why Layers Need Different Error Types
 

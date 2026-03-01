@@ -2,13 +2,30 @@
 
 > These are the interview chains — each link is a question that naturally leads to the next. Interviewers follow these paths to find where your knowledge ends.
 
-## Navigation
-| Phase | File |
-|-------|------|
-| 0 — JVM Mental Model | [00_jvm_mental_model.md](00_jvm_mental_model.md) |
-| 1 — Type System | [01_type_system_foundations.md](01_type_system_foundations.md) |
-| 17 — Performance & Memory | [17_performance_and_memory.md](17_performance_and_memory.md) |
-| **Master Chains** | ← You are here |
+## Navigation — Master Index
+
+| Phase | File | Questions |
+|-------|------|-----------|
+| 0 — JVM Mental Model | [00_jvm_mental_model.md](00_jvm_mental_model.md) | Q0.1 · Q0.2 · Q0.3 · Q0.4 · Q0.5 |
+| 1 — Type System | [01_type_system_foundations.md](01_type_system_foundations.md) | Q1.1 · Q1.2 · Q1.3 · Q1.4 |
+| 2 — Classes & Objects | [02_classes_and_objects.md](02_classes_and_objects.md) | Q2.1 · Q2.2 · Q2.3 · Q2.4 · Q2.5 |
+| 2.5 — Initialization | [02_5_initialization_mechanics.md](02_5_initialization_mechanics.md) | Q2.5.1 · Q2.5.2 · Q2.5.3 · Q2.5.4 · Q2.5.5 · Q2.5.6 |
+| 3 — Generics & Variance | [03_generics_and_variance.md](03_generics_and_variance.md) | Q3.1 · Q3.2 · Q3.3 · Q3.4 |
+| 4 — Functions & Lambdas | [04_functions_lambdas_inlining.md](04_functions_lambdas_inlining.md) | Q4.1 · Q4.2 · Q4.3 · Q4.4 · Q4.5 |
+| 5 — Properties & Delegation | [05_properties_and_delegation.md](05_properties_and_delegation.md) | Q5.1 · Q5.2 · Q5.3 |
+| 6 — Extension Functions | [06_extension_functions.md](06_extension_functions.md) | Q6.1 · Q6.2 · Q6.3 |
+| 7 — Collections & Sequences | [07_collections_and_sequences.md](07_collections_and_sequences.md) | Q7.1 · Q7.2 · Q7.3 |
+| 8 — Other Kotlin Features | [08_other_kotlin_features.md](08_other_kotlin_features.md) | Q8.1 · Q8.2 · Q8.3 |
+| 9 — Coroutines Mechanics | [09_coroutines_execution_mechanics.md](09_coroutines_execution_mechanics.md) | Q9.1 · Q9.2 · Q9.3 · Q9.4 |
+| 10 — Structured Concurrency | [10_structured_concurrency.md](10_structured_concurrency.md) | Q10.1 · Q10.2 · Q10.3 · Q10.4 · Q10.5 · Q10.6 |
+| 11 — Flow | [11_flow.md](11_flow.md) | Q11.1 · Q11.2 · Q11.3 · Q11.4 · Q11.5 |
+| 12 — Reflection & References | [12_reference_operators_and_reflection.md](12_reference_operators_and_reflection.md) | Q12.1 · Q12.2 |
+| 13 — Android Architecture | [13_android_architecture.md](13_android_architecture.md) | Q13.1 · Q13.2 · Q13.3 · Q13.4 · Q13.5 · Q13.6 · Q13.7 |
+| 14 — Jetpack Components | [14_jetpack_components.md](14_jetpack_components.md) | Q14.1 · Q14.2 · Q14.3 · Q14.4 |
+| 15 — Networking | [15_networking.md](15_networking.md) | Q15.1 · Q15.2 · Q15.3 |
+| 16 — Android System Internals | [16_android_system_internals.md](16_android_system_internals.md) | Q16.1 · Q16.2 · Q16.3 · Q16.4 · Q16.5 |
+| 17 — Performance & Memory | [17_performance_and_memory.md](17_performance_and_memory.md) | Q17.1 · Q17.2 · Q17.3 · Q17.4 |
+| **Master Chains** | ← You are here | Chains A–H |
 
 ---
 

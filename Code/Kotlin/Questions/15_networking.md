@@ -1,16 +1,19 @@
 # Phase 15: Networking
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 14 — Jetpack Components | [14_jetpack_components.md](14_jetpack_components.md) |
-| **15 — Networking** | ← You are here |
-| 16 — Android System Internals | [16_android_system_internals.md](16_android_system_internals.md) |
+[← Master Index](master_chains.md)
+
+## Questions in This File
+- [Q15.1 — OkHttp Interceptor Chain](#q151--okhttp-interceptor-chain)
+- [Q15.2 — Token Refresh Pattern](#q152--token-refresh-pattern)
+- [Q15.3 — JSON Serialization Pitfalls](#q153--json-serialization-pitfalls)
 
 ---
 
 ## Q15.1 — OkHttp Interceptor Chain
 
+> **Builds on:** [Q4.3 — suspend (OkHttp uses coroutines)](04_functions_lambdas_inlining.md#q43--higher-order-functions-with-suspend)
+> **Connects to:** [Q15.2 — Token Refresh Pattern](15_networking.md#q152--token-refresh-pattern) · [Q10.3 — CancellationException in network calls](10_structured_concurrency.md#q103--exception-handling-rules)
 > **Reference:** [OkHttp Docs — Interceptors](https://square.github.io/okhttp/features/interceptors/)
 
 ### First Principles: What Is an Interceptor?
@@ -112,11 +115,13 @@ class TokenAuthenticator(private val tokenProvider: TokenProvider) : Authenticat
 
 ## Q15.2 — Token Refresh Pattern
 
+> **Builds on:** [Q15.1 — OkHttp Interceptor Chain](15_networking.md#q151--okhttp-interceptor-chain)
+> **Connects to:** [Q10.3 — Coroutine cancellation during refresh](10_structured_concurrency.md#q103--exception-handling-rules) · [Q13.6 — Repository pattern](13_android_architecture.md#q136--repository-and-offline-first-patterns)
 > **Reference:** [OkHttp Docs — Authenticator](https://square.github.io/okhttp/recipes/#handling-authentication-kt)
 
 ### Why Token Refresh Needs a Mutex
 
-Imagine 3 parallel API calls all get a 401 simultaneously (token expired):
+The [mutex](10_structured_concurrency.md#q102--coroutinescope-vs-supervisorscope) prevents concurrent refresh attempts. Imagine 3 parallel API calls all get a 401 simultaneously (token expired):
 
 ```
 Without Mutex:
@@ -207,6 +212,8 @@ override fun authenticate(route: Route?, response: Response): Request? {
 
 ## Q15.3 — JSON Serialization Pitfalls
 
+> **Builds on:** [Q3.3 — reified (used for JSON parsing)](03_generics_and_variance.md#q33--reified-type-parameters) · [Q2.2 — Data Classes (serialization targets)](02_classes_and_objects.md#q22--data-classes)
+> **Connects to:** [Q13.6 — Repository data mapping](13_android_architecture.md#q136--repository-and-offline-first-patterns)
 > **Reference:** [Kotlin Serialization Docs](https://kotlinlang.org/docs/serialization.html)
 
 ### Why Gson Is Dangerous With Kotlin Data Classes

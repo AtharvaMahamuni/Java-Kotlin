@@ -1,11 +1,12 @@
 # Phase 7: Collections and Sequences
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 6 — Extension Functions | [06_extension_functions.md](06_extension_functions.md) |
-| **7 — Collections & Sequences** | ← You are here |
-| 8 — Other Kotlin Features | [08_other_kotlin_features.md](08_other_kotlin_features.md) |
+[← Master Index](master_chains.md)
+
+## Questions in This File
+- [Q7.1 — Kotlin's Collection Hierarchy](#q71--kotlins-collection-hierarchy)
+- [Q7.2 — Sequences vs Eager Collections](#q72--sequences-vs-eager-collections)
+- [Q7.3 — Common Collection Pitfalls](#q73--common-collection-pitfalls)
 
 ---
 
@@ -49,7 +50,7 @@ kotlin.collections
 
 ### Why `List` is Covariant (`out E`) but `MutableList` is Not
 
-**`List<out E>`** — covariant because `List` only has read operations:
+[`List<out E>`](03_generics_and_variance.md#q32--variance) — [covariant](03_generics_and_variance.md#q32--variance) because `List` only has read operations:
 ```kotlin
 interface List<out E> {
     fun get(index: Int): E    // E in OUT position — returns E, never stores it
@@ -105,7 +106,7 @@ Array<Int>: [ref1][ref2][ref3]  4 bytes each (references) = 12 bytes + header
 Total:       ~16 bytes           ~60 bytes — 3.75× more memory!
 ```
 
-**Rule:** For numeric arrays in performance-critical code (game loops, image processing, audio), always use `IntArray`, `FloatArray`, `LongArray` — never `Array<Int>`.
+**Rule:** For numeric arrays in performance-critical code (game loops, image processing, audio), always use `IntArray`, `FloatArray`, `LongArray` — never `Array<Int>` (see [Q0.2 — boxing cost](00_jvm_mental_model.md#q02--jvm-type-mapping)).
 
 ### `listOf()` — Backed by `Arrays.asList()`
 
@@ -142,8 +143,9 @@ val b = listOf<Int>()      // also returns a SINGLETON empty list (same as empty
 
 ## Q7.2 — Sequences vs Eager Collections
 
+> **Builds on:** [Q4.2 — inline (all sequence operators are inline)](04_functions_lambdas_inlining.md#q42--inline-noinline-crossinline) · [Q4.1 — lambda allocation cost](04_functions_lambdas_inlining.md#q41--lambda-compilation)
+> **Connects to:** [Q11.1 — Flow (async counterpart to Sequence)](11_flow.md#q111--cold-vs-hot-streams)
 > **Reference:** [Kotlin Docs — Sequences](https://kotlinlang.org/docs/sequences.html)
-> **Connects to:** [Q11.1 — Flow](11_flow.md)
 
 ### First Principles: Eager vs Lazy Evaluation
 
@@ -247,12 +249,14 @@ lines.filter { it.isNotBlank() }.take(100).toList()
 | Concurrent collection | No | Yes (with `buffer`, etc.) |
 | Cold | Yes | Yes |
 
-`Flow` is the async equivalent of `Sequence` — it uses the same lazy element-by-element processing model, but each step can `suspend`. (→ See [Q11.1 Flow](11_flow.md))
+`Flow` is the async equivalent of `Sequence` — it uses the same lazy element-by-element processing model, but each step can `suspend`. (→ See [Q11.1 — Cold vs Hot Streams](11_flow.md#q111--cold-vs-hot-streams))
 
 ---
 
 ## Q7.3 — Common Collection Pitfalls
 
+> **Builds on:** [Q7.1 — Collection Hierarchy](07_collections_and_sequences.md#q71--kotlins-collection-hierarchy) · [Q0.1 — heap allocation](00_jvm_mental_model.md#q01--primitives-vs-references)
+> **Connects to:** [Q14.4 — Thread-Safe Caching](14_jetpack_components.md#q144--thread-safe-caching)
 > **Reference:** [Kotlin Docs — Collection Operations](https://kotlinlang.org/docs/collection-operations.html)
 
 ### `ConcurrentModificationException` — The Modification Flag

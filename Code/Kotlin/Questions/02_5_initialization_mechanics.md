@@ -3,20 +3,22 @@
 > **Core Rule:** JVM initializes **top-to-bottom, superclass-before-subclass, delegation-before-body**. Every trap in this section comes from this single rule.
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 0 — JVM Mental Model | [00_jvm_mental_model.md](00_jvm_mental_model.md) |
-| 1 — Type System | [01_type_system_foundations.md](01_type_system_foundations.md) |
-| 2 — Classes & Objects | [02_classes_and_objects.md](02_classes_and_objects.md) |
-| **2.5 — Initialization** | ← You are here |
-| 3 — Generics & Variance | [03_generics_and_variance.md](03_generics_and_variance.md) |
-| 4 — Functions & Lambdas | [04_functions_lambdas_inlining.md](04_functions_lambdas_inlining.md) |
-| 5 — Properties & Delegation | [05_properties_and_delegation.md](05_properties_and_delegation.md) |
-| Master Chains | [master_chains.md](master_chains.md) |
+[← Master Index](master_chains.md)
+
+## Questions in This File
+- [Q2.5.1 — Primary Constructor vs `init` Block](#q251--primary-constructor-vs-init-block)
+- [Q2.5.2 — Primary vs Secondary Constructors](#q252--primary-vs-secondary-constructors)
+- [Q2.5.3 — Inheritance Initialization Order](#q253--inheritance-initialization-order)
+- [Q2.5.4 — Companion Object and Object Initialization](#q254--companion-object-and-object-initialization)
+- [Q2.5.5 — Property Initializer Order Traps](#q255--property-initializer-order-traps)
+- [Q2.5.6 — Constructor Visibility and Factory Patterns](#q256--constructor-visibility-and-factory-patterns)
 
 ---
 
 ## Q2.5.1 — Primary Constructor vs `init` Block
+
+> **Builds on:** [Q0.3 — Class Loading (`<init>` method)](00_jvm_mental_model.md#q03--class-loading-and-the-static--block)
+> **Connects to:** [Q2.5.2 (secondary constructors)](02_5_initialization_mechanics.md#q252--primary-vs-secondary-constructors) · [Q2.5.3 (inheritance order)](02_5_initialization_mechanics.md#q253--inheritance-initialization-order)
 
 ### Are They the Same at the Bytecode Level?
 
@@ -93,6 +95,9 @@ With declaration-order interleaving, `processName()` is called when `name` is st
 
 ## Q2.5.2 — Primary vs Secondary Constructors
 
+> **Builds on:** [Q2.5.1 — Primary Constructor](02_5_initialization_mechanics.md#q251--primary-constructor-vs-init-block)
+> **Connects to:** [Q4.5 — Default Parameters (prefer over secondary constructors)](04_functions_lambdas_inlining.md#q45--named-and-default-parameters) · [Q2.5.6 — Constructor Visibility](02_5_initialization_mechanics.md#q256--constructor-visibility-and-factory-patterns)
+
 ### Why Must Secondary Constructors Delegate to Primary?
 
 The JVM `<init>` method **must** call another `<init>` as its first action (via `INVOKESPECIAL`) — either a superclass `<init>` or another constructor in the same class. This is a JVM specification requirement.
@@ -146,6 +151,9 @@ class User(val name: String, val age: Int) {
 ---
 
 ## Q2.5.3 — Inheritance Initialization Order
+
+> **Builds on:** [Q2.5.1 — init Block Order](02_5_initialization_mechanics.md#q251--primary-constructor-vs-init-block) · [Q2.1 — open/final Modifiers](02_classes_and_objects.md#q21--class-modifiers)
+> **Connects to:** [Q0.4 — INVOKEVIRTUAL dispatch](00_jvm_mental_model.md#q04--the-jvm-call-stack) · [Q2.1 — Why final is safe](02_classes_and_objects.md#q21--class-modifiers)
 
 > **This section contains the most dangerous trap in all of Kotlin.**
 
@@ -230,7 +238,7 @@ Dog()  // prints: null (not "Woof")
 
 ### How `final` Removes the Danger
 
-If `Animal` is `final` (or `sound()` is `final`/`private`), the compiler uses `INVOKESPECIAL` (direct call) instead of `INVOKEVIRTUAL` (virtual dispatch). There's no override possible, so the call in `init` always resolves to the base class method — which IS fully initialized.
+If `Animal` is `final` (or `sound()` is `final`/`private`), the compiler uses `INVOKESPECIAL` (direct call) instead of [`INVOKEVIRTUAL`](00_jvm_mental_model.md#q04--the-jvm-call-stack) (virtual dispatch). There's no override possible, so the call in `init` always resolves to the base class method — which IS fully initialized.
 
 ```kotlin
 class Animal {  // final by default!
@@ -260,6 +268,9 @@ class EventManager {
 
 ## Q2.5.4 — Companion Object and Object Initialization
 
+> **Builds on:** [Q0.3 — Class Loading and `<clinit>`](00_jvm_mental_model.md#q03--class-loading-and-the-static--block) · [Q2.4 — The `object` Keyword](02_classes_and_objects.md#q24--the-object-keyword)
+> **Connects to:** [Q1.1 — const val inlining](01_type_system_foundations.md#q11--val-vs-const-val) · [Q2.5.1 — init block timing](02_5_initialization_mechanics.md#q251--primary-constructor-vs-init-block)
+
 ### When Does a `companion object` Get Initialized?
 
 A `companion object` is initialized **lazily** — on the first access to any of its non-const members.
@@ -281,7 +292,7 @@ Log.d(Config.TAG, "message")  // → Log.d("Config", "message") — no class loa
 
 ### Why `const val` Doesn't Trigger Companion Initialization
 
-`const val` is **inlined at the call site** at compile time — the compiler replaces `Config.TAG` with the literal `"Config"`. The JVM never needs to load the `Config` class or its companion, so the static initializer never runs.
+[`const val`](01_type_system_foundations.md#q11--val-vs-const-val) is **inlined at the call site** at compile time — the compiler replaces `Config.TAG` with the literal `"Config"`. The JVM never needs to load the `Config` class or its companion, so the static initializer never runs.
 
 This is proven by looking at the bytecode:
 ```bytecode
@@ -312,6 +323,9 @@ object B {
 ---
 
 ## Q2.5.5 — Property Initializer Order Traps
+
+> **Builds on:** [Q2.5.1 — Interleaved Init Order](02_5_initialization_mechanics.md#q251--primary-constructor-vs-init-block)
+> **Connects to:** [Q5.2 — lazy defers initialization](05_properties_and_delegation.md#q52--lazy-internals) · [Q5.1 — lateinit internals](05_properties_and_delegation.md#q51--lateinit-internals)
 
 ### Can a Property Reference One Declared Below It?
 
@@ -345,7 +359,7 @@ object Config {
 
 `const val` is never "assigned" at runtime — its value is baked directly into bytecodes that reference it. Regular `val` is assigned in `<clinit>` (static initializer) when the class loads.
 
-### `lazy` vs Eager `val` — Timing
+### [`lazy`](05_properties_and_delegation.md#q52--lazy-internals) vs Eager `val` — Timing
 
 ```kotlin
 class Screen {
@@ -367,12 +381,15 @@ screen.lazyData  ← FIRST ACCESS
 
 ## Q2.5.6 — Constructor Visibility and Factory Patterns
 
+> **Builds on:** [Q2.5.2 — Secondary Constructors](02_5_initialization_mechanics.md#q252--primary-vs-secondary-constructors) · [Q2.4 — object singleton pattern](02_classes_and_objects.md#q24--the-object-keyword)
+> **Connects to:** [Q13.5 — Dependency Injection](13_android_architecture.md#q135--dependency-injection)
+
 ### Private Constructor + Factory Pattern
 
 ```kotlin
 class Database private constructor(val url: String) {
     companion object {
-        @Volatile private var instance: Database? = null
+        @Volatile private var instance: Database? = null  // @Volatile ensures visibility across threads (see [Q5.2 — lazy internals](05_properties_and_delegation.md#q52--lazy-internals))
 
         fun getInstance(url: String): Database {
             return instance ?: synchronized(this) {

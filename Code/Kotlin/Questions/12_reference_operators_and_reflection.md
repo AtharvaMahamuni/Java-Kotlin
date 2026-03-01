@@ -1,17 +1,18 @@
 # Phase 12: Reference Operators and Reflection
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 11 — Flow | [11_flow.md](11_flow.md) |
-| **12 — Reference Operators & Reflection** | ← You are here |
-| 13 — Android Architecture | [13_android_architecture.md](13_android_architecture.md) |
+[← Master Index](master_chains.md)
+
+## Questions in This File
+- [Q12.1 — `::` Operators](#q121----operators)
+- [Q12.2 — `KClass` vs `Class`](#q122--kclass-vs-class)
 
 ---
 
 ## Q12.1 — `::` Operators
 
 > **Builds on:** [Q4.1 — Lambda anonymous class](04_functions_lambdas_inlining.md#q41--lambda-compilation) · [Q4.2 — inline](04_functions_lambdas_inlining.md#q42--inline-noinline-crossinline)
+> **Connects to:** [Q3.3 — reified (T::class inside reified)](03_generics_and_variance.md#q33--reified-type-parameters) · [Q12.2 — KClass vs Class](12_reference_operators_and_reflection.md#q122--kclass-vs-class)
 > **Reference:** [Kotlin Docs — Callable References](https://kotlinlang.org/docs/reflection.html#callable-references)
 
 ### First Principles: What Is a Function Reference?
@@ -46,7 +47,7 @@ Function1<String, String> ref = new Function1<String, String>() {
 };
 ```
 
-Like lambdas, non-capturing function references can be **singletons** — the compiler may share one instance:
+Like lambdas, non-capturing function references can be [**singletons**](00_jvm_mental_model.md#q03--class-loading-and-the-static--block) (one instance, like `object`) — the compiler may share one instance:
 
 ```kotlin
 // top-level non-capturing function reference — likely a singleton:
@@ -151,6 +152,8 @@ val result = listOf(1, 2, 3, 4).myFilter(::isEven)
 
 ## Q12.2 — `KClass` vs `Class`
 
+> **Builds on:** [Q12.1 — Function References](12_reference_operators_and_reflection.md#q121----operators) · [Q3.3 — reified (uses KClass)](03_generics_and_variance.md#q33--reified-type-parameters)
+> **Connects to:** [Q3.1 — Type Erasure (reflection defeats it)](03_generics_and_variance.md#q31--type-erasure)
 > **Reference:** [Kotlin Docs — Reflection](https://kotlinlang.org/docs/reflection.html)
 
 ### `KClass<T>` vs `Class<T>` — The Difference

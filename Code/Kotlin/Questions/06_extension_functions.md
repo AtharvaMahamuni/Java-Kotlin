@@ -1,16 +1,19 @@
 # Phase 6: Extension Functions
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 5 — Properties & Delegation | [05_properties_and_delegation.md](05_properties_and_delegation.md) |
-| **6 — Extension Functions** | ← You are here |
-| 7 — Collections & Sequences | [07_collections_and_sequences.md](07_collections_and_sequences.md) |
+[← Master Index](master_chains.md)
+
+## Questions in This File
+- [Q6.1 — Compilation and Dispatch](#q61--compilation-and-dispatch)
+- [Q6.2 — Extension Functions as API Design](#q62--extension-functions-as-api-design)
+- [Q6.3 — Extension Properties](#q63--extension-properties)
 
 ---
 
 ## Q6.1 — Compilation and Dispatch
 
+> **Builds on:** [Q0.4 — JVM Call Stack (INVOKESTATIC vs INVOKEVIRTUAL)](00_jvm_mental_model.md#q04--the-jvm-call-stack) · [Q4.1 — Lambda anonymous class](04_functions_lambdas_inlining.md#q41--lambda-compilation)
+> **Connects to:** [Q6.2 — Extension Functions as API Design](06_extension_functions.md#q62--extension-functions-as-api-design) · [Q3.3 — reified extension functions](03_generics_and_variance.md#q33--reified-type-parameters)
 > **Reference:** [Kotlin Docs — Extension Functions](https://kotlinlang.org/docs/extensions.html)
 
 ### First Principles: How Can You Add Methods to a Class You Don't Own?
@@ -94,7 +97,7 @@ fun makeSpeak(animal: Animal) {
 makeSpeak(Dog())  // "Dog speaks" — virtual dispatch works
 ```
 
-The key difference: **member functions use `INVOKEVIRTUAL` (runtime type dispatch); extension functions use `INVOKESTATIC` (compile-time type dispatch).**
+The key difference: **member functions use [`INVOKEVIRTUAL`](00_jvm_mental_model.md#q04--the-jvm-call-stack) (runtime type dispatch); extension functions use `INVOKESTATIC` (compile-time type dispatch).**
 
 ### What Happens When a Member and Extension Have the Same Name?
 
@@ -114,6 +117,9 @@ p.print()  // "Member print" — member ALWAYS wins over extension
 ---
 
 ## Q6.2 — Extension Functions as API Design
+
+> **Builds on:** [Q6.1 — Compilation and Dispatch](06_extension_functions.md#q61--compilation-and-dispatch) · [Q4.4 — Scope Functions](04_functions_lambdas_inlining.md#q44--scope-functions)
+> **Connects to:** [Q6.3 — Extension Properties](06_extension_functions.md#q63--extension-properties) · [Q4.4 — apply for chaining](04_functions_lambdas_inlining.md#q44--scope-functions)
 
 ### When Do Extension Functions Make Sense?
 
@@ -157,7 +163,7 @@ fun RecyclerView.onScrolledToEnd(action: () -> Unit) {
     })
 }
 
-// With apply for fluent chaining (← Q4.4):
+// With apply for fluent chaining (see Q4.4 — Scope Functions):
 recyclerView.apply {
     adapter = myAdapter
     layoutManager = LinearLayoutManager(context)
@@ -197,6 +203,8 @@ The null check happens **inside** the extension function, so calling it on `null
 
 ## Q6.3 — Extension Properties
 
+> **Builds on:** [Q6.1 — Extension Functions (static dispatch)](06_extension_functions.md#q61--compilation-and-dispatch) · [Q0.1 — Heap and backing fields](00_jvm_mental_model.md#q01--primitives-vs-references)
+> **Connects to:** [Q5.3 — Delegates (external storage for extension state)](05_properties_and_delegation.md#q53--delegates)
 > **Reference:** [Kotlin Docs — Extension Properties](https://kotlinlang.org/docs/extensions.html#extension-properties)
 
 ### The Backing Field Restriction

@@ -1,16 +1,20 @@
 # Phase 14: Jetpack Components
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 13 — Android Architecture | [13_android_architecture.md](13_android_architecture.md) |
-| **14 — Jetpack Components** | ← You are here |
-| 15 — Networking | [15_networking.md](15_networking.md) |
+[← Master Index](master_chains.md)
+
+## Questions in This File
+- [Q14.1 — Room — Internals](#q141--room--internals)
+- [Q14.2 — WorkManager](#q142--workmanager)
+- [Q14.3 — Paging 3](#q143--paging-3)
+- [Q14.4 — Thread-Safe Caching](#q144--thread-safe-caching)
 
 ---
 
 ## Q14.1 — Room — Internals
 
+> **Builds on:** [Q11.3 — Flow (Room returns Flow)](11_flow.md#q113--stateflow-vs-sharedflow) · [Q9.2 — Dispatchers.IO for DB](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
+> **Connects to:** [Q13.6 — Repository pattern](13_android_architecture.md#q136--repository-and-offline-first-patterns) · [Q14.2 — WorkManager](14_jetpack_components.md#q142--workmanager)
 > **Reference:** [Android Docs — Room persistence library](https://developer.android.com/training/data-storage/room)
 
 ### First Principles: What Is Room?
@@ -76,7 +80,7 @@ suspend fun getUserWithOrders(userId: String): UserWithOrders
 
 ### How Room's `Flow<List<T>>` Auto-Emits
 
-Room uses an **invalidation tracker** to detect when a table has changed:
+Room uses an **invalidation tracker** to detect when a table has changed. [`Flow`](11_flow.md#q111--cold-vs-hot-streams) from Room auto-emits whenever the observed table is invalidated:
 
 ```
 Room Invalidation Mechanism:
@@ -175,6 +179,8 @@ If you bump the version WITHOUT providing a migration: **`IllegalStateException:
 
 ## Q14.2 — WorkManager
 
+> **Builds on:** [Q16.2 — Background Work Evolution](16_android_system_internals.md#q162--background-work-evolution)
+> **Connects to:** [Q10.4 — Lifecycle Scopes](10_structured_concurrency.md#q104--lifecycle-scopes-and-process-death)
 > **Reference:** [Android Docs — Schedule tasks with WorkManager](https://developer.android.com/topic/libraries/architecture/workmanager)
 
 ### Why a `Service` Doesn't Guarantee Background Work
@@ -280,6 +286,8 @@ WorkManager.enqueueUniqueWork("sync", ExistingWorkPolicy.APPEND, request)
 
 ## Q14.3 — Paging 3
 
+> **Builds on:** [Q11.2 — Flow Operators](11_flow.md#q112--flow-operators) · [Q14.1 — Room](14_jetpack_components.md#q141--room--internals)
+> **Connects to:** [Q11.4 — Flow collection](11_flow.md#q114--flow-collection-and-lifecycle)
 > **Reference:** [Android Docs — Paging 3 library](https://developer.android.com/topic/libraries/architecture/paging/v3-overview)
 
 ### `PagingSource` vs `RemoteMediator`
@@ -399,6 +407,8 @@ UI always shows Room data; network seamlessly fills Room in background
 
 ## Q14.4 — Thread-Safe Caching
 
+> **Builds on:** [Q7.3 — Collection pitfalls](07_collections_and_sequences.md#q73--common-collection-pitfalls) · [Q5.2 — lazy double-checked locking](05_properties_and_delegation.md#q52--lazy-internals)
+> **Connects to:** [Q17.1 — Memory Leaks](17_performance_and_memory.md#q171--memory-leaks--top-5-causes)
 > **Reference:** [Kotlin Docs — Shared mutable state and concurrency](https://kotlinlang.org/docs/shared-mutable-state-and-concurrency.html)
 
 ### `Mutex.withLock` vs `synchronized` — Key Difference

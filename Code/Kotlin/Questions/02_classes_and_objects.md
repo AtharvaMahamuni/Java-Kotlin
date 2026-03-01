@@ -1,35 +1,21 @@
 # Phase 2: Classes and Objects
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 0 — JVM Mental Model | [00_jvm_mental_model.md](00_jvm_mental_model.md) |
-| 1 — Type System | [01_type_system_foundations.md](01_type_system_foundations.md) |
-| **2 — Classes & Objects** | ← You are here |
-| 2.5 — Initialization | [02_5_initialization_mechanics.md](02_5_initialization_mechanics.md) |
-| 3 — Generics & Variance | [03_generics_and_variance.md](03_generics_and_variance.md) |
-| 4 — Functions & Lambdas | [04_functions_lambdas_inlining.md](04_functions_lambdas_inlining.md) |
-| 5 — Properties & Delegation | [05_properties_and_delegation.md](05_properties_and_delegation.md) |
-| 6 — Extension Functions | [06_extension_functions.md](06_extension_functions.md) |
-| 7 — Collections & Sequences | [07_collections_and_sequences.md](07_collections_and_sequences.md) |
-| 8 — Other Kotlin Features | [08_other_kotlin_features.md](08_other_kotlin_features.md) |
-| 9 — Coroutines Mechanics | [09_coroutines_execution_mechanics.md](09_coroutines_execution_mechanics.md) |
-| 10 — Structured Concurrency | [10_structured_concurrency.md](10_structured_concurrency.md) |
-| 11 — Flow | [11_flow.md](11_flow.md) |
-| 12 — Reflection & References | [12_reference_operators_and_reflection.md](12_reference_operators_and_reflection.md) |
-| 13 — Android Architecture | [13_android_architecture.md](13_android_architecture.md) |
-| 14 — Jetpack Components | [14_jetpack_components.md](14_jetpack_components.md) |
-| 15 — Networking | [15_networking.md](15_networking.md) |
-| 16 — Android System Internals | [16_android_system_internals.md](16_android_system_internals.md) |
-| 17 — Performance & Memory | [17_performance_and_memory.md](17_performance_and_memory.md) |
-| Master Chains | [master_chains.md](master_chains.md) |
+[← Master Index](master_chains.md)
+
+## Questions in This File
+- [Q2.1 — Class Modifiers](#q21--class-modifiers)
+- [Q2.2 — Data Classes](#q22--data-classes)
+- [Q2.3 — Sealed Classes and Interfaces](#q23--sealed-classes-and-interfaces)
+- [Q2.4 — The `object` Keyword](#q24--the-object-keyword)
+- [Q2.5 — Value Classes](#q25--value-classes)
 
 ---
 
 ## Q2.1 — Class Modifiers
 
 > **Builds on:** [Q0.4 — Virtual dispatch](00_jvm_mental_model.md#q04--the-jvm-call-stack)
-> **Connects to:** [Q2.5.3 (open function in init is dangerous)](02_5_initialization_mechanics.md#q253--inheritance-initialization-order)
+> **Connects to:** [Q2.5.3 (open function in init is dangerous)](02_5_initialization_mechanics.md#q253--inheritance-initialization-order) · [Q3.2 (final enables devirtualization)](03_generics_and_variance.md#q32--variance)
 
 ### Why Are Kotlin Classes `final` by Default?
 
@@ -93,6 +79,8 @@ final class vtable:          open class vtable:
                              │ (subclass can replace this) │
                              └─────────────────────────────┘
 ```
+
+**Why Kotlin's `final` default matters:** When a class is `final`, the JIT compiler knows there's only ONE possible implementation. It can devirtualize the call (see [Q0.4 — The JVM Call Stack](00_jvm_mental_model.md#q04--the-jvm-call-stack) for vtable details).
 
 ### `abstract` vs `open` — Architectural Choice
 
@@ -212,7 +200,7 @@ val deepCopy = original.copy(settings = original.settings.toMutableList())
 
 ### `@UnsafeVariance` in `List.contains()`
 
-`List<out E>` is covariant — `E` only appears in "out" (producer) positions. But `contains(element: E)` takes `E` as a parameter (in position), which violates covariance.
+[`List<out E>`](07_collections_and_sequences.md#q71--kotlins-collection-hierarchy) is [covariant](03_generics_and_variance.md#q32--variance) — `E` only appears in "out" (producer) positions. But `contains(element: E)` takes `E` as a parameter (in position), which violates covariance.
 
 The Kotlin stdlib uses `@UnsafeVariance` to override this restriction:
 
@@ -229,7 +217,8 @@ It's "safe" here because `contains` only **reads** `element` to compare it — i
 
 ## Q2.3 — Sealed Classes and Interfaces
 
-> **Connects to:** [Q1.3 (Nothing in sealed subtypes)](01_type_system_foundations.md#q13--nothing-unit-and-the-type-hierarchy)
+> **Builds on:** [Q1.3 — Nothing, Unit](01_type_system_foundations.md#q13--nothing-unit-and-the-type-hierarchy) · [Q2.1 — Class Modifiers (final/open)](02_classes_and_objects.md#q21--class-modifiers)
+> **Connects to:** [Q1.3 (Nothing in sealed subtypes)](01_type_system_foundations.md#q13--nothing-unit-and-the-type-hierarchy) · [Q1.4 (when exhaustiveness)](01_type_system_foundations.md#q14--smart-casts)
 
 ### What Bytecode Does `sealed class` Compile To?
 
@@ -445,7 +434,7 @@ public final class UserRepository {
 }
 ```
 
-**Key difference:** `companion object` members live in a `Companion` class. From Java, you call `UserRepository.Companion.create()` unless annotated with `@JvmStatic`, which generates a real static delegating method.
+**Key difference:** `companion object` members live in a `Companion` class. From Java, you call `UserRepository.Companion.create()` unless annotated with `@JvmStatic`, which generates a real static delegating method. Note that [`const val`](01_type_system_foundations.md#q11--val-vs-const-val) is truly static — it is inlined directly into the class, bypassing the `Companion` wrapper entirely.
 
 ```kotlin
 companion object {
@@ -465,6 +454,9 @@ class Parser {
 ---
 
 ## Q2.5 — Value Classes
+
+> **Builds on:** [Q0.2 — JVM Type Mapping](00_jvm_mental_model.md#q02--jvm-type-mapping) · [Q3.1 — Type Erasure](03_generics_and_variance.md#q31--type-erasure)
+> **Connects to:** [Q3.1 (erased at runtime)](03_generics_and_variance.md#q31--type-erasure) · [Q0.2 (boxing scenarios)](00_jvm_mental_model.md#q02--jvm-type-mapping)
 
 ### What "Erased at Runtime" Means
 
@@ -489,7 +481,7 @@ The JVM sees `String` directly — no allocation of `UserId` wrapper object. Thi
 | Scenario | Example | Why |
 |----------|---------|-----|
 | Nullable | `val x: UserId? = null` | Null needs object; primitives can't be null |
-| Generic type | `val list: List<UserId>` | Generics erase to Object — must be a reference |
+| Generic type | `val list: List<UserId>` | Generics [erase to Object](03_generics_and_variance.md#q31--type-erasure) — must be a reference |
 | Interface implementation | `val x: Comparable<UserId> = userId` | Interface needs object reference |
 | Return from inline function | `inline fun <reified T> create(): T` | T must be Object at runtime |
 

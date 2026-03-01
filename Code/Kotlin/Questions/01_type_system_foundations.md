@@ -1,28 +1,13 @@
 # Phase 1: Type System Foundations
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 0 — JVM Mental Model | [00_jvm_mental_model.md](00_jvm_mental_model.md) |
-| **1 — Type System** | ← You are here |
-| 2 — Classes & Objects | [02_classes_and_objects.md](02_classes_and_objects.md) |
-| 2.5 — Initialization | [02_5_initialization_mechanics.md](02_5_initialization_mechanics.md) |
-| 3 — Generics & Variance | [03_generics_and_variance.md](03_generics_and_variance.md) |
-| 4 — Functions & Lambdas | [04_functions_lambdas_inlining.md](04_functions_lambdas_inlining.md) |
-| 5 — Properties & Delegation | [05_properties_and_delegation.md](05_properties_and_delegation.md) |
-| 6 — Extension Functions | [06_extension_functions.md](06_extension_functions.md) |
-| 7 — Collections & Sequences | [07_collections_and_sequences.md](07_collections_and_sequences.md) |
-| 8 — Other Kotlin Features | [08_other_kotlin_features.md](08_other_kotlin_features.md) |
-| 9 — Coroutines Mechanics | [09_coroutines_execution_mechanics.md](09_coroutines_execution_mechanics.md) |
-| 10 — Structured Concurrency | [10_structured_concurrency.md](10_structured_concurrency.md) |
-| 11 — Flow | [11_flow.md](11_flow.md) |
-| 12 — Reflection & References | [12_reference_operators_and_reflection.md](12_reference_operators_and_reflection.md) |
-| 13 — Android Architecture | [13_android_architecture.md](13_android_architecture.md) |
-| 14 — Jetpack Components | [14_jetpack_components.md](14_jetpack_components.md) |
-| 15 — Networking | [15_networking.md](15_networking.md) |
-| 16 — Android System Internals | [16_android_system_internals.md](16_android_system_internals.md) |
-| 17 — Performance & Memory | [17_performance_and_memory.md](17_performance_and_memory.md) |
-| Master Chains | [master_chains.md](master_chains.md) |
+[← Master Index](master_chains.md)
+
+## Questions in This File
+- [Q1.1 — `val` vs `const val`](#q11--val-vs-const-val)
+- [Q1.2 — Nullability at the Type Level](#q12--nullability-at-the-type-level)
+- [Q1.3 — `Nothing`, `Unit`, and the Type Hierarchy](#q13--nothing-unit-and-the-type-hierarchy)
+- [Q1.4 — Smart Casts](#q14--smart-casts)
 
 ---
 
@@ -70,7 +55,7 @@ GETSTATIC ApiConfig.INSTANCE : LApiConfig;
 INVOKEVIRTUAL ApiConfig.getBASE_URL ()Ljava/lang/String;
 ```
 
-Every access to `ApiConfig.BASE_URL` invokes a getter method — a virtual dispatch + stack frame push. In a hot path (e.g., setting a header on every network request), this overhead adds up.
+Every access to `ApiConfig.BASE_URL` invokes a getter method — a [virtual dispatch + stack frame push](00_jvm_mental_model.md#q04--the-jvm-call-stack). In a hot path (e.g., setting a header on every network request), this overhead adds up.
 
 ### What Does `const val` Emit at the Call Site?
 
@@ -135,7 +120,7 @@ object Config {
 
 ### Are `String` and `String?` Different JVM Types?
 
-**No.** At the JVM level, both are `java.lang.String`. Kotlin's null-safety is **entirely a compile-time construct**.
+**No.** At the [JVM level](00_jvm_mental_model.md#q02--jvm-type-mapping), both are `java.lang.String`. Kotlin's null-safety is **entirely a compile-time construct**.
 
 ```kotlin
 val a: String = "hello"    // JVM type: java.lang.String
@@ -166,6 +151,26 @@ public static final void greet(@NotNull String name) {
     System.out.println("Hello, " + name);
 }
 ```
+
+**Exact bytecode position — the null check is the very first instruction in the method body:**
+
+```bytecode
+; fun greet(name: String)
+ALOAD_0                                                                             ; push 'name' onto the stack
+LDC "name"                                                                          ; push parameter name literal
+INVOKESTATIC kotlin/jvm/internal/Intrinsics.checkNotNullParameter (Ljava/lang/Object;Ljava/lang/String;)V
+; ↑ executed BEFORE any local variables, BEFORE println — fail-fast position
+
+; only if null check passes does execution continue here:
+GETSTATIC java/lang/System.out : Ljava/io/PrintStream;
+; ... string concatenation for "Hello, $name" ...
+INVOKEVIRTUAL java/io/PrintStream.println (Ljava/lang/Object;)V
+RETURN
+```
+
+The null check runs **before any work**. If `name` is `null` (passed from Java), the exception is thrown immediately with a clear message: `"Parameter specified as non-null is null: method greet, parameter name"` — pinpointing which parameter violated the contract, before any side effects occur.
+
+**For constructors**, this means: if a non-null constructor parameter is passed `null` from Java, the exception is thrown before ANY field initialization runs — the object is never partially constructed.
 
 ### Platform Types (`String!`) — The Silent Danger
 
@@ -327,7 +332,7 @@ sealed class Result<out T> {
 }
 ```
 
-`out T` means `Result` is **covariant** — `Result<Nothing>` is a subtype of `Result<T>` for any `T`. Since `Nothing` is a subtype of everything, `Result<Nothing>` is a subtype of `Result<String>`, `Result<User>`, etc.
+`out T` means `Result` is [**covariant**](03_generics_and_variance.md#q32--variance) — `Result<Nothing>` is a subtype of `Result<T>` for any `T`. Since `Nothing` is a subtype of everything, `Result<Nothing>` is a subtype of `Result<String>`, `Result<User>`, etc.
 
 ```kotlin
 fun getResult(): Result<User> {
@@ -471,7 +476,7 @@ fun use(box: Box) {
 }
 ```
 
-The compiler cannot smart-cast through a getter because the getter is a **method call** — it could return a different value each time. Even if the backing field is `val`, the getter could be overridden in a subclass to return null.
+The compiler cannot smart-cast through a getter because the getter is a **method call** — it could return a different value each time. Even if the backing field is `val`, the getter could be overridden in a subclass (see [Q2.1 — Class Modifiers](02_classes_and_objects.md#q21--class-modifiers)) to return null.
 
 > **Key Takeaway:** Smart casts are a compile-time guarantee. The compiler only performs them when it can prove the value is stable. Always capture mutable/getter-accessed values into local `val` before type-checking.
 

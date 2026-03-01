@@ -1,16 +1,19 @@
 # Phase 8: Other Kotlin Features
 
 ## Navigation
-| Phase | File |
-|-------|------|
-| 7 — Collections & Sequences | [07_collections_and_sequences.md](07_collections_and_sequences.md) |
-| **8 — Other Kotlin Features** | ← You are here |
-| 9 — Coroutines Mechanics | [09_coroutines_execution_mechanics.md](09_coroutines_execution_mechanics.md) |
+[← Master Index](master_chains.md)
+
+## Questions in This File
+- [Q8.1 — Destructuring](#q81--destructuring)
+- [Q8.2 — String Templates and Operators](#q82--string-templates-and-operators)
+- [Q8.3 — SAM Conversions](#q83--sam-conversions)
 
 ---
 
 ## Q8.1 — Destructuring
 
+> **Builds on:** [Q2.2 — Data Classes (componentN generation)](02_classes_and_objects.md#q22--data-classes)
+> **Connects to:** [Q8.2 — Operators](08_other_kotlin_features.md#q82--string-templates-and-operators)
 > **Reference:** [Kotlin Docs — Destructuring declarations](https://kotlinlang.org/docs/destructuring-declarations.html)
 
 ### First Principles: What Is Destructuring?
@@ -42,7 +45,7 @@ val c = someObject.component3()
 
 ### How `data class` Provides `componentN()` Automatically
 
-For any `data class`, the compiler generates `component1()`, `component2()`, etc. for each **primary constructor property**, in declaration order:
+For any [`data class`](02_classes_and_objects.md#q22--data-classes), the compiler generates `component1()`, `component2()`, etc. for each **primary constructor property**, in declaration order:
 
 ```kotlin
 data class User(val name: String, val age: Int, val email: String)
@@ -111,6 +114,9 @@ list.forEachIndexed { index, _ ->   // don't care about the value
 
 ## Q8.2 — String Templates and Operators
 
+> **Builds on:** [Q0.1 — heap allocation (StringBuilder)](00_jvm_mental_model.md#q01--primitives-vs-references)
+> **Connects to:** [Q8.3 — SAM Conversions](08_other_kotlin_features.md#q83--sam-conversions) · [Q4.1 — invoke operator and lambdas](04_functions_lambdas_inlining.md#q41--lambda-compilation)
+
 ### What `"Hello $name"` Compiles To
 
 String templates compile to `StringBuilder` operations — NOT `String.format()`:
@@ -175,7 +181,7 @@ val negated = -v1         // calls v1.unaryMinus() → Vector(-1.0, -2.0)
 
 ### The `invoke` Operator — Making Objects Callable
 
-`operator fun invoke()` makes an object callable like a function using `()`:
+`operator fun invoke()` makes an object callable like a [function/lambda](04_functions_lambdas_inlining.md#q41--lambda-compilation) using `()`:
 
 ```kotlin
 class Validator(val rule: (String) -> Boolean) {
@@ -249,6 +255,8 @@ class VersionRange(val start: Version, val end: Version) {
 
 ## Q8.3 — SAM Conversions
 
+> **Builds on:** [Q4.1 — Lambda Compilation (anonymous class)](04_functions_lambdas_inlining.md#q41--lambda-compilation) · [Q4.2 — inline functions](04_functions_lambdas_inlining.md#q42--inline-noinline-crossinline)
+> **Connects to:** [Q3.2 — Variance (functional interface covariance)](03_generics_and_variance.md#q32--variance)
 > **Reference:** [Kotlin Docs — SAM conversions](https://kotlinlang.org/docs/fun-interfaces.html)
 
 ### First Principles: What Is a SAM Interface?
@@ -285,7 +293,7 @@ button.setOnClickListener(object : View.OnClickListener {
 })
 ```
 
-The Kotlin compiler generates the anonymous class implementation. This SAM conversion works automatically for **Java interfaces** when called from Kotlin.
+The Kotlin compiler generates the [anonymous class](04_functions_lambdas_inlining.md#q41--lambda-compilation) implementation. This SAM conversion works automatically for **Java interfaces** when called from Kotlin.
 
 ### `fun interface` — Kotlin's Native Functional Interface
 
