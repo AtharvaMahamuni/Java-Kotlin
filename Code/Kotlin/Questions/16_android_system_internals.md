@@ -18,6 +18,31 @@
 > **Connects to:** [Q16.2 — Background Work](16_android_system_internals.md#q162--background-work-evolution) · [Q17.1 — Memory Leaks](17_performance_and_memory.md#q171--memory-leaks--top-5-causes) · [Q10.4 — lifecycleScope](10_structured_concurrency.md#q104--lifecycle-scopes-and-process-death)
 > **Reference:** [Android Docs — Activity lifecycle](https://developer.android.com/guide/components/activities/activity-lifecycle)
 
+### The Concrete Picture
+
+Starting state: Activity is fully running (onResume returned), user rotates device.
+
+```
+BEFORE rotation:
+  Activity A (portrait)  ←  currently displayed, onResume returned
+
+ROTATION sequence (Android P+):
+  Activity A:  onPause()
+               onSaveInstanceState(bundle)  ──► bundle stored by AMS via Binder
+               onStop()
+               onDestroy()                  ──► A is garbage-collected
+
+  Activity A2: onCreate(savedInstanceState) ◄── same bundle restored from AMS
+               onStart()
+               onResume()                   ──► user sees landscape Activity
+
+KEY DISTINCTION — process death vs rotation:
+  Rotation:      onDestroy IS called, bundle IS passed to next onCreate
+  Process death: onDestroy NOT called, OS kills process with no warning
+```
+
+The bundle travels through Binder IPC (subject to 1MB limit). ViewModel survives rotation because it is stored in ViewModelStore, not in the bundle.
+
 ### Exact Callback Order During Rotation
 
 ```
@@ -103,12 +128,57 @@ When user presses back to the Fragment:
 - `repeatOnLifecycle(STARTED)` RESTARTS the collecting block
 - UI gets fresh data
 
+### Memory Trick
+
+```
+ROTATION:  OLD activity → onPause → onSaveInstanceState → onStop → onDestroy
+           NEW activity → onCreate(bundle) → onStart → onResume
+
+DEATH:     process killed → NO callbacks → bundle restored from Binder store
+           ViewModel GONE (heap gone), SavedStateHandle survives (Binder store)
+
+FRAGMENT TWO LIFECYCLES:
+  Fragment object:  onAttach ──────────────────────────── onDetach
+  Fragment view:             onCreateView ── onDestroyView
+                             (clear binding = null here!)
+
+Android P+ guarantee: onSaveInstanceState BEFORE onStop (not before onPause)
+```
+
 ---
 
 ## Q16.2 — Background Work Evolution
 
 > **Builds on:** [Q16.1 — Activity Lifecycle](16_android_system_internals.md#q161--activity-and-fragment-lifecycle) · [Q10.4 — Lifecycle Scopes](10_structured_concurrency.md#q104--lifecycle-scopes-and-process-death)
 > **Connects to:** [Q14.2 — WorkManager](14_jetpack_components.md#q142--workmanager)
+
+### The Concrete Picture
+
+Starting state: You have a long-running upload task that must survive the user pressing Home.
+
+```
+WRONG mental model:
+  Service created ──► runs on background thread automatically
+
+CORRECT picture:
+  Service.onStartCommand() ──► MAIN THREAD
+                                │
+                                ├── network call here ──► NetworkOnMainThreadException
+                                └── heavy loop here   ──► ANR after 5s
+
+CORRECT approach:
+  Service.onStartCommand() ──► MAIN THREAD
+                                │
+                                └── CoroutineScope(Dispatchers.IO).launch { ... }
+                                         │
+                                         └──► background thread (safe)
+
+Android 8+ additional constraint:
+  App in background ──► startService() ──► IllegalStateException (BLOCKED)
+  Fix: startForegroundService() + call startForeground() within 5s ──► shows notification
+```
+
+The word "background" in "background Service" = running while Activity not visible, NOT a background thread.
 
 ### Does a `Service` Run on a Background Thread?
 
@@ -199,6 +269,22 @@ WorkManager (current):
 - Constraint-aware (network, charging, etc.)
 ```
 
+### Memory Trick
+
+```
+SERVICE = runs on MAIN thread (background = invisible, not background thread)
+
+EVOLUTION chain (all deprecated → WorkManager):
+  AsyncTask (API 30-)  →  leaked Activity, sequential pool
+  IntentService (API 30-)  →  killed by Oreo limits, single thread
+  WorkManager (current)  →  Room-persisted, Doze-aware, coroutines, constraints
+
+OREO RULE: background app + startService() = IllegalStateException
+FIX: startForegroundService() → must call startForeground() within 5s
+
+ANDROID 14: foregroundServiceType in manifest MUST match startForeground() type
+```
+
 ---
 
 ## Q16.3 — Binder IPC
@@ -206,6 +292,32 @@ WorkManager (current):
 > **Builds on:** [Q16.4 — Zygote and App Startup](16_android_system_internals.md#q164--zygote-and-app-startup)
 > **Connects to:** [Q13.3 — SavedStateHandle uses Binder](13_android_architecture.md#q133--viewmodel-internals) · [Q16.5 — Handler/Looper](16_android_system_internals.md#q165--handler-looper-and-messagequeue)
 > **Reference:** [Android Docs — Bound services overview](https://developer.android.com/guide/components/bound-services)
+
+### The Concrete Picture
+
+Starting state: Your Activity calls `getSystemService(ACTIVITY_SERVICE)`. This crosses a process boundary.
+
+```
+Your app process (PID 12345)          system_server process (PID 600)
+  ┌──────────────────────────┐          ┌─────────────────────────────┐
+  │  ActivityManager.getXxx()│          │  ActivityManagerService     │
+  │  (Java wrapper — proxy)  │          │  (real implementation)      │
+  │          │               │          │          ▲                  │
+  │          ▼               │          │          │                  │
+  │  BinderProxy             │          │  Binder Stub (onTransact)   │
+  └──────────┬───────────────┘          └──────────┬──────────────────┘
+             │                                      │
+             └──────────────► /dev/binder ──────────┘
+                              (kernel driver)
+                              ONE copy via mmap
+
+Traditional IPC: Process A → kernel buffer → kernel buffer → Process B  (2 copies)
+Binder IPC:      Process A ──────────────────────────────────► Process B  (1 copy via mmap)
+
+1MB LIMIT: all concurrent Binder transactions for a process share ~1MB buffer
+  Small primitives (IDs, ints) → safe
+  Large lists, Bitmaps        → TransactionTooLargeException
+```
 
 ### What Is Binder IPC?
 
@@ -275,12 +387,63 @@ savedState["bitmap"] = bitmap               // bytes → DEFINITELY CRASH!
 savedState["selectedUserId"] = "user_123"   // fetch from DB on restore
 ```
 
+### Memory Trick
+
+```
+BINDER = Android's IPC highway
+  Traditional IPC: 2 copies (process → kernel → process)
+  Binder:          1 copy (mmap shared region)
+
+1MB LIMIT — what fits:
+  SAFE:   primitives, IDs, small strings ("userId", tab index)
+  DANGER: List<User> > ~500 items, any Bitmap, serialized objects > 1MB
+
+REMEMBER: every getSystemService() call crosses Binder
+          onSaveInstanceState bundle crosses Binder (subject to same 1MB!)
+          SavedStateHandle also crosses Binder — same limit applies
+
+Error: TransactionTooLargeException: data parcel size N bytes
+Fix:   store large data in Room/DataStore, save only the key
+```
+
 ---
 
 ## Q16.4 — Zygote and App Startup
 
 > **Builds on:** [Q0.3 — Class Loading](00_jvm_mental_model.md#q03--class-loading-and-the-static--block)
 > **Connects to:** [Q16.3 — Binder IPC](16_android_system_internals.md#q163--binder-ipc) · [Q17.3 — The 16ms Budget](17_performance_and_memory.md#q173--the-16ms-budget)
+
+### The Concrete Picture
+
+Starting state: Device is running, your app is NOT launched. User taps the launcher icon.
+
+```
+Launcher (process A)                   system_server                  Your app (new process)
+      │                                      │                               │
+      ├──► Intent via Binder IPC ──────────► │                               │
+      │                               ActivityManagerService                 │
+      │                                      │                               │
+      │                               checks: process alive?                 │
+      │                               NO ──► asks Zygote to fork ──────────► │
+      │                                                                 Zygote.fork()
+      │                                                                 (copy-on-write)
+      │                                                                 new PID assigned
+      │                                                                       │
+      │                                                                 ActivityThread.main()
+      │                                                                       │
+      │                                                                 Looper.prepareMainLooper()
+      │                                                                       │
+      │                                                                 Application.onCreate()
+      │                                                                       │
+      │                                                                 Activity.onCreate()
+      │                                                                       │
+      │                                                                 first frame drawn
+      │                                                                       │
+      └──────────────────────────────────────────────────────────────── user sees app
+
+Zygote pre-loads: java.lang.*, android.*, ART runtime, common resources
+Fork result: child shares Zygote pages via CoW → no redundant class loading
+```
 
 ### The Path from App Icon Tap to First Activity Frame
 
@@ -380,6 +543,23 @@ An **ANR** (Application Not Responding) occurs when a message in this queue take
 - Input event not handled in 5 seconds
 - Broadcast receiver not completing in 10 seconds
 
+### Memory Trick
+
+```
+STARTUP ORDER (memorize the 9-step chain):
+  tap icon → Launcher Binder → AMS checks process → Zygote.fork()
+  → ActivityThread.main() → Looper.prepareMainLooper()
+  → Application.onCreate() → Activity.onCreate() → first frame
+
+ZYGOTE = template process (always running at boot)
+  Pre-loaded: ~50MB of shared classes (CoW = not copied until written)
+  fork() is fast because child starts with Zygote's pages already mapped
+
+Application.onCreate() runs INSIDE Looper.loop() (as a message)
+  → heavy work in Application.onCreate() delays EVERY future message
+  → keep it minimal (lazy-init SDKs, avoid synchronous I/O)
+```
+
 ---
 
 ## Q16.5 — Handler, Looper, and MessageQueue
@@ -387,6 +567,30 @@ An **ANR** (Application Not Responding) occurs when a message in this queue take
 > **Builds on:** [Q16.4 — Zygote (main thread setup)](16_android_system_internals.md#q164--zygote-and-app-startup) · [Q9.2 — Dispatchers.Main uses Looper](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
 > **Connects to:** [Q9.2 — Dispatchers.Main.immediate](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
 > **Reference:** [Android Docs — Processes and threads overview](https://developer.android.com/guide/components/processes-and-threads)
+
+### The Concrete Picture
+
+Starting state: Your app is running. Multiple things post to the UI: touch events, animations, your own `postDelayed`.
+
+```
+THREAD (one):
+  main thread ──────────────────────────────────────────────────────────────►
+                          │ (runs Looper.loop() — infinite)
+                          │
+LOOPER (one per thread):  │
+  Looper.loop()  picks one message at a time from queue ──► dispatches to Handler
+
+MESSAGEQUEUE (one per Looper):
+  ┌──────────────────────────────────────────────────────┐
+  │ msg1 (touch event, t=0ms) │ msg2 (draw, t=16ms) │ ..│
+  └──────────────────────────────────────────────────────┘
+        ▲                ▲               ▲
+  Handler (touch)  Handler (Choreographer)  Handler (your postDelayed)
+
+PROBLEM: one slow message blocks everything else
+  database.query() on main thread → query takes 6s
+  → touch events piling up in queue unprocessed → ANR after 5s
+```
 
 ### The Relationship: Thread → Looper → MessageQueue → Handlers
 
@@ -473,6 +677,26 @@ lifecycleScope.launch {
 **Under the hood, `delay()` on [`Dispatchers.Main`](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers) uses `Handler.postDelayed()`!** The `Dispatchers.Main` implementation (via `HandlerContext`) schedules coroutine resumptions by posting delayed messages to the main Looper's MessageQueue.
 
 Both are equivalent in behavior. Coroutines just make it cleaner and composable with other suspend functions.
+
+### Memory Trick
+
+```
+THREAD:LOOPER:QUEUE:HANDLER = 1:1:1:many
+  One thread has exactly one Looper (created by Looper.prepare())
+  One Looper has exactly one MessageQueue
+  Many Handlers can all post to the same queue
+
+ANR TIMEOUTS (memorize the 3):
+  Input dispatch: 5 seconds
+  BroadcastReceiver.onReceive(): 10 seconds
+  Service.onCreate/onStartCommand(): 20 seconds
+
+Background thread + Handler:
+  Thread { Handler() }  ──► CRASH (no Looper)
+  Thread { Looper.prepare(); Handler(); Looper.loop() }  ──► works
+
+delay() on Dispatchers.Main == Handler.postDelayed() under the hood
+```
 
 ---
 

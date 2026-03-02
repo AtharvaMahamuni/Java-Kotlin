@@ -16,6 +16,27 @@
 > **Connects to:** [Q8.2 — Operators](08_other_kotlin_features.md#q82--string-templates-and-operators)
 > **Reference:** [Kotlin Docs — Destructuring declarations](https://kotlinlang.org/docs/destructuring-declarations.html)
 
+### The Concrete Picture
+
+Destructuring = compiler calls `componentN()` functions for you:
+
+```kotlin
+val (name, age) = User("Alice", 30)
+// Compiler sees this as:
+val name = user.component1()   // "Alice"
+val age  = user.component2()   // 30
+```
+
+Where do `component1()`, `component2()` come from?
+- `data class` → auto-generated for every primary constructor property
+- `Pair`, `Triple` → built-in
+- Any class → you can write `operator fun component1()` manually
+
+`_` = "I don't want this one" (componentN not called at all):
+```kotlin
+val (_, age) = User("Alice", 30)   // component1() skipped entirely
+```
+
 ### First Principles: What Is Destructuring?
 
 Destructuring is a way to unpack multiple values from an object into separate variables in a single statement. Instead of:
@@ -110,12 +131,55 @@ list.forEachIndexed { index, _ ->   // don't care about the value
 }
 ```
 
+### Memory Trick
+
+```
+DESTRUCTURING = syntactic sugar for componentN() calls.
+  Position 1 → component1(), position 2 → component2(), etc.
+  Order = primary constructor declaration order.
+
+data class automatically generates componentN() for primary constructor only.
+Body properties → no componentN() → can't destructure.
+
+_ = skip. component not called. No variable created. Less bytecode.
+
+IN LAMBDAS:
+  .forEach { (key, value) -> }   // destructures each Map.Entry
+  .map { (first, second) -> }    // destructures each Pair
+```
+
 ---
 
 ## Q8.2 — String Templates and Operators
 
 > **Builds on:** [Q0.1 — heap allocation (StringBuilder)](00_jvm_mental_model.md#q01--primitives-vs-references)
 > **Connects to:** [Q8.3 — SAM Conversions](08_other_kotlin_features.md#q83--sam-conversions) · [Q4.1 — invoke operator and lambdas](04_functions_lambdas_inlining.md#q41--lambda-compilation)
+
+### The Concrete Picture
+
+String templates → StringBuilder, not String.format:
+
+```kotlin
+"Hello $name, you are ${name.length} chars!"
+
+// JVM sees:
+new StringBuilder()
+  .append("Hello ")
+  .append(name)
+  .append(", you are ")
+  .append(name.length())
+  .append(" chars!")
+  .toString()
+```
+
+Operator overloading → function name mapping:
+```kotlin
+v1 + v2   →  v1.plus(v2)       // a + b = a.plus(b)
+v1 * 2.0  →  v1.times(2.0)     // a * b = a.times(b)
+-v1       →  v1.unaryMinus()   // -a = a.unaryMinus()
+obj[i]    →  obj.get(i)        // a[i] = a.get(i)
+obj(arg)  →  obj.invoke(arg)   // a() = a.invoke()
+```
 
 ### What `"Hello $name"` Compiles To
 
@@ -251,6 +315,22 @@ class VersionRange(val start: Version, val end: Version) {
 }
 ```
 
+### Memory Trick
+
+```
+STRING TEMPLATE = StringBuilder under the hood. NOT String.format.
+  "$name" → StringBuilder.append(name). One buffer, efficient.
+
+OPERATOR = function with a specific name + operator modifier.
+  Define plus() → you get + operator.
+  Define invoke() → your object is callable with ().
+  Define get/set() → your object supports [] access.
+
+INVOKE OPERATOR use case: stateful callable object.
+  class Validator { operator fun invoke(x: String): Boolean }
+  validator("test")   // cleaner than validator.validate("test")
+```
+
 ---
 
 ## Q8.3 — SAM Conversions
@@ -258,6 +338,28 @@ class VersionRange(val start: Version, val end: Version) {
 > **Builds on:** [Q4.1 — Lambda Compilation (anonymous class)](04_functions_lambdas_inlining.md#q41--lambda-compilation) · [Q4.2 — inline functions](04_functions_lambdas_inlining.md#q42--inline-noinline-crossinline)
 > **Connects to:** [Q3.2 — Variance (functional interface covariance)](03_generics_and_variance.md#q32--variance)
 > **Reference:** [Kotlin Docs — SAM conversions](https://kotlinlang.org/docs/fun-interfaces.html)
+
+### The Concrete Picture
+
+SAM = "Single Abstract Method." A functional interface. A lambda can pretend to be one:
+
+```kotlin
+// Java interface (e.g., Android SDK):
+interface OnClickListener { fun onClick(view: View) }
+
+// Kotlin: lambda → auto-converted to OnClickListener
+button.setOnClickListener { view -> handleClick(view) }
+// JVM: compiler creates anonymous OnClickListener { onClick = { view -> ... } }
+```
+
+Kotlin-defined interface: needs `fun interface` keyword:
+```kotlin
+interface Transformer { fun transform(x: Int): Int }  // regular interface
+val t: Transformer = { it * 2 }   // COMPILE ERROR — no SAM conversion
+
+fun interface Transformer { fun transform(x: Int): Int }  // functional interface
+val t: Transformer = { it * 2 }   // WORKS!
+```
 
 ### First Principles: What Is a SAM Interface?
 
@@ -351,6 +453,24 @@ val h: Handler = { }  // ERROR: SAM only works for interfaces, not abstract clas
 4. **When the interface has default methods that conflict:**
 ```kotlin
 // Generally fine, but complex generics or default method interactions can block conversion
+```
+
+### Memory Trick
+
+```
+SAM = Single Abstract Method interface = can be replaced by a lambda.
+
+JAVA interface → auto SAM conversion in Kotlin (works always).
+KOTLIN interface → requires `fun interface` keyword to enable SAM conversion.
+
+WHY the distinction?
+  Kotlin interfaces can have multiple implementations per call site.
+  `fun interface` makes "this is meant to be a lambda" EXPLICIT.
+
+SAM conversion FAILS when:
+  - More than one abstract method (needs ALL methods, lambda only gives one)
+  - Abstract class (not interface)
+  - Regular Kotlin interface (not `fun interface`)
 ```
 
 ---

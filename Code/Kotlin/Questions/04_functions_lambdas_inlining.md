@@ -17,6 +17,32 @@
 > **Builds on:** [Q0.1 — heap allocation](00_jvm_mental_model.md#q01--primitives-vs-references)
 > **Reference:** [Kotlin Docs — Lambdas](https://kotlinlang.org/docs/lambdas.html)
 
+### The Concrete Picture
+
+You write a lambda. The JVM sees an object:
+
+```kotlin
+doSomething { println("hello") }
+```
+
+What the JVM actually gets:
+```
+Without inline:
+  Compiler creates an anonymous class that implements Function0
+  Creates an instance of that class
+  Passes the instance to doSomething()
+  doSomething calls instance.invoke()
+
+  → heap allocation (the object)
+  → method call (invoke())
+```
+
+Non-capturing vs capturing — the cost difference:
+```
+{ it > 3 }             ← captures nothing → SINGLETON (allocated once, reused forever)
+{ it > threshold }     ← captures threshold → NEW OBJECT per call (GC pressure)
+```
+
 ### First Principles: What IS a Lambda on the JVM?
 
 The JVM, at its core, does not understand "functions as values." It only understands objects and methods on objects. So when Kotlin (or Java) lets you pass a function as a value, the compiler has to translate that into something the JVM understands: **an anonymous class that implements a functional interface**.
@@ -113,6 +139,21 @@ Non-Capturing Lambda:                   Capturing Lambda:
 └───────────────────────┘               └───────────────────────────────┘
 ```
 
+### Memory Trick
+
+```
+LAMBDA = anonymous class + instance implementing FunctionN.
+
+NON-CAPTURING → singleton (one instance ever, zero allocation).
+CAPTURING     → new instance per call (heap object for each call, GC needed).
+
+RULE: avoid capturing in hot paths. If you must capture, use inline.
+
+LAMBDA OBJECT COST: creation + garbage collection.
+  In a loop doing 1,000,000 iterations with a capturing lambda:
+  → 1,000,000 objects created → GC pressure → jank/slowdowns.
+```
+
 ### Why Kotlin Uses Anonymous Classes Instead of `invokedynamic`
 
 Java 8 added `invokedynamic` + `LambdaMetafactory` — a JVM instruction that creates lambda objects efficiently at runtime, deferring the class creation strategy to the JVM itself (which may use method handles, class reuse, etc.).
@@ -148,6 +189,36 @@ This creates GC pressure: 1 million `Function1` objects that must be garbage col
 > **Builds on:** [Q4.1 (lambda anonymous class)](04_functions_lambdas_inlining.md#q41--lambda-compilation) · [Q0.4 (method call overhead)](00_jvm_mental_model.md#q04--the-jvm-call-stack)
 > **Connects to:** [Q3.3 (reified requires inline)](03_generics_and_variance.md#q33--reified-type-parameters)
 > **Reference:** [Kotlin Docs — Inline Functions](https://kotlinlang.org/docs/inline-functions.html)
+
+### The Concrete Picture
+
+What `inline` does — literally pastes both bodies at the call site:
+
+```kotlin
+inline fun doWork(action: () -> Unit) {
+    println("Before")
+    action()
+    println("After")
+}
+
+doWork { println("Working") }
+```
+
+After inlining, the compiler REMOVES the call and pastes:
+```kotlin
+// The call site becomes:
+println("Before")
+println("Working")    // lambda body pasted here — no object created
+println("After")
+// No doWork() function call. No Function0 object. All flattened.
+```
+
+Three keywords — three different behaviors:
+```
+inline    → body pasted, lambda pasted  → no allocation, non-local return OK
+noinline  → body pasted, lambda NOT pasted → lambda stays as Function object
+crossinline → body pasted, lambda pasted but non-local return FORBIDDEN
+```
 
 ### What Exactly Does `inline` Paste at the Call Site?
 
@@ -308,6 +379,24 @@ inline fun broken(action: () -> Unit) {
 
 ---
 
+### Memory Trick
+
+```
+INLINE = "copy-paste the body here."
+
+NON-LOCAL RETURN: works ONLY in inlined lambdas.
+  Lambda body is pasted INTO the outer function → return exits the outer function.
+  Without inline: lambda is in its own method → return exits only that method.
+
+crossinline = "paste it, but forbid non-local return" (nested context can't return)
+noinline    = "don't paste this one, keep it as object" (when you need to store it)
+
+WHY all stdlib operators (map, filter, let, apply) are inline:
+  Without inline → Function1 object allocated on every call.
+  With inline → no object, body pasted.
+  Stdlib is called everywhere → inline is critical for zero allocation.
+```
+
 ### When `inline` Is Harmful
 
 **1. Binary compatibility for library APIs:**
@@ -355,6 +444,32 @@ Without `inline`, every call to `.map {}` would allocate a `Function1` object fo
 
 > **Builds on:** [Q4.1 — Lambda Compilation](04_functions_lambdas_inlining.md#q41--lambda-compilation) · [Q4.2 — inline](04_functions_lambdas_inlining.md#q42--inline-noinline-crossinline)
 > **Connects to:** [Q9.1 — What suspend does](09_coroutines_execution_mechanics.md#q91--what-suspend-actually-does) · [Q10.3 — CancellationException rules](10_structured_concurrency.md#q103--exception-handling-rules)
+
+### The Concrete Picture
+
+Same-looking lambda, different JVM type:
+
+```kotlin
+val regular:  () -> String           // JVM: Function0<String>
+val suspended: suspend () -> String  // JVM: SuspendFunction0<String>
+//                                          invoke(continuation: Continuation<String>)
+```
+
+The `suspend` keyword adds a hidden `Continuation` parameter. This is the same CPS transformation applied to regular `suspend` functions.
+
+`Thread.sleep` vs `delay` — the key practical difference:
+```
+Thread.sleep(1000):
+  Thread → BLOCKED for 1 second
+  Other coroutines on this thread → ALSO BLOCKED (can't run)
+
+delay(1000):
+  Coroutine → SUSPENDED (saves its state)
+  Thread    → FREED (can run other coroutines)
+  After 1 second: coroutine resumes on the thread
+```
+
+`Thread.sleep` is a JVM OS call. `delay` is a coroutine-aware suspension point.
 
 ### How a `suspend` Lambda Differs from a Regular Lambda
 
@@ -476,6 +591,21 @@ throws CancellationException
     └── if swallowed → coroutine continues running! Scope never cleans up ✗
 ```
 
+### Memory Trick
+
+```
+CANCELLATION EXCEPTION = the "please stop" signal in coroutines.
+RULE: catch (e: CancellationException) → ALWAYS throw e
+
+Why: if you swallow it, the coroutine doesn't know it's been cancelled.
+  It keeps running. The scope never cleans up. You have a zombie coroutine.
+
+Thread.sleep vs delay:
+  sleep = OS-level block → thread unavailable (nothing can run on it)
+  delay = coroutine suspension → thread available (other coroutines run)
+  NEVER use Thread.sleep in a coroutine. Always use delay.
+```
+
 ---
 
 ## Q4.4 — Scope Functions
@@ -483,6 +613,36 @@ throws CancellationException
 > **Builds on:** [Q4.2 — inline functions](04_functions_lambdas_inlining.md#q42--inline-noinline-crossinline) · [Q4.1 — lambda compilation](04_functions_lambdas_inlining.md#q41--lambda-compilation)
 > **Connects to:** [Q6.2 — Extension Functions as API Design](06_extension_functions.md#q62--extension-functions-as-api-design)
 > **Reference:** [Kotlin Docs — Scope Functions](https://kotlinlang.org/docs/scope-functions.html)
+
+### The Concrete Picture
+
+Five functions. Two axes to understand them:
+
+**Axis 1: how do you refer to the object inside?**
+- `this` → the object IS the context (like you're inside it)
+- `it`   → the object is an argument (you're outside, passing it in)
+
+**Axis 2: what does the function return?**
+- Returns the BLOCK RESULT → use for transformation
+- Returns THE OBJECT ITSELF → use for configuration chains
+
+Map them:
+```
+          │  Access via THIS  │  Access via IT
+──────────┼───────────────────┼───────────────────
+RETURNS   │    run { }        │    let { }
+block     │    with(obj) { }  │
+result    │                   │
+──────────┼───────────────────┼───────────────────
+RETURNS   │    apply { }      │    also { }
+the       │                   │
+object    │                   │
+```
+
+Quick usage rule:
+- Configuring something? → `apply { }` (returns object, `this` = clean builder syntax)
+- Transforming? → `let { }` (returns result, `it` = explicit variable)
+- Side effects in chain? → `also { }` (returns object, `it` = for logging/debugging)
 
 ### The Five Scope Functions — Bytecode Reality
 
@@ -561,6 +721,28 @@ Do you want to...
 → Call multiple methods (fluent builder) → use apply { }
 ```
 
+### Memory Trick
+
+```
+SCOPE FUNCTIONS — two questions to pick the right one:
+  Q1: How do I want to refer to the object?
+      → this (feels like inside): run, apply, with
+      → it   (explicit param):    let, also
+
+  Q2: What do I need returned?
+      → block result: let, run, with
+      → original object: apply, also
+
+COMMON USES:
+  apply  → building/configuring: View().apply { text = "hi"; color = RED }
+  let    → null-safe transform: nullable?.let { doSomething(it) }
+  also   → side effects: list.also { println("size=${it.size}") }
+  run    → multiple statements, want result: val x = run { a + b }
+  with   → multiple operations, non-extension: with(obj) { a(); b(); c() }
+
+All five are INLINE → zero overhead at runtime.
+```
+
 ---
 
 ## Q4.5 — Named and Default Parameters
@@ -568,6 +750,28 @@ Do you want to...
 > **Builds on:** [Q2.5.2 — Secondary Constructors](02_5_initialization_mechanics.md#q252--primary-vs-secondary-constructors)
 > **Connects to:** [Q2.5.6 — @JvmOverloads and Java interop](02_5_initialization_mechanics.md#q256--constructor-visibility-and-factory-patterns)
 > **Reference:** [Kotlin Docs — Default arguments](https://kotlinlang.org/docs/functions.html#default-arguments)
+
+### The Concrete Picture
+
+Default parameters are compile-time sugar. At bytecode level they become a bitmask:
+
+```kotlin
+fun connect(host: String, port: Int = 443, ssl: Boolean = true) { }
+
+connect("example.com")         // mask = 0b11 = 3  → both defaults used
+connect("example.com", 8080)   // mask = 0b10 = 2  → ssl default used only
+connect("example.com", 8080, false) // no mask    → no defaults
+```
+
+Direction of resolution:
+```
+Kotlin call site → compiler picks which defaults needed → sets bits in mask
+                → calls connect$default(host, 0, false, mask, null)
+                → $default reads mask → fills in missing args → calls connect()
+```
+
+Java callers can't see the default parameters directly — they only see the full method.
+`@JvmOverloads` generates real Java overloads to bridge this.
 
 ### What Bytecode Does a Function With Default Parameters Compile To?
 
@@ -620,6 +824,23 @@ fun connect(host: String, port: Int = 443, ssl: Boolean = true) { ... }
 void connect(String host)                      // uses port=443, ssl=true
 void connect(String host, int port)            // uses ssl=true
 void connect(String host, int port, boolean ssl) // no defaults
+```
+
+### Memory Trick
+
+```
+DEFAULT PARAMS = compiler generates a $default method with bitmask.
+  Each missing argument → corresponding bit set in mask.
+  $default reads mask → fills in defaults → calls full method.
+
+JAVA INTEROP:
+  Java sees only the FULL method (all params required).
+  @JvmOverloads → generates N+1 overloads for Java.
+  Always add @JvmOverloads on public APIs shared with Java.
+
+NAMED PARAMS benefit: safe argument reordering.
+  connect(ssl = false, host = "example.com")  ← order doesn't matter
+  No risk of swapping port and ssl by mistake.
 ```
 
 ### When Default Parameters Eliminate Secondary Constructors

@@ -9,6 +9,37 @@ Activity and Fragment are the foundational UI building blocks of Android. They a
 > **Builds on:** [A0.2 — Zygote & App Startup](A0_android_platform.md#a02--zygote--app-startup) · [A0.4 — Binder IPC](A0_android_platform.md#a04--binder-ipc)
 > **Connects to:** [A1.2 — Configuration Changes](A1_activity_fragment.md#a12--configuration-changes) · [A1.3 — Fragment Lifecycle](A1_activity_fragment.md#a13--fragment-lifecycle)
 
+### The Concrete Picture
+
+Starting point: a running app. User presses the Home button, then returns to the app.
+
+```
+[User presses Home]
+  Activity (currently in onResume — RUNNING)
+      │
+      ▼  onPause()      ← stop camera, release audio focus
+      ▼  onStop()       ← persist data to DB, unregister receivers
+      │
+      │  [OS may kill process here — no callbacks!]
+      │
+[User taps icon again]
+      │
+      ├── if process alive ──► onRestart() ──► onStart() ──► onResume()
+      │
+      └── if process killed ──► cold start
+              onCreate(savedBundle?)  ← bundle contains saved UI state
+              onStart() ──► onResume()
+
+[User presses Back]
+  onPause() ──► onStop() ──► onDestroy()
+  isFinishing = true  ← permanent destruction
+
+[Screen rotates]
+  onPause() ──► onSaveInstanceState(bundle) ──► onStop() ──► onDestroy()
+  onCreate(bundle) ──► onStart() ──► onResume()
+  isFinishing = false  ← temporary, ViewModel survives
+```
+
 ### WHY The Lifecycle Exists
 
 On a mobile device, the operating system needs to reclaim resources from apps that the user isn't actively looking at. Unlike a desktop OS where your app runs continuously in its own window with guaranteed RAM, Android's design principle is that the OS can kill any background app at any time to free memory for the foreground app. The Activity lifecycle is the mechanism by which Android tells your code what state your UI is in so you can respond appropriately — save state, release resources, stop animations.
@@ -185,12 +216,56 @@ override fun onDestroy() {
                                                             onResume()
 ```
 
+### Memory Trick
+
+```
+7 CALLBACKS: Create Start Resume [RUNNING] Pause Stop Destroy
+  "Can Steve Run? Perhaps Sadly Died."
+
+3 SCOPES (nested):
+  Entire:     onCreate ────────────────────── onDestroy
+  Visible:      onStart ──────────── onStop
+  Foreground:     onResume ── onPause
+
+KILL ORDER (highest kill priority to lowest):
+  Empty > Background > Service > Visible > Foreground (NEVER killed)
+
+TRAP: onDestroy() NOT called on process kill (SIGKILL is instant).
+  Save critical data in onStop(). isFinishing() = true means Back was pressed.
+```
+
 ---
 
 ## A1.2 — Configuration Changes
 
 > **Builds on:** [A1.1 — Activity Lifecycle](A1_activity_fragment.md#a11--activity-lifecycle)
 > **Connects to:** [A4 — ViewModel & State Management](A4_viewmodel_state.md)
+
+### The Concrete Picture
+
+Starting point: user is on your app with a loaded list of 100 items, then rotates the phone.
+
+```
+Portrait Activity (instance A, PID 12345)
+  users: [100 User objects in memory]
+  searchQuery: "alice"
+      │
+      ▼  onPause()
+      ▼  onSaveInstanceState(bundle)  ← bundle.putString("query", "alice")
+      ▼  onStop()
+      ▼  onDestroy()  ← instance A is GC'd
+         (but ViewModelStore is RETAINED by ActivityThread.NonConfigurationInstance)
+
+Landscape Activity (instance B, same PID 12345)
+      ▼  onCreate(bundle)   ← bundle.getString("query") → "alice"   (small UI state back)
+      ▼  viewModels<MyViewModel>()  ──► returns SAME ViewModel from retained store
+         users: still the 100 User objects  ← no re-fetch needed!
+      ▼  onStart() ──► onResume()
+
+Result:
+  searchQuery restored from bundle  (survived process death too)
+  users list restored from ViewModel (survived rotation, NOT process death)
+```
 
 ### WHY Configuration Changes Destroy Activities
 

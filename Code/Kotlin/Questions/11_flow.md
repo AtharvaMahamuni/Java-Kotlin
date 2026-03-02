@@ -18,6 +18,31 @@
 > **Connects to:** [Q11.2 — Flow Operators](11_flow.md#q112--flow-operators) · [Q11.3 — StateFlow vs SharedFlow](11_flow.md#q113--stateflow-vs-sharedflow) · [Q11.4 — Flow Collection](11_flow.md#q114--flow-collection-and-lifecycle)
 > **Reference:** [Kotlin Docs — Flows](https://kotlinlang.org/docs/flow.html)
 
+### The Concrete Picture
+
+**COLD flow** — producer starts fresh for each collector:
+```
+val coldFlow = flow { emit(1); emit(2); emit(3) }
+
+Collector A subscribes → producer STARTS → A gets: 1, 2, 3
+Collector B subscribes → producer STARTS AGAIN → B gets: 1, 2, 3
+                         ^^ independent execution, no shared state
+```
+
+**HOT flow (StateFlow)** — producer runs independently, collectors tap in:
+```
+StateFlow(0) → value=1 → value=2 → value=3 (producer runs regardless)
+
+Collector A (joined at start): 0, 1, 2, 3
+Collector B (joined late):              3   ← only current state, missed history
+```
+
+**Flow vs Sequence**: Sequence is synchronous and blocks the thread. Flow suspends.
+```
+sequence { yield(1); Thread.sleep(100); yield(2) }  // blocks thread
+flow     { emit(1);  delay(100);        emit(2)  }  // suspends coroutine, frees thread
+```
+
 ### First Principles: The Problem Flow Solves
 
 `Sequence` is lazy and synchronous — it blocks the calling thread while producing elements. You can't use `delay()` or any suspend function inside a `Sequence` block.
@@ -127,6 +152,22 @@ class UserViewModel : ViewModel() {
 | Cold | Yes | Yes (cold by default) |
 | Backpressure | No (synchronous = natural backpressure) | Yes (via `buffer`, `conflate`, etc.) |
 
+### Memory Trick
+
+```
+COLD = starts fresh on each collect. Like a movie: press play, it starts from scratch.
+HOT  = always running. Like a TV channel: join anytime, get what's currently on.
+
+Flow:      COLD. Sequence but async. delay() works. Cancellation-aware.
+StateFlow: HOT. Always has current value. replay=1. Filters duplicates.
+SharedFlow: HOT. Configurable replay. No duplicate filtering. Events.
+
+BACKPRESSURE options:
+  buffer(n)       → producer runs ahead n items, consumer catches up
+  conflate()      → only latest matters, skip stale intermediate values
+  collectLatest   → cancel current processing when new item arrives
+```
+
 ### What Is Backpressure?
 
 Backpressure is the problem where a producer emits faster than a consumer can process:
@@ -165,6 +206,26 @@ flow { ... }.collectLatest { item ->
 
 > **Builds on:** [Q11.1 — Cold Flows](11_flow.md#q111--cold-vs-hot-streams) · [Q4.2 — inline operators](04_functions_lambdas_inlining.md#q42--inline-noinline-crossinline)
 > **Connects to:** [Q11.3 — StateFlow vs SharedFlow](11_flow.md#q113--stateflow-vs-sharedflow) · [Q7.2 — Sequences (similar lazy pipeline)](07_collections_and_sequences.md#q72--sequences-vs-eager-collections)
+
+### The Concrete Picture
+
+**flatMapLatest** — user types fast, only latest search runs:
+```
+keystrokes: "a"  →  "ap"  →  "app"  →  "apple"
+inner flow:  [cancelled] [cancelled] [cancelled] [runs → result]
+
+Only "apple" search completes. Earlier searches cancelled mid-flight.
+```
+
+**zip vs combine** — two state sources:
+```
+zip:                               combine:
+flow1: ──1─────2─────3──           flow1: ──1────────2──────3──
+flow2: ────a─────b─────c──         flow2: ────a──────────b──────
+result:  ──(1,a)─(2,b)─(3,c)──    result:  ──(1,a)──(2,a)─(2,b)─(3,b)──
+
+zip = waits for BOTH (pair by pair)  combine = fires when EITHER changes
+```
 
 ### `map` vs `flatMapLatest`
 
@@ -248,6 +309,22 @@ flow {
 // Producer emits ahead, filling buffer. Consumer processes at its pace.
 ```
 
+### Memory Trick — Q11.2
+
+```
+map           → transform each value (1-to-1, no cancellation)
+flatMapLatest → each value starts a new inner flow; new value cancels previous inner flow
+                USE CASE: search (cancel stale search when new keystroke arrives)
+
+debounce(300) + flatMapLatest = the complete search pattern:
+  wait 300ms silence → distinct → flatMapLatest (cancel previous search)
+
+zip     = PAIR-BY-PAIR. Waits for both. "1a, 2b, 3c"
+combine = LATEST FROM BOTH. Fires when either changes. "Any change → re-emit"
+
+conflate/buffer/collectLatest = backpressure strategies for slow consumer.
+```
+
 ### `distinctUntilChanged`
 
 Emits only when the value has CHANGED from the previous emission:
@@ -316,6 +393,33 @@ output: ─────1a─2b─3c──      output: ─────(1,a)─(2
 > **Builds on:** [Q11.1 — Hot vs Cold](11_flow.md#q111--cold-vs-hot-streams) · [Q9.2 — CoroutineContext (scope for stateIn)](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
 > **Connects to:** [Q13.4 — LiveData vs StateFlow](13_android_architecture.md#q134--livedata-vs-stateflow-vs-sharedflow) · [Q11.4 — Collection lifecycle](11_flow.md#q114--flow-collection-and-lifecycle)
 > **Reference:** [Kotlin Docs — StateFlow and SharedFlow](https://kotlinlang.org/docs/flow.html#stateflow-and-sharedflow)
+
+### The Concrete Picture
+
+**StateFlow — duplicate filter bug with navigation:**
+```
+navigateTo = MutableStateFlow<String?>(null)
+
+navigateTo.value = "DetailScreen"  → navigates ✓
+// user comes back, state still "DetailScreen"
+navigateTo.value = "DetailScreen"  → SAME VALUE → filtered! → NO navigation!
+
+Root cause: StateFlow uses equals() — same value = not emitted.
+```
+
+**StateFlow on rotation bug:**
+```
+ViewModel survives rotation. StateFlow still holds "DetailScreen".
+New Activity subscribes → StateFlow replay=1 → immediately emits "DetailScreen"
+→ NAVIGATES AGAIN on rotation! Bug.
+```
+
+**SharedFlow — correct for events:**
+```
+MutableSharedFlow(replay=0)  → no caching, no replay to new subscribers
+                              → no duplicate filtering
+                              → safe for navigation events
+```
 
 ### Why `StateFlow` Skips Duplicate Consecutive Emissions
 
@@ -403,6 +507,28 @@ New Activity → subscribes → immediately receives "DetailScreen" → NAVIGATE
 
 **Fix:** Use `SharedFlow(replay = 0)` + set to `null` or use `Channel`. Either way: don't use `StateFlow` for events.
 
+### Memory Trick — Q11.3
+
+```
+StateFlow  = CURRENT STATE. Always has value. replay=1. Filters duplicates.
+             Good for: UI state (loading, content, error).
+             BAD for: navigation events (duplicates filtered → second nav dropped).
+
+SharedFlow = EVENT STREAM. No initial value. Configurable replay.
+             Good for: one-shot events (navigate, snackbar, error).
+             replay=0 → no stale events on rotation.
+
+ROTATION TRAP with StateFlow events:
+  ViewModel survives → StateFlow still holds last event
+  New Activity subscribes → gets old event immediately (replay=1) → executes again!
+  FIX: SharedFlow(replay=0) or Channel for events.
+
+stateIn  = cold flow → StateFlow (converts to hot with initial value)
+shareIn  = cold flow → SharedFlow (converts to hot, configurable)
+SharingStarted.WhileSubscribed(5000) = stay alive 5s after last subscriber leaves
+                                       (handles config changes gracefully)
+```
+
 ### `stateIn` vs `shareIn` on a Cold Flow
 
 ```kotlin
@@ -433,6 +559,31 @@ val userShared: SharedFlow<User> = userFlow.shareIn(
 > **Builds on:** [Q11.3 — StateFlow/SharedFlow](11_flow.md#q113--stateflow-vs-sharedflow) · [Q10.4 — Lifecycle Scopes](10_structured_concurrency.md#q104--lifecycle-scopes-and-process-death)
 > **Connects to:** [Q13.3 — ViewModel and StateFlow](13_android_architecture.md#q133--viewmodel-internals) · [Q10.3 — CancellationException](10_structured_concurrency.md#q103--exception-handling-rules)
 > **Reference:** [Android Docs — Collect flows from Android UIs](https://developer.android.com/kotlin/flow/stateflow-and-sharedflow)
+
+### The Concrete Picture
+
+```
+lifecycleScope.launch { flow.collect { updateUI() } }
+  → App goes to background (STOPPED) → collect KEEPS RUNNING
+  → updateUI() called on invisible UI → wasteful + potentially wrong
+
+lifecycleScope.launch {
+  repeatOnLifecycle(STARTED) { flow.collect { updateUI() } }
+}
+  → onStart()  → collection STARTS
+  → onStop()   → collection CANCELLED
+  → onStart()  → collection RESTARTS
+  → Only updates visible UI. ✓
+```
+
+In Compose:
+```kotlin
+// WRONG: always collecting, even in background
+val state by viewModel.state.collectAsState()
+
+// CORRECT: lifecycle-aware
+val state by viewModel.state.collectAsStateWithLifecycle()
+```
 
 ### The Lifecycle Bug with `lifecycleScope.launch { flow.collect {} }`
 
@@ -495,6 +646,19 @@ val uiState by viewModel.uiState.collectAsState()
 // collectAsState ignores lifecycle — always collects, even in background!
 ```
 
+### Memory Trick — Q11.4
+
+```
+lifecycleScope.launch { collect }           → ALWAYS collecting. WRONG for UI.
+repeatOnLifecycle(STARTED) { collect }      → ON when visible, OFF when not. CORRECT.
+
+collectAsState()                 → always collecting. Wrong in Compose.
+collectAsStateWithLifecycle()    → lifecycle-aware. Right in Compose.
+
+For Fragments: viewLifecycleOwner.repeatOnLifecycle (NOT this.repeatOnLifecycle)
+  Fragment lifecycle ≠ Fragment's View lifecycle. Use the VIEW one for UI updates.
+```
+
 ### What Happens to Buffered Emissions When Collector Is Cancelled
 
 When a Flow collector is cancelled:
@@ -518,6 +682,27 @@ sharedFlow.buffer(10).collect { value ->
 > **Builds on:** [Q11.1 — Cold vs Hot Streams](11_flow.md#q111--cold-vs-hot-streams) · [Q11.3 — StateFlow vs SharedFlow](11_flow.md#q113--stateflow-vs-sharedflow) · [Q9.3 — launch vs async](09_coroutines_execution_mechanics.md#q93--launch-vs-async)
 > **Connects to:** [Q10.6 — Mutex](10_structured_concurrency.md#q106--mutex-and-synchronization-primitives) · [Q10.5 — select Expression](10_structured_concurrency.md#q105--select-expression)
 > **Reference:** [Kotlin Docs — Channels](https://kotlinlang.org/docs/channels.html)
+
+### The Concrete Picture
+
+Channel = coroutine-safe queue with suspension protocol:
+
+```
+Producer coroutine              Channel (buffer=2)    Consumer coroutine
+  send(1) ─────────────────────► [1]  ─────────────► receive() → 1
+  send(2) ─────────────────────► [1,2]
+  send(3) → buffer full!            [suspend]
+                                [1,2]─► receive() → 1
+                                [2,3]─► producer resumes → sends 3
+```
+
+Four buffer strategies:
+```
+Rendezvous (0) → send suspends IMMEDIATELY until receiver ready. Tightest coupling.
+Buffered (64)  → send suspends when buffer full. Producer can be 64 ahead.
+Conflated      → send never suspends. Only LATEST kept. Old overwritten.
+Unlimited      → send never suspends. ALL values kept. Memory risk.
+```
 
 ### First Principles: The Problem Channels Solve
 
@@ -740,6 +925,26 @@ class MyViewModel : ViewModel() {
 // - Each event processed exactly ONCE (Channel guarantees delivery to one receiver)
 // - SharedFlow might deliver to multiple collectors or miss if no collector active
 // - Channel buffers if collector is momentarily inactive (Activity recreating)
+```
+
+### Memory Trick — Q11.5
+
+```
+Channel = QUEUE between coroutines.
+  send()    → suspends if buffer full (producer waits for consumer).
+  receive() → suspends if buffer empty (consumer waits for producer).
+  Neither blocks a thread. Both suspend.
+
+ALWAYS close channels. Forgetting → receiver suspends forever (LEAK).
+produce { } builder = auto-closes when block ends. Preferred pattern.
+
+Flow vs Channel:
+  Flow    → data stream with operators. Each collector gets own execution.
+  Channel → coroutine-to-coroutine. One item processed by exactly ONE receiver.
+
+For one-shot UI events (navigation): Channel preferred over SharedFlow.
+  Channel guarantees each event processed ONCE (not replayed, not missed).
+  _events.receiveAsFlow() exposes Channel as Flow for collection.
 ```
 
 > **Key Takeaway:** Channels are the low-level primitive beneath Flow, SharedFlow, and StateFlow. They're a coroutine-safe queue: `send()` suspends if buffer full, `receive()` suspends if empty — but never blocks a thread. Use Flow for data streams with operators; use Channel for coroutine-to-coroutine communication where each item must be processed exactly once. Always close channels (or use `produce` which auto-closes).

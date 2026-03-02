@@ -20,6 +20,30 @@
 > **Connects to:** [Q13.2 — Clean Architecture](13_android_architecture.md#q132--clean-architecture-layer-boundaries) · [Q13.3 — ViewModel](13_android_architecture.md#q133--viewmodel-internals)
 > **Reference:** [Android Docs — Guide to app architecture](https://developer.android.com/topic/architecture)
 
+### The Concrete Picture
+
+Starting point — the MassiveViewActivity anti-pattern:
+```
+UserProfileActivity.kt (500 lines)
+    ├── onClick()  → calls Retrofit directly
+    ├── onResponse() → parses JSON, updates UI, writes to DB
+    ├── onConfigurationChanged() → tries to save state manually
+    └── everything tangled — rotation = data loss, tests = impossible
+```
+
+MVVM with UDF layered on top:
+```
+UserProfileActivity
+    │  onEvent(UserEvent.LoadProfile(id))          ──►  ViewModel.onEvent()
+    │                                                        │
+    │                                                        ▼
+    │                                               GetUserUseCase(userId)
+    │                                                        │
+    │                                                        ▼
+    │  collect { state ->  render(state) }  ◄──  _uiState: StateFlow<UserUiState>
+```
+Direction: events flow UP (View → VM), state flows DOWN (VM → View). One way only.
+
 ### First Principles: Why Architecture Patterns?
 
 Without a defined architecture, Android code tends toward **MassiveViewActivity** — Activities/Fragments that handle UI, business logic, network calls, database access, and state management. This makes code:
@@ -114,6 +138,20 @@ class UserViewModel(
 }
 ```
 
+### Memory Trick
+
+```
+MVVM vs MVI:
+  MVVM = separation (View and VM can still talk both ways)
+  MVI  = one-way contract (View emits Intents, VM emits State, no return path)
+
+What lives in ViewModel:
+  IN:  UiState (StateFlow), action handlers (fun onClick), viewModelScope coroutines
+  OUT: Context refs, View refs, Navigation logic, Android Framework calls
+
+"VM is a pure Kotlin island — no Android waves can reach it"
+```
+
 ---
 
 ## Q13.2 — Clean Architecture Layer Boundaries
@@ -121,6 +159,31 @@ class UserViewModel(
 > **Builds on:** [Q13.1 — MVVM](13_android_architecture.md#q131--mvvm-and-unidirectional-data-flow)
 > **Connects to:** [Q13.5 — Dependency Injection](13_android_architecture.md#q135--dependency-injection) · [Q13.7 — Error Handling](13_android_architecture.md#q137--error-handling-across-layers)
 > **Reference:** [Android Docs — Presentation, domain, and data layers](https://developer.android.com/topic/architecture/domain-layer)
+
+### The Concrete Picture
+
+Starting state — no layer separation, Data leaks everywhere:
+```
+UserViewModel
+    │ imports retrofit2.HttpException          ← Data-layer type in Presentation!
+    │ imports com.app.data.UserRepositoryImpl  ← Concrete impl, not interface!
+    └── val repo = UserRepositoryImpl(api, db) ← ViewModel constructs its own deps!
+```
+
+After applying Clean Architecture dependency rule:
+```
+Presentation (ViewModel)
+    │  imports only: UserRepository (interface), User (domain model)
+    │  knows nothing about: Retrofit, Room, HttpException
+    ▼
+Domain (UserRepository interface, User model, GetUserUseCase)
+    │  imports nothing from Android or Retrofit — pure Kotlin
+    ▼
+Data (UserRepositoryImpl)
+    │  imports: Retrofit, Room, Domain interfaces
+    └── implements UserRepository → direction of dependency points inward
+```
+Arrow direction: Presentation → Domain ← Data (arrow = "depends on")
 
 ### First Principles: The Dependency Rule
 
@@ -227,6 +290,23 @@ class PlaceOrderUseCaseTest {
 }
 ```
 
+### Memory Trick
+
+```
+Layer dependencies — only arrows pointing INWARD are allowed:
+  UI ──► Domain ◄── Data
+         (center)
+
+Repository interface location test:
+  "Can Domain compile without the Data module?"
+  YES → interface is in Domain (correct)
+  NO  → interface is in Data (violates DIP — fix it)
+
+UseCase justified? Ask: "Does removing it require rewriting TWO ViewModels?"
+  YES → justify the abstraction
+  NO  → it's over-engineering; call the repo directly
+```
+
 ---
 
 ## Q13.3 — ViewModel Internals
@@ -234,6 +314,32 @@ class PlaceOrderUseCaseTest {
 > **Builds on:** [Q10.4 — Lifecycle Scopes](10_structured_concurrency.md#q104--lifecycle-scopes-and-process-death) · [Q0.3 — Class loading (ViewModelStore)](00_jvm_mental_model.md#q03--class-loading-and-the-static--block)
 > **Connects to:** [Q11.3 — StateFlow in ViewModel](11_flow.md#q113--stateflow-vs-sharedflow) · [Q13.4 — LiveData vs StateFlow](13_android_architecture.md#q134--livedata-vs-stateflow-vs-sharedflow) · [Q16.1 — Activity lifecycle](16_android_system_internals.md#q161--activity-and-fragment-lifecycle)
 > **Reference:** [Android Docs — ViewModel overview](https://developer.android.com/topic/libraries/architecture/viewmodel)
+
+### The Concrete Picture
+
+Starting point — screen rotation without ViewModel:
+```
+Activity onCreate()  →  creates UserRepository, loads data, stores in field
+User rotates device  →  Activity.onDestroy() called, all fields = gone
+Activity onCreate()  →  starts fresh, blank screen, re-fetches everything
+```
+
+What actually happens with ViewModelStore across a rotation:
+```
+Rotation start:
+  Activity.onRetainNonConfigurationInstance()
+      └── saves ViewModelStore  ──►  NonConfigurationInstances (held by ActivityThread)
+
+Activity destroyed and recreated:
+  new Activity.onCreate()
+      └── getLastNonConfigurationInstance()
+          └── restores ViewModelStore  ──►  same ViewModel instance returned!
+
+ViewModelProvider("UserViewModel")
+  First time   → creates new UserViewModel, stores in ViewModelStore
+  After rotate → finds existing UserViewModel in ViewModelStore — same object!
+```
+The ViewModel reference count in ViewModelStore never hits zero during rotation.
 
 ### How ViewModel Survives Configuration Changes
 
@@ -366,12 +472,65 @@ val viewModel: SharedViewModel by navGraphViewModels(R.id.nav_graph_orders)
 
 **Use case:** Sharing state between screens that are part of a single flow (checkout flow, onboarding, etc.).
 
+### Memory Trick
+
+```
+Survival matrix — what persists what?
+
+  Event                 ViewModel    SavedStateHandle   Room/DataStore
+  Rotation              YES          YES                YES
+  Process death         NO           YES                YES
+  Force quit            NO           NO                 YES
+
+"ViewModel lives in RAM — RAM dies with the process.
+ SavedStateHandle rides the Binder (system server keeps it).
+ Room is on disk — nothing kills it."
+
+SavedStateHandle size limit: ~1MB (Binder transaction limit)
+  SAFE:  String, Int, Boolean, small data classes
+  UNSAFE: List<User> with thousands of items → TransactionTooLargeException
+```
+
 ---
 
 ## Q13.4 — LiveData vs StateFlow vs SharedFlow
 
 > **Builds on:** [Q11.3 — StateFlow vs SharedFlow](11_flow.md#q113--stateflow-vs-sharedflow) · [Q13.3 — ViewModel](13_android_architecture.md#q133--viewmodel-internals)
 > **Connects to:** [Q11.4 — Flow collection lifecycle](11_flow.md#q114--flow-collection-and-lifecycle)
+
+### The Concrete Picture
+
+Starting state — LiveData in a ViewModel, needs migration to StateFlow:
+```kotlin
+// Before — LiveData (Android dependency, can be null, no duplicate filter):
+private val _user = MutableLiveData<User>()
+val user: LiveData<User> = _user
+
+// In Activity:
+viewModel.user.observe(this) { user -> render(user) }
+// Problem: observe() always active — emits in background, no lifecycle safety
+```
+
+After — StateFlow with `repeatOnLifecycle`:
+```kotlin
+// After — StateFlow (no Android dep, duplicate-filtered, coroutine-native):
+private val _user = MutableStateFlow<User?>(null)
+val user: StateFlow<User?> = _user.asStateFlow()
+
+// In Activity (lifecycle-safe collection):
+lifecycleScope.launch {
+    repeatOnLifecycle(Lifecycle.State.STARTED) {  ← stops when backgrounded
+        viewModel.user.collect { user -> render(user) }
+    }
+}
+```
+Key change: `observe()` → `repeatOnLifecycle + collect`
+
+For one-shot navigation events — StateFlow drops duplicates (bug!):
+```
+StateFlow: "DetailScreen" → "DetailScreen"  ──►  second value DROPPED (equals check)
+Channel:   "DetailScreen" → "DetailScreen"  ──►  both delivered, each consumed once
+```
 
 ### The Four Key Differences: LiveData vs StateFlow
 
@@ -434,6 +593,21 @@ viewModelScope.launch { _events.send(UiEvent.Navigate("Detail")) }
 
 **Preference:** `Channel` is simpler for one-shot events where there's exactly one consumer (UI). `SharedFlow` is better for broadcast (multiple observers).
 
+### Memory Trick
+
+```
+Pick the right observable type:
+  Current UI state (show loading/content/error)  →  StateFlow
+  One-shot event, single consumer (navigation)   →  Channel
+  One-shot event, multiple observers             →  SharedFlow(replay=0)
+  Legacy View system, simple lifecycle           →  LiveData (acceptable)
+
+StateFlow duplicate trap mnemonic:
+  "StateFlow COMPARES, Channel DELIVERS"
+  navigate("Detail") twice via StateFlow → second is LOST (same value)
+  navigate("Detail") twice via Channel   → both arrive (queue-based)
+```
+
 ---
 
 ## Q13.5 — Dependency Injection
@@ -441,6 +615,37 @@ viewModelScope.launch { _events.send(UiEvent.Navigate("Detail")) }
 > **Builds on:** [Q2.5.6 — Constructor visibility and factory](02_5_initialization_mechanics.md#q256--constructor-visibility-and-factory-patterns) · [Q2.5.2 — @Inject constructor](02_5_initialization_mechanics.md#q252--primary-vs-secondary-constructors)
 > **Connects to:** [Q13.2 — Clean Architecture layers](13_android_architecture.md#q132--clean-architecture-layer-boundaries)
 > **Reference:** [Hilt Docs](https://developer.android.com/training/dependency-injection/hilt-android)
+
+### The Concrete Picture
+
+Starting state — manual dependency construction (no DI):
+```kotlin
+class MainActivity : AppCompatActivity() {
+    override fun onCreate(...) {
+        val db = Room.databaseBuilder(this, AppDatabase::class.java, "app.db").build()
+        val dao = db.userDao()
+        val api = Retrofit.Builder().baseUrl("...").build().create(UserApi::class.java)
+        val repo = UserRepositoryImpl(api, dao)        // manual wiring
+        val vm = UserViewModel(repo)                   // manual wiring
+        // Problem: every Activity recreates the graph; no sharing; testing = nightmare
+    }
+}
+```
+
+After Hilt — construction graph generated at compile time:
+```
+@HiltAndroidApp MyApp
+    └── generates: SingletonComponent (Dagger component)
+            ├── @Singleton AppDatabase (one instance, lives forever)
+            ├── @Singleton UserApi
+            └── @Singleton UserRepositoryImpl
+
+@AndroidEntryPoint MainActivity
+    └── by viewModels()
+            └── Hilt generates UserViewModel_Factory
+                    └── injects UserRepositoryImpl from SingletonComponent
+```
+Direction: Hilt PUSHES deps into objects; objects do not PULL from a registry.
 
 ### First Principles: DI vs Service Locator
 
@@ -554,12 +759,71 @@ Hilt generates a `UserViewModel_HiltModules` that registers a factory in the `Vi
 
 You never write a `ViewModelFactory` — Hilt generates it from the `@HiltViewModel` annotation.
 
+### Memory Trick
+
+```
+DI vs Service Locator:
+  DI: "Here are your dependencies" (pushed in via constructor)
+  SL: "Go get your dependencies" (object calls global registry)
+  Koin = Service Locator with DI syntax (global module, runtime lookup)
+  Hilt/Dagger = true DI (compile-time graph, no global registry)
+
+@Binds vs @Provides:
+  @Binds   = declaration ("use THIS impl for THAT interface") — no code
+  @Provides = construction ("here is how to BUILD the instance") — has code
+
+Hilt scope ladder: Singleton → Activity → ViewModel → Fragment
+  "Outer scopes can inject into inner, never the reverse"
+```
+
 ---
 
 ## Q13.6 — Repository and Offline-First Patterns
 
 > **Builds on:** [Q13.2 — Clean Architecture](13_android_architecture.md#q132--clean-architecture-layer-boundaries) · [Q11.3 — StateFlow](11_flow.md#q113--stateflow-vs-sharedflow)
 > **Connects to:** [Q13.7 — Error Handling](13_android_architecture.md#q137--error-handling-across-layers) · [Q14.1 — Room](14_jetpack_components.md#q141--room--internals) · [Q15.1 — OkHttp](15_networking.md#q151--okhttp-interceptor-chain)
+
+### The Concrete Picture
+
+Starting state — UI reads directly from network (no offline support):
+```
+User opens app
+    │
+    ▼
+ViewModel calls api.getUsers()           ← network-only
+    │ network available  →  list appears
+    │ network unavailable →  blank screen, error
+    └── no local cache, no persistence
+```
+
+After Single Source of Truth with Room:
+```
+User opens app
+    │
+    ▼
+ViewModel calls userDao.observeAll()     ← Flow<List<User>> from Room
+    │  immediately emits cached DB data  →  list appears instantly (even offline)
+    │
+    ▼ (in parallel)
+refreshUsers()
+    │  api.getUsers()                    ← network fetch
+    │  userDao.insertAll(response)       ← write to Room
+    │  Room InvalidationTracker fires
+    └──────────────────────────────────► Flow emits new data → UI auto-updates
+
+Offline scenario: network step fails → Room still has old data → no blank screen
+```
+
+Optimistic update direction:
+```
+User taps Like
+    │
+    ├──► DB write immediately (+1 like)  →  UI shows "Liked" instantly (t=0ms)
+    │
+    └──► api.likePost() in background    (t=~300ms)
+              │ success → nothing to do (DB already correct)
+              └── failure → DB write (-1 like) → Flow emits → UI shows "Not liked"
+```
 
 ### The Single Source of Truth Pattern
 
@@ -710,12 +974,63 @@ fun mergeUser(local: User, server: User): User {
 }
 ```
 
+### Memory Trick
+
+```
+SSoT flow direction:
+  Network ──► Room ◄── UI observes
+  "Network feeds Room; Room feeds UI; network never feeds UI directly"
+
+Conflict resolution decision tree:
+  Simple / infrequent edits    →  Last-Write-Wins (timestamp comparison)
+  Financial / inventory        →  Server-Wins (correctness > UX)
+  User's own content / drafts  →  Client-Wins
+  Collaborative docs           →  Field-Level Merge or CRDTs
+
+Optimistic update rollback is FREE when using Room + Flow:
+  Rollback write → Room emits → UI reverts automatically (no setState needed)
+```
+
 ---
 
 ## Q13.7 — Error Handling Across Layers
 
 > **Builds on:** [Q13.6 — Repository](13_android_architecture.md#q136--repository-and-offline-first-patterns) · [Q10.3 — Coroutine exception handling](10_structured_concurrency.md#q103--exception-handling-rules)
 > **Connects to:** [Q4.3 — CancellationException](04_functions_lambdas_inlining.md#q43--higher-order-functions-with-suspend)
+
+### The Concrete Picture
+
+Starting state — HttpException leaking across all layers:
+```kotlin
+// ViewModel (Presentation layer) — knows about HTTP status codes: BAD
+catch (e: HttpException) {
+    if (e.code() == 401) navigateToLogin()   // HTTP vocabulary in UI layer!
+    if (e.code() == 404) showNotFound()
+}
+```
+
+After translation at the Data→Domain boundary:
+```
+Data layer (UserRepositoryImpl):
+    HttpException(401)  ──►  throw AppError.Unauthorized
+    HttpException(404)  ──►  throw AppError.NotFound("User $id")
+    HttpException(5xx)  ──►  throw AppError.ServerError
+    IOException         ──►  throw AppError.NetworkError
+
+Domain boundary (sealed class AppError — no Retrofit imports)
+
+ViewModel (Presentation):
+    catch (e: AppError) {
+        AppError.Unauthorized  ──►  UiState.Error.SessionExpired
+        AppError.NetworkError  ──►  UiState.Error.Offline
+        AppError.NotFound      ──►  UiState.Error.NotFound(e.resource)
+    }
+
+UI:
+    UiState.Error.SessionExpired  ──►  navController.navigate(loginScreen)
+    UiState.Error.Offline         ──►  show snackbar + retry button
+```
+Each layer translates to its own vocabulary — no type crosses the boundary.
 
 ### First Principles: Why Layers Need Different Error Types
 
@@ -910,6 +1225,26 @@ Re-thrown:
 ```
 
 > **Interview Trap:** This is one of the most common production bugs. `catch (e: Exception)` blocks in ViewModels that don't re-throw `CancellationException` cause coroutine leaks and show error UI when the user simply navigated away.
+
+### Memory Trick
+
+```
+Error translation direction — always translate INWARD:
+  Data    →  throws AppError (translates HTTP codes)
+  Domain  →  catches AppError (passes it up or handles it)
+  UI      →  maps AppError to UiState.Error (user-facing language)
+
+CancellationException rule — "FIRST or RETHROW":
+  catch (e: CancellationException) { throw e }  ← always first catch block
+  catch (e: AppError) { ... }                   ← then domain errors
+
+Why CancellationException must be rethrown:
+  It IS-A Exception → generic catch swallows it
+  Swallowed = coroutine keeps running despite scope cancellation = LEAK
+
+Sealed AppError wins = exhaustive when() → compiler enforces all cases
+  "Add AppError.RateLimit → compiler error in ViewModel → can't miss it"
+```
 
 ---
 

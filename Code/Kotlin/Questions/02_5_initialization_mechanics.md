@@ -20,6 +20,31 @@
 > **Builds on:** [Q0.3 — Class Loading (`<init>` method)](00_jvm_mental_model.md#q03--class-loading-and-the-static--block)
 > **Connects to:** [Q2.5.2 (secondary constructors)](02_5_initialization_mechanics.md#q252--primary-vs-secondary-constructors) · [Q2.5.3 (inheritance order)](02_5_initialization_mechanics.md#q253--inheritance-initialization-order)
 
+### The Concrete Picture
+
+Three things in a class body: constructor params, property initializers, init blocks. They all merge into ONE method (`<init>`), in declaration order:
+
+```kotlin
+class User(val name: String) {   // ← constructor param
+    val greeting = "Hello, $name"  // ← property initializer
+    init { println("1: $name") }   // ← init block
+    val bio = "$name!"             // ← property initializer
+    init { println("2: $bio") }    // ← init block
+}
+```
+
+The execution order is exactly the order you WROTE them:
+```
+User("Alice"):
+  → name = "Alice"           (constructor param, always first)
+  → greeting = "Hello, Alice" (property initializer)
+  → println("1: Alice")      (init block)
+  → bio = "Alice!"           (property initializer)
+  → println("2: Alice!")     (init block)
+```
+
+Not: "all properties, then all init blocks." It's: **one unified top-to-bottom sequence**.
+
 ### Are They the Same at the Bytecode Level?
 
 **Yes, and no.** Both compile into the **same `<init>` method**. The primary constructor's parameters become local variables inside `<init>`, and both property initializers and `init` blocks are **interleaved in declaration order** into the body of `<init>`.
@@ -71,6 +96,16 @@ User("Alice", 30) called
 └── 5. "init block 2: bio=Alice..."   [init block]
 ```
 
+### Memory Trick
+
+```
+INIT ORDER = TOP-TO-BOTTOM declaration order. No exceptions.
+Constructor params → then everything interleaved as written.
+
+"Primary constructor vs init block" — same method (<init>), same sequence.
+They're not two separate phases. It's one continuous top-down execution.
+```
+
 ### Why Interleaved Order Matters
 
 **The Bug If Properties Ran First, Then All `init` Blocks:**
@@ -97,6 +132,22 @@ With declaration-order interleaving, `processName()` is called when `name` is st
 
 > **Builds on:** [Q2.5.1 — Primary Constructor](02_5_initialization_mechanics.md#q251--primary-constructor-vs-init-block)
 > **Connects to:** [Q4.5 — Default Parameters (prefer over secondary constructors)](04_functions_lambdas_inlining.md#q45--named-and-default-parameters) · [Q2.5.6 — Constructor Visibility](02_5_initialization_mechanics.md#q256--constructor-visibility-and-factory-patterns)
+
+### The Concrete Picture
+
+Secondary constructor must chain to primary. Think of it as a delegation chain — the primary does the real work, secondary just adds on top:
+
+```
+new User("Alice")              → secondary called
+  ├── this("Alice", 0) → primary called
+  │     ├── name = "Alice"
+  │     ├── age = 0
+  │     ├── [all property initializers run]
+  │     └── [all init blocks run]
+  └── secondary body runs  ← AFTER all of the above
+```
+
+Primary always runs first. Secondary body runs last. init blocks are part of primary, not secondary.
 
 ### Why Must Secondary Constructors Delegate to Primary?
 
@@ -131,6 +182,23 @@ new User("Alice")  →  secondary constructor called
 BEFORE the secondary constructor body!
 ```
 
+### Memory Trick
+
+```
+SECONDARY CONSTRUCTOR rule: must call this() first (primary).
+The primary is "the real init." Secondary body is just an afterthought.
+
+INIT BLOCK vs SECONDARY BODY order:
+  init blocks  → run as part of PRIMARY (before secondary body)
+  secondary body → runs AFTER everything in primary
+
+PREFER default parameters over secondary constructors:
+  class User(val name: String, val age: Int = 0)   // cleaner
+  vs
+  constructor(name: String) : this(name, 0) { }    // more verbose
+  Use secondary only when logic differs per constructor path.
+```
+
 ### Secondary Constructor vs Default Parameters
 
 ```kotlin
@@ -156,6 +224,36 @@ class User(val name: String, val age: Int) {
 > **Connects to:** [Q0.4 — INVOKEVIRTUAL dispatch](00_jvm_mental_model.md#q04--the-jvm-call-stack) · [Q2.1 — Why final is safe](02_classes_and_objects.md#q21--class-modifiers)
 
 > **This section contains the most dangerous trap in all of Kotlin.**
+
+### The Concrete Picture
+
+Two classes. Parent runs BEFORE child. Now imagine parent calls a method that child overrides:
+
+```
+class Child : Base()
+
+Base.init runs → calls message → JVM dispatches to Child.getMessage()
+                                  → Child.message not yet assigned!
+                                  → returns null
+Child.init runs → message = "from Child"  ← TOO LATE
+```
+
+The bug step by step:
+```
+new Child()
+  ├── 1. Base.<init> starts
+  │   ├── Base properties initialize
+  │   ├── Base init block: println(message)
+  │   │           message calls → INVOKEVIRTUAL → Child.getMessage()
+  │   │           Child.message field = null (Child hasn't run yet)
+  │   │           prints: null  ← BUG
+  │   └── Base.<init> done
+  └── 2. Child.<init> starts
+      ├── Child.message = "from Child"  ← would have been fine if Base hadn't read it
+      └── Child.<init> done
+```
+
+Parent already finished using `message` before child got to initialize it.
 
 ### The Exact Execution Order for Subclass Instantiation
 
@@ -236,6 +334,25 @@ class Dog : Animal() {
 Dog()  // prints: null (not "Woof")
 ```
 
+### Memory Trick
+
+```
+INHERITANCE INIT ORDER = SUPER BEFORE SUB, always.
+
+THE FATAL COMBINATION:
+  open class Base  +  open fun in init  +  Child overrides that fun
+  = Base's init calls Child's version = Child's fields not yet initialized = null/0
+
+MENTAL CHECK before writing any open class:
+  "Does my init block call any open method?"
+  If YES → risk of seeing null/0 from subclass fields.
+
+SAFE alternatives:
+  1. Make the method final/private (compiler uses INVOKESPECIAL, no override)
+  2. Don't call overridable methods in init
+  3. Move logic to a factory function that runs after construction
+```
+
 ### How `final` Removes the Danger
 
 If `Animal` is `final` (or `sound()` is `final`/`private`), the compiler uses `INVOKESPECIAL` (direct call) instead of [`INVOKEVIRTUAL`](00_jvm_mental_model.md#q04--the-jvm-call-stack) (virtual dispatch). There's no override possible, so the call in `init` always resolves to the base class method — which IS fully initialized.
@@ -271,6 +388,28 @@ class EventManager {
 > **Builds on:** [Q0.3 — Class Loading and `<clinit>`](00_jvm_mental_model.md#q03--class-loading-and-the-static--block) · [Q2.4 — The `object` Keyword](02_classes_and_objects.md#q24--the-object-keyword)
 > **Connects to:** [Q1.1 — const val inlining](01_type_system_foundations.md#q11--val-vs-const-val) · [Q2.5.1 — init block timing](02_5_initialization_mechanics.md#q251--primary-constructor-vs-init-block)
 
+### The Concrete Picture
+
+Two accesses. One triggers class loading. One doesn't:
+
+```kotlin
+class Config {
+    companion object {
+        const val TAG = "Config"          // compile-time constant
+        val URL = "https://api.example.com"  // runtime value
+    }
+}
+
+Log.d(Config.TAG, "hi")    // bytecode: LDC "Config"  ← no class loading!
+val url = Config.URL        // bytecode: GETSTATIC + INVOKEVIRTUAL ← class loaded here
+```
+
+Direction of dependency:
+```
+const val  → compiler INLINES it → Config class never touched for that line
+val        → compiler READS it at runtime → Config's companion must be initialized first
+```
+
 ### When Does a `companion object` Get Initialized?
 
 A `companion object` is initialized **lazily** — on the first access to any of its non-const members.
@@ -302,6 +441,21 @@ LDC "message"
 INVOKESTATIC android/util/Log.d
 ```
 
+### Memory Trick
+
+```
+COMPANION INIT is LAZY — triggered on first NON-CONST access.
+const val → inlined at call site → companion NEVER initialized for that access.
+val       → runtime access → companion initialized on first touch.
+
+CIRCULAR INIT DEADLOCK:
+  object A uses B during init, object B uses A during init.
+  Thread 1: initializing A → needs B → waits for B's init lock
+  Thread 2: initializing B → needs A → waits for A's init lock
+  DEADLOCK — both threads wait forever.
+  Fix: avoid cross-singleton dependencies during initialization.
+```
+
 ### Circular Initialization Deadlock Risk
 
 ```kotlin
@@ -327,6 +481,28 @@ object B {
 > **Builds on:** [Q2.5.1 — Interleaved Init Order](02_5_initialization_mechanics.md#q251--primary-constructor-vs-init-block)
 > **Connects to:** [Q5.2 — lazy defers initialization](05_properties_and_delegation.md#q52--lazy-internals) · [Q5.1 — lateinit internals](05_properties_and_delegation.md#q51--lateinit-internals)
 
+### The Concrete Picture
+
+Declaration order is execution order. Reference something below you = NPE:
+
+```kotlin
+class Example {
+    val length = name.length   // runs first — name is null here!  → NPE
+    val name = "Alice"         // runs second
+}
+```
+
+The compiler doesn't warn you. It compiles fine. You only find out at runtime.
+
+Compare with `lazy`:
+```kotlin
+class Example {
+    val length by lazy { name.length }  // runs only when accessed, AFTER construction
+    val name = "Alice"
+}
+// length is safe — lazy block runs after entire constructor finishes
+```
+
 ### Can a Property Reference One Declared Below It?
 
 ```kotlin
@@ -346,6 +522,23 @@ This **compiles** — the compiler doesn't check cross-property reference order.
 // Generated <init>:
 this.length = this.name.length();  // name is null here → NPE!
 this.name = "Alice";               // assigned AFTER!
+```
+
+### Memory Trick
+
+```
+PROPERTY ORDER TRAP:
+  Rule: declaration order = execution order.
+  Reference a property BELOW your current line = it's still null.
+  Compiler won't catch this. It compiles. It crashes at runtime.
+
+SAFE PATTERN when order is ambiguous: use lazy { }
+  lazy block defers until first access.
+  By that time, the entire constructor has finished.
+  Safe reference to any other property of the same object.
+
+eager val  → initialized at construction time (order matters!)
+lazy val   → initialized at first access (order doesn't matter)
 ```
 
 ### `const val` vs Regular `val` — Initialization Timing
@@ -383,6 +576,28 @@ screen.lazyData  ← FIRST ACCESS
 
 > **Builds on:** [Q2.5.2 — Secondary Constructors](02_5_initialization_mechanics.md#q252--primary-vs-secondary-constructors) · [Q2.4 — object singleton pattern](02_classes_and_objects.md#q24--the-object-keyword)
 > **Connects to:** [Q13.5 — Dependency Injection](13_android_architecture.md#q135--dependency-injection)
+
+### The Concrete Picture
+
+Private constructor = you control every entry point into the object:
+
+```kotlin
+class Database private constructor(val url: String)
+
+// From outside: can't do Database("url")  → COMPILE ERROR
+// Only way in:
+val db = Database.getInstance("jdbc:sqlite:app.db")
+```
+
+Why this matters:
+```
+Public constructor:   anyone creates instances → no control
+Private constructor:  only factory methods create instances → full control:
+  - Return cached instance (singleton)
+  - Validate params before construction
+  - Return subclass based on params
+  - Give meaningful names: Database.inMemory() vs Database.persistent()
+```
 
 ### Private Constructor + Factory Pattern
 
@@ -432,6 +647,23 @@ The Kotlin compiler also generates a synthetic `$default` method with a bitmask:
 // Internal: Button$default(String text, int color, float size, int mask, Object defaultConstructorMarker)
 // mask bit 0 = use default for color
 // mask bit 1 = use default for size
+```
+
+### Memory Trick
+
+```
+PRIVATE CONSTRUCTOR = "only I decide how to be born."
+  Use when: singleton, validation on construction, named factory variants.
+
+@JvmOverloads = generates N+1 Java constructors from N default params.
+  Kotlin callers: one function with defaults (no overloads needed)
+  Java callers:   need actual separate constructors (@JvmOverloads provides them)
+
+DOUBLE-CHECKED LOCKING = for thread-safe lazy singleton when you can't use object:
+  @Volatile var instance: T? = null
+  ?: synchronized(lock) { instance ?: create().also { instance = it } }
+  Outer ?: avoids lock after first creation.
+  Inner ?: handles race condition between two threads entering synchronized.
 ```
 
 ### `@Inject constructor` and Hilt DI

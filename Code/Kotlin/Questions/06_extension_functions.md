@@ -16,6 +16,26 @@
 > **Connects to:** [Q6.2 — Extension Functions as API Design](06_extension_functions.md#q62--extension-functions-as-api-design) · [Q3.3 — reified extension functions](03_generics_and_variance.md#q33--reified-type-parameters)
 > **Reference:** [Kotlin Docs — Extension Functions](https://kotlinlang.org/docs/extensions.html)
 
+### The Concrete Picture
+
+Extension function in Kotlin vs what the JVM sees:
+
+```kotlin
+// Kotlin:
+fun String.greet(): String = "Hello, $this!"
+"World".greet()
+
+// JVM bytecode:
+// 1. Extension → static method, receiver is FIRST PARAMETER
+public static String greet(String $receiver) { return "Hello, " + $receiver + "!"; }
+
+// 2. Call site → static call (INVOKESTATIC), not virtual (INVOKEVIRTUAL)
+StringExtensionsKt.greet("World")
+```
+
+Key insight: the receiver (`"World"`) is NOT `this` inside the JVM — it's a parameter.
+That means the JVM doesn't do a vtable lookup. The type is resolved at COMPILE TIME.
+
 ### First Principles: How Can You Add Methods to a Class You Don't Own?
 
 In Java, if you want extra behavior on `String`, you must:
@@ -99,6 +119,24 @@ makeSpeak(Dog())  // "Dog speaks" — virtual dispatch works
 
 The key difference: **member functions use [`INVOKEVIRTUAL`](00_jvm_mental_model.md#q04--the-jvm-call-stack) (runtime type dispatch); extension functions use `INVOKESTATIC` (compile-time type dispatch).**
 
+### Memory Trick
+
+```
+EXTENSION = STATIC method with receiver as first parameter.
+
+INVOKESTATIC = compile-time type dispatch (declared type wins).
+INVOKEVIRTUAL = runtime type dispatch (actual type wins).
+
+Extension dispatch = COMPILE TIME → can NOT override member functions.
+Member dispatch = RUNTIME → CAN override (polymorphism).
+
+"Animal.speak() extension vs Dog override of member speak()":
+  Extension: declared type is Animal → always calls Animal version → no polymorphism
+  Member:     actual type is Dog    → calls Dog version → polymorphism works
+
+MEMBER ALWAYS BEATS EXTENSION with same signature. No exception.
+```
+
 ### What Happens When a Member and Extension Have the Same Name?
 
 ```kotlin
@@ -120,6 +158,23 @@ p.print()  // "Member print" — member ALWAYS wins over extension
 
 > **Builds on:** [Q6.1 — Compilation and Dispatch](06_extension_functions.md#q61--compilation-and-dispatch) · [Q4.4 — Scope Functions](04_functions_lambdas_inlining.md#q44--scope-functions)
 > **Connects to:** [Q6.3 — Extension Properties](06_extension_functions.md#q63--extension-properties) · [Q4.4 — apply for chaining](04_functions_lambdas_inlining.md#q44--scope-functions)
+
+### The Concrete Picture
+
+Three patterns where extensions shine:
+
+```
+1. You don't own the class (final/3rd party):
+   Can't subclass String → add fun String.capitalize() as extension → clean
+
+2. Domain logic outside the core type:
+   RecyclerView.setup() is YOUR domain, not RecyclerView's job → extension
+
+3. Nullable receiver — handle null inside the extension:
+   fun String?.orEmpty() = this ?: ""
+   null.orEmpty()  // safe! receiver is null, checked inside
+   vs null?.uppercase() → you'd need ?. at every call site
+```
 
 ### When Do Extension Functions Make Sense?
 
@@ -199,6 +254,19 @@ public static String orEmpty(String $receiver) {
 
 The null check happens **inside** the extension function, so calling it on `null` is safe.
 
+### Memory Trick
+
+```
+EXTENSION on nullable receiver = null safety INSIDE the function.
+  fun String?.orEmpty() = this ?: ""
+  null.orEmpty()   // compiles! JVM calls: StringKt.orEmpty(null)
+  Inside: if (this == null) return ""
+  No NullPointerException because null is handled inside, not at call site.
+
+Use extensions when: don't own class, domain-specific logic, nullable safe handling.
+Don't use when: need private state access (can't), need polymorphism (can't override).
+```
+
 ---
 
 ## Q6.3 — Extension Properties
@@ -206,6 +274,34 @@ The null check happens **inside** the extension function, so calling it on `null
 > **Builds on:** [Q6.1 — Extension Functions (static dispatch)](06_extension_functions.md#q61--compilation-and-dispatch) · [Q0.1 — Heap and backing fields](00_jvm_mental_model.md#q01--primitives-vs-references)
 > **Connects to:** [Q5.3 — Delegates (external storage for extension state)](05_properties_and_delegation.md#q53--delegates)
 > **Reference:** [Kotlin Docs — Extension Properties](https://kotlinlang.org/docs/extensions.html#extension-properties)
+
+### The Concrete Picture
+
+Extension property = computed getter/setter, NO backing field:
+
+```kotlin
+val String.wordCount: Int
+    get() = this.split(" ").count { it.isNotEmpty() }
+
+// JVM: public static int getWordCount(String $receiver) { ... }
+// There is NO field "wordCount" on String. Never was.
+```
+
+Can't add state:
+```kotlin
+var String.tag: String = ""   // COMPILE ERROR — no place to store it!
+// String class is owned by JVM, you can't add fields to it
+```
+
+External storage workaround:
+```kotlin
+private val viewTags = WeakHashMap<View, String>()
+var View.customTag: String?
+    get() = viewTags[this]
+    set(value) { viewTags[this] = value }
+// Stores state in a Map OUTSIDE the View class
+// WeakHashMap: doesn't prevent View from being GC'd (important!)
+```
 
 ### The Backing Field Restriction
 
@@ -266,6 +362,22 @@ fun String.parseAsUser(): User { ... }  // action/transformation → function
 - Properties represent **characteristics** (what the object IS)
 - Functions represent **actions** (what the object DOES)
 - If it's expensive, prefer a function — properties imply O(1) cheap access
+
+### Memory Trick
+
+```
+EXTENSION PROPERTY = computed value only. No backing field. EVER.
+You can't add state to a class you don't own.
+
+CAN compute from receiver:  val String.wordCount = split(" ").size  ✓
+CAN use external map:       WeakHashMap<View, String> as backing      ✓
+CANNOT have field:          var String.tag = ""                        ✗
+
+property vs function distinction:
+  Property → characteristic ("what it IS") → wordCount, length, isEmpty
+  Function → action ("what it DOES") → parseAsUser(), download(), compress()
+  Expensive operation → function (properties imply cheap access)
+```
 
 ---
 

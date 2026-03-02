@@ -9,6 +9,25 @@ Phase J6 built the foundational mental model: thread states, monitor locks, the 
 > **Builds on:** [J6.1 — Thread Lifecycle](J6_concurrency_fundamentals.md#j61--thread-lifecycle)
 > **Connects to:** [J7.6 — CompletableFuture](J7_concurrent_utilities.md#j76--completablefuture)
 
+### The Concrete Picture
+
+Start: `ThreadPoolExecutor(core=2, max=4, queue=ArrayBlockingQueue(3))`, submit 8 tasks:
+
+```
+T1 submitted ──► running threads (0) < core (2) ──► start Thread-1, run T1
+T2 submitted ──► running threads (1) < core (2) ──► start Thread-2, run T2
+T3 submitted ──► running = core = 2; queue.offer(T3) succeeds ──► queued [T3]
+T4 submitted ──► queue.offer(T4) succeeds ──► queued [T3, T4]
+T5 submitted ──► queue.offer(T5) succeeds ──► queued [T3, T4, T5]
+T6 submitted ──► queue FULL; running (2) < max (4) ──► start Thread-3, run T6
+T7 submitted ──► queue FULL; running (3) < max (4) ──► start Thread-4, run T7
+T8 submitted ──► queue FULL; running = max = 4 ──► RejectedExecutionHandler!
+
+newFixedThreadPool(4):  uses LinkedBlockingQueue (UNBOUNDED)
+  ──► T6, T7, T8 all queue (never reach max) ──► queue grows without bound!
+  ──► Under load: queue fills heap ──► OutOfMemoryError
+```
+
 ### WHY This Matters
 
 Before `java.util.concurrent`, developers managed threads directly: `new Thread(task).start()`. This is fine for one or two threads but catastrophic at scale. Thread creation is expensive — each thread allocates a stack (512 KB to 1 MB by default), registers with the OS scheduler, and has a teardown cost. Creating one thread per incoming request in a server under load produces thousands of threads, exhausting heap memory and causing the OS scheduler to spend more time context-switching than executing work.

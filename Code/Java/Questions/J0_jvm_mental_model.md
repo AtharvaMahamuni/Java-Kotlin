@@ -8,6 +8,36 @@ These four questions build the foundational mental model every Java developer mu
 
 > **Connects to:** [J0.2 — Autoboxing & Integer Cache](J0_jvm_mental_model.md#j02--autoboxing--integer-cache)
 
+### The Concrete Picture
+
+Two variables. Same conceptual value. Completely different memory:
+
+```
+int x = 5;
+Integer y = 5;
+
+STACK:                          HEAP:
+┌─────────────────────┐         ┌────────────────────────────────┐
+│  x = 5  [4 bytes]   │         │  Integer @ 0x7fa3                │
+│  y = 0x7fa3 [ptr]   │──────►  │    mark word       [8 bytes]    │
+└─────────────────────┘         │    class pointer   [4 bytes]    │
+                                 │    int value = 5   [4 bytes]    │
+                                 │  TOTAL: 16 bytes (4× overhead)  │
+                                 └────────────────────────────────┘
+
+int  x = 5 → 4 bytes, on stack, no pointer, no GC overhead.
+Integer y = 5 → 4 bytes pointer + 16 bytes heap object = 20 bytes + GC pressure.
+```
+
+Pass-by-value — both primitives AND references are passed by VALUE:
+```
+void mutate(StringBuilder sb) { sb.append("!"); }   // mutates the same object ✓
+void reassign(String s) { s = "new"; }               // s is a local copy ✗ (caller unchanged)
+
+Think: reference = photocopy of address. Mutate through it = caller sees change.
+       Reassign the copy = caller's copy unaffected.
+```
+
 ### WHY This Distinction Exists
 
 Java was designed with two fundamentally different kinds of data, and confusing them is the source of some of the most common bugs and performance problems in Java code. The distinction exists for a simple reason: performance. If every integer required a heap allocation, a garbage collector write barrier, and an indirection through a pointer just to do arithmetic, Java would be unusably slow. Primitives exist so that the JVM can work with raw CPU-native data directly on the stack or in registers, with no object overhead whatsoever.
@@ -116,6 +146,20 @@ After sb2.append():
   sb2 → [StringBuilder @ 0x1000: "hello world"]  ← same object was mutated
 ```
 
+### Memory Trick
+
+```
+PRIMITIVE = value IS the variable. Stack only. 4 bytes for int. No GC.
+REFERENCE = variable holds ADDRESS. Stack pointer + heap object. 16 bytes minimum.
+
+int  → 4 bytes on stack. DONE.
+Integer → 4-byte pointer + 16-byte heap object = 4× overhead.
+
+Java is ALWAYS pass-by-value.
+  Primitive: copy the bits (caller unaffected).
+  Reference: copy the address (shared object — mutation visible, reassignment not).
+```
+
 ### Interview Trap: Java is Always Pass-by-Value
 
 This is one of the most debated Java interview questions, and the answer is definitive: Java is always pass-by-value. Always. No exceptions. The confusion arises because for reference types, the "value" being passed is the pointer itself.
@@ -150,6 +194,31 @@ The mental model: think of a reference as a piece of paper with an address writt
 
 > **Builds on:** [J0.1 — Primitives vs References in Java](J0_jvm_mental_model.md#j01--primitives-vs-references-in-java)
 > **Connects to:** [J0.3 — String Pool & Interning](J0_jvm_mental_model.md#j03--string-pool--interning)
+
+### The Concrete Picture
+
+The cache boundary trap — same code, different result:
+
+```
+Integer a = 127;    →  Integer.valueOf(127) → cache hit → SAME object every time
+Integer b = 127;    →  Integer.valueOf(127) → cache hit → SAME object
+a == b  → TRUE  (same address in IntegerCache)
+
+Integer c = 128;    →  Integer.valueOf(128) → cache miss → new Integer(128)
+Integer d = 128;    →  Integer.valueOf(128) → cache miss → new Integer(128)
+c == d  → FALSE (two different new objects)
+c.equals(d)  → TRUE (content comparison)
+
+Cache range: -128 to +127 (guaranteed by JLS).
+Outside range: new object every time → == fails.
+```
+
+Autoboxing what actually happens:
+```
+Integer x = 5;     compiles to: Integer.valueOf(5)   — uses cache
+int y = x;         compiles to: x.intValue()          — method call on object
+Integer z = null; int w = z;  → NullPointerException!  null.intValue() → NPE
+```
 
 ### WHY Autoboxing Exists
 
@@ -277,6 +346,22 @@ The fix is to always check for null before unboxing, or use a default value:
 int count = map.getOrDefault("key", 0);  // safe — returns 0 if key absent
 ```
 
+### Memory Trick
+
+```
+AUTOBOXING = Integer.valueOf(x). NOT new Integer(x).
+  valueOf → checks cache first → returns cached object for -128..127.
+  -128 to +127: cache hit → == TRUE (same object).
+  Outside range: new object → == FALSE. ALWAYS use .equals() for Integer.
+
+UNBOXING NULL → NPE. Integer x = null; int y = x; → x.intValue() on null → CRASH.
+  map.get("key") → null if absent → unboxing → NPE. Fix: getOrDefault("key", 0).
+
+AUTOBOXING IN LOOPS = GC pressure.
+  Long sum = 0L; sum += i; → new Long every iteration → 1M objects.
+  long sum = 0L; sum += i; → stays on stack, zero allocations.
+```
+
 ### Performance: Autoboxing in Loops
 
 Every time the JVM autoboxes a primitive outside the cache range, it allocates a new object on the heap. In a tight loop, this creates massive GC pressure:
@@ -311,6 +396,28 @@ The first version creates one million `Long` objects. Each allocation is small b
 
 > **Builds on:** [J0.2 — Autoboxing & Integer Cache](J0_jvm_mental_model.md#j02--autoboxing--integer-cache)
 > **Connects to:** [J0.4 — Java Bytecode Basics](J0_jvm_mental_model.md#j04--java-bytecode-basics)
+
+### The Concrete Picture
+
+Four comparison cases — memorize the pattern:
+
+```
+"hello" == "hello"              → TRUE   (same pool object, literals share)
+new String("hello") == "hello"  → FALSE  (new creates heap object outside pool)
+"hel" + "lo" == "hello"         → TRUE   (compile-time folding → same pool entry)
+String s = "hel"; s + "lo" == "hello" → FALSE (runtime concat → new object)
+```
+
+Pool storage (since Java 7 — moved from PermGen to main heap):
+```
+String Pool (heap):
+┌────────────────────────────┐
+│  "hello" @ 0x5000          │ ← ONE object for ALL "hello" literals
+└────────────────────────────┘
+   ▲      ▲      ▲
+String a  b  c   ← all three variables point to the same pool entry
+a == b == c → TRUE
+```
 
 ### WHY the String Pool Exists
 
@@ -443,6 +550,21 @@ String result = sb.toString();   // one final allocation
 
 In Java 9+, concatenation outside loops uses `invokedynamic StringConcatFactory` which can be even more efficient than `StringBuilder`, choosing the optimal strategy at JIT compile time.
 
+### Memory Trick
+
+```
+LITERAL "hello" → pool entry. All literals with same content share ONE object.
+new String("hello") → bypasses pool → new heap object → == false with pool literal.
+"a" + "b" (both literals) → compile-time folded → ONE pool entry → == "ab" is TRUE.
+s + "b" (s is variable) → runtime concat → new object → == "ab" is FALSE.
+
+ALWAYS use .equals() for String content comparison. NEVER ==.
+intern() → moves to pool. Careful: pool has lock contention with many unique strings.
+
+String + in loop → O(n²). StringBuilder.append() → O(n). Use StringBuilder.
+Java 9+: INVOKEDYNAMIC StringConcatFactory → potentially even faster than StringBuilder.
+```
+
 ### Interview Trap: How Many Objects Does `new String("hello")` Create?
 
 The answer is 1 or 2, depending on whether `"hello"` is already in the pool:
@@ -457,6 +579,39 @@ In practice, in almost all programs, the pool entry exists because the literal `
 ## J0.4 — Java Bytecode Basics
 
 > **Builds on:** [J0.3 — String Pool & Interning](J0_jvm_mental_model.md#j03--string-pool--interning)
+
+### The Concrete Picture
+
+JVM is stack-based: push operands, execute instruction, push result:
+
+```java
+int result = a * b + c;
+```
+```
+Stack:    []
+ILOAD_1   → [a]
+ILOAD_2   → [a, b]
+IMUL      → [a*b]        // pops a,b, pushes product
+ILOAD_3   → [a*b, c]
+IADD      → [a*b+c]      // pops both, pushes sum
+ISTORE_4  → []           // pops and stores in result
+```
+
+Four INVOKE opcodes — pick the right one:
+```
+INVOKEVIRTUAL   → class instance method.    vtable lookup (O(1)).
+INVOKEINTERFACE → interface method.         itable lookup (slightly slower, JIT optimizes).
+INVOKESPECIAL   → constructor, private, super. Direct call, no dispatch.
+INVOKESTATIC    → static method.            Direct call, no dispatch.
+INVOKEDYNAMIC   → lambda, String concat.    Bootstrap method → CallSite.
+```
+
+JIT optimization path:
+```
+Call site always gets one type (Circle) → MONOMORPHIC → JIT inlines directly → fastest
+Second type appears (Rectangle) → BIMORPHIC → JIT deoptimizes, recompiles with 2 guards
+Third type appears → MEGAMORPHIC → table lookup, no inlining, slower
+```
 
 ### WHY Understanding Bytecode Matters
 
@@ -643,6 +798,29 @@ INVOKEDYNAMIC makeConcatWithConstants(Ljava/lang/String;Ljava/lang/String;)Ljava
 ```
 
 This allows the JDK to choose the optimal concatenation strategy per use site, without recompiling your code.
+
+### Memory Trick
+
+```
+JVM = STACK MACHINE. Push operands → execute → push result.
+  ILOAD/ALOAD = local var → stack.
+  ISTORE/ASTORE = stack → local var.
+  IADD, IMUL = pop 2, push result.
+
+INVOKE opcodes:
+  INVOKEVIRTUAL   → class.method (vtable, O(1))
+  INVOKEINTERFACE → interface.method (itable, slightly slower)
+  INVOKESPECIAL   → <init>, private, super (direct, no dispatch)
+  INVOKESTATIC    → static (direct, fastest)
+  INVOKEDYNAMIC   → lambdas, String concat (bootstrap → CallSite)
+
+JIT CALL SITE PROGRESSION:
+  1 type   → MONOMORPHIC → inlined → fastest
+  2 types  → BIMORPHIC   → 2 guards → still fast
+  3+ types → MEGAMORPHIC → table lookup → no inlining
+
+Adding a proxy/second impl → call site becomes bimorphic → deoptimize → slower.
+```
 
 ### Interview Trap: INVOKEVIRTUAL vs INVOKEINTERFACE Performance
 

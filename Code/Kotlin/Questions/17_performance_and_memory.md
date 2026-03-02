@@ -17,6 +17,39 @@
 > **Connects to:** [Q17.2 — RecyclerView](17_performance_and_memory.md#q172--recyclerview-internals) · [Q16.1 — Activity lifecycle](16_android_system_internals.md#q161--activity-and-fragment-lifecycle)
 > **Reference:** [Android Docs — Inspect your app's memory usage](https://developer.android.com/studio/profile/memory-profiler)
 
+### The Concrete Picture
+
+Starting state: Five common scenarios where a short-lived object gets anchored to a long-lived one.
+
+```
+LEAK PATTERN (general):
+  Long-lived holder ──holds ref──► Short-lived object that should be freed
+                                   │
+                                   GC cannot collect it (still reachable!)
+                                   Memory grows on every rotation/navigation
+
+LEAK 1 — Singleton holds Activity context:
+  NetworkManager (singleton, lives forever)
+    └── context: Context  ──► MainActivity (should die on rotation)
+  Fix: context.applicationContext (same lifetime as singleton)
+
+LEAK 2 — Inner class holds outer:
+  MyActivity  ──implicit ref──► inner class MyHandler
+                                    └── posted in MessageQueue for 10s
+  Handler fires after 10s → Activity never GC'd during that window
+
+LEAK 3 — postDelayed captures Activity:
+  handler.postDelayed({ startActivity(Intent(this, ...)) }, 2000)
+  Lambda captures `this` (Activity) → Activity lives for 2s after destruction
+
+LEAK 4 — GlobalScope captures Activity:
+  GlobalScope.launch { ...; updateUI() }  ← lambda captures `this`
+  GlobalScope.Job never cancelled → coroutine holds Activity ref indefinitely
+
+LEAK 5 — Listener registered but never unregistered:
+  registerReceiver() in onResume → must unregisterReceiver() in onPause
+```
+
 ### First Principles: What Is a Memory Leak?
 
 A memory leak occurs when an object that should be garbage collected is still **reachable** from a GC root (live reference). The GC cannot free it, so memory usage grows over time.
@@ -204,6 +237,23 @@ class MyFragment : Fragment() {
 }
 ```
 
+### Memory Trick
+
+```
+5 LEAKS — mnemonic "SHDGU":
+  S — Singleton with Activity context        (fix: applicationContext)
+  H — Handler inner class (non-static)       (fix: static + WeakReference)
+  D — Delayed Runnable captures `this`       (fix: removeCallbacks in onDestroy)
+  G — GlobalScope coroutine captures this    (fix: lifecycleScope)
+  U — Unregistered listener                  (fix: unregister in matching lifecycle)
+
+RULE: lifecycle of HOLDER must not outlive lifecycle of HELD OBJECT
+  Singleton > Application > Activity > Fragment > View
+  If holder is higher in this chain than held → leak risk
+
+LeakCanary detects these at runtime → install in debug builds only
+```
+
 ---
 
 ## Q17.2 — RecyclerView Internals
@@ -211,6 +261,38 @@ class MyFragment : Fragment() {
 > **Builds on:** [Q17.1 — Memory Leaks](17_performance_and_memory.md#q171--memory-leaks--top-5-causes) · [Q16.1 — Fragment Lifecycle](16_android_system_internals.md#q161--activity-and-fragment-lifecycle)
 > **Connects to:** [Q17.3 — The 16ms Budget](17_performance_and_memory.md#q173--the-16ms-budget)
 > **Reference:** [Android Docs — RecyclerView](https://developer.android.com/develop/ui/views/layout/recyclerview)
+
+### The Concrete Picture
+
+Starting state: A list of 1,000 user items. Screen shows 10 at a time. User scrolls down.
+
+```
+VISIBLE screen (10 items shown):
+  [Item 0] [Item 1] ... [Item 9]   ← currently on screen
+
+User scrolls down → Item 0 scrolls off top:
+
+  Step 1: RecyclerView tries Scrap cache
+          Item 0 still attached? NO → move to next cache level
+
+  Step 2: RecyclerView tries Cache (holds last 2 scrolled-off views)
+          Cache has Item 0: YES → retrieve with NO rebind (position matches!)
+          User scrolls back up → Item 0 is back instantly
+
+  Step 3 (if cache full, i.e. 3rd scroll-off): ViewCacheExtension (rarely used)
+
+  Step 4 (cache miss): RecycledViewPool
+          Pool has a ViewHolder of correct type → retrieve, call onBindViewHolder
+          (rebind required — position changed)
+
+  Step 5 (pool empty): onCreateViewHolder → inflate XML, create new ViewHolder
+          (most expensive, should be rare for normal scrolling)
+
+ANTI-PATTERN: RecyclerView wrap_content inside NestedScrollView
+  → RecyclerView measures ALL 1,000 items at once
+  → no recycling possible (all views stay inflated simultaneously)
+  Fix: ConcatAdapter with match_parent RecyclerView
+```
 
 ### The 4-Level Cache
 
@@ -315,6 +397,30 @@ DiffUtil uses Myers' diff algorithm to find the minimum set of edits (insertions
 3. **Set a fixed height** on RecyclerView (not `wrap_content`) — recycling works
 4. **Use Compose** with `LazyColumn` — handles this natively
 
+### Memory Trick
+
+```
+4-LEVEL CACHE (fastest → slowest):
+  1. Scrap       → still attached, exact position → NO rebind
+  2. Cache       → recently scrolled off (default 2) → NO rebind
+  3. Extension   → custom (rare)
+  4. Pool        → by view type (default 5 per type) → MUST rebind
+
+KEY: only levels 1 and 2 avoid onBindViewHolder!
+
+setHasFixedSize(true):
+  notifyDataSetChanged() → normally triggers requestLayout() up the full tree
+  setHasFixedSize(true) → skip parent re-measurement → only children re-laid out
+
+DiffUtil:
+  notifyDataSetChanged()  → O(N) rebinds, no animation, jarring
+  submitList(newList)     → Myers diff on background thread, animate only changes
+  DiffUtil limit: ~1,000 items; larger lists → consider paging
+
+NEVER: RecyclerView wrap_content inside NestedScrollView
+  = disables recycling = all N items inflated simultaneously = OOM risk
+```
+
 ---
 
 ## Q17.3 — The 16ms Budget
@@ -322,6 +428,37 @@ DiffUtil uses Myers' diff algorithm to find the minimum set of edits (insertions
 > **Builds on:** [Q17.2 — RecyclerView](17_performance_and_memory.md#q172--recyclerview-internals) · [Q16.5 — Handler/Looper (main thread)](16_android_system_internals.md#q165--handler-looper-and-messagequeue)
 > **Connects to:** [Q17.4 — Testing](17_performance_and_memory.md#q174--testing)
 > **Reference:** [Android Docs — Slow rendering](https://developer.android.com/topic/performance/vitals/render)
+
+### The Concrete Picture
+
+Starting state: A custom `TemperatureView` redraws every frame (animated thermometer).
+
+```
+FRAME TIMELINE (60 FPS = 16.67ms per frame):
+
+  t=0ms     Choreographer signals new frame (Vsync)
+               │
+               ├── MEASURE: how big is TemperatureView?
+               │     ViewGroup.measure() → recursive → O(depth) calls
+               │
+               ├── LAYOUT: where is TemperatureView positioned?
+               │     ViewGroup.layout() → final x/y/width/height
+               │
+               └── DRAW: paint TemperatureView onto Canvas
+                     View.onDraw(canvas) ← THIS is where the bug lives
+
+  t=16.67ms  Next Vsync — new frame expected
+
+  IF onDraw() creates Paint object:
+    Paint() allocation → GC pressure → GC pause → frame takes 20ms → DROP!
+
+CORRECT:
+  init { val paint = Paint() ... }   ← allocated once
+  onDraw { canvas.drawText(..., paint) }  ← reused every frame, 0 allocations
+
+requestLayout() → triggers all 3 phases (Measure + Layout + Draw)
+invalidate()    → triggers only Draw phase (cheapest)
+```
 
 ### First Principles: Why 16ms?
 
@@ -416,6 +553,27 @@ class BaselineProfileGenerator {
 }
 ```
 
+### Memory Trick
+
+```
+16ms = 1000ms / 60 FPS (90Hz → 11ms, 120Hz → 8ms)
+
+THREE PHASES: Measure → Layout → Draw
+  requestLayout() → triggers all 3 (expensive)
+  invalidate()    → triggers only Draw (cheaper)
+  Use invalidate() when only appearance changes (color, text, not size)
+
+ONDRAW RULE: NEVER allocate inside onDraw
+  BAD:  val paint = Paint()  ← inside onDraw = 60 allocs/second = GC pressure
+  GOOD: val paint = Paint()  ← in init block, reused every frame
+  Objects to pre-allocate: Paint, Path, RectF, Rect, Matrix, Bitmap
+
+BASELINE PROFILES:
+  Without: JIT compiles hot paths at runtime → first use is slow
+  With:    AOT compiles hot paths at install time → ~30% faster cold start
+  Tool: Macrobenchmark + BaselineProfileRule → generates baseline.prof in APK
+```
+
 ---
 
 ## Q17.4 — Testing
@@ -423,6 +581,42 @@ class BaselineProfileGenerator {
 > **Builds on:** [Q9.2 — Dispatchers (TestDispatcher)](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers) · [Q10.3 — Exception handling in tests](10_structured_concurrency.md#q103--exception-handling-rules)
 > **Connects to:** [Q13.1 — MVVM testability](13_android_architecture.md#q131--mvvm-and-unidirectional-data-flow)
 > **Reference:** [Kotlin Coroutines Testing Docs](https://kotlinlang.org/docs/coroutines-test.html)
+
+### The Concrete Picture
+
+Starting state: A ViewModel calls `repository.getUser()` (suspend fun) on `viewModelScope`. You need to test the loading → success state transition.
+
+```
+PROBLEM without test infrastructure:
+  viewModel.loadUser("123")
+  assertEquals(Success, viewModel.uiState.value)  ← FAILS: coroutine hasn't run yet!
+
+PROBLEM on JVM:
+  viewModelScope uses Dispatchers.Main → no Android main thread on JVM → deadlock
+
+SOLUTION — two tools working together:
+
+  Tool 1: MainDispatcherRule (replaces Dispatchers.Main with TestDispatcher)
+    @get:Rule val rule = MainDispatcherRule()
+    → Dispatchers.Main now points to StandardTestDispatcher (virtual clock, JVM-safe)
+
+  Tool 2: runTest + advanceUntilIdle
+    runTest {
+      viewModel.loadUser("123")    ← queues coroutine but does NOT run it yet
+      advanceUntilIdle()           ← drains ALL pending coroutines to completion
+      assertEquals(Success, ...)  ← now safe to assert
+    }
+
+StandardTestDispatcher: manual advancement (explicit advanceUntilIdle / advanceTimeBy)
+UnconfinedTestDispatcher: eager, coroutines run immediately without advancement
+  → use Unconfined when: you don't care about timing, want simplest test code
+
+Turbine for Flows:
+  flow.test {
+    awaitItem()      ← suspends until next emission arrives
+    awaitComplete()  ← asserts flow completed
+  }
+```
 
 ### `runTest` vs `runBlockingTest`
 
@@ -576,6 +770,35 @@ This is the only way to test:
 - `SavedStateHandle` restoration
 - Room state persistence
 - "Process death and restore" user scenario
+
+### Memory Trick
+
+```
+TEST DISPATCHER CHOICE:
+  StandardTestDispatcher (default in runTest):
+    coroutines queued → run only on advanceUntilIdle() / advanceTimeBy()
+    → use when: testing state BETWEEN coroutine steps, time-sensitive logic
+
+  UnconfinedTestDispatcher:
+    coroutines run eagerly → no advancement needed
+    → use when: just want coroutines to finish, don't care about timing
+
+TURBINE API:
+  flow.test {
+    awaitItem()                        ← assert next emitted value
+    awaitComplete()                    ← assert flow is done
+    cancelAndIgnoreRemainingEvents()   ← stop collecting, ignore rest
+    expectNoEvents()                   ← assert nothing emitted
+  }
+
+PROCESS DEATH test:
+  Home button    → process STAYS alive (Activity stopped, not killed)
+  adb shell am kill <package>  → REAL process death (SavedStateHandle survives)
+
+FAKE > MOCK for repositories:
+  Fake: stores data, tests sequences (save then get), reused across tests
+  Mock: good only for verifying side effects (analytics events)
+```
 
 ---
 

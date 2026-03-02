@@ -17,6 +17,38 @@
 > **Builds on:** [Q0.4 — Virtual dispatch](00_jvm_mental_model.md#q04--the-jvm-call-stack)
 > **Connects to:** [Q2.5.3 (open function in init is dangerous)](02_5_initialization_mechanics.md#q253--inheritance-initialization-order) · [Q3.2 (final enables devirtualization)](03_generics_and_variance.md#q32--variance)
 
+### The Concrete Picture
+
+Three modifiers. Three completely different relationships with inheritance:
+
+```
+final (default):    class Calculator { }
+                         │
+                         └── Nobody can extend this. Period.
+                             JIT knows exactly ONE implementation → can optimize.
+
+open:               open class Calculator { open fun add() { } }
+                         │
+                         ├── Subclass A can override add()
+                         └── Subclass B can override add()
+                             JIT must keep vtable lookup → can't inline.
+
+abstract:           abstract class Animal { abstract fun sound(): String }
+                         │
+                         └── Can't instantiate Animal directly.
+                             Subclass MUST implement sound().
+```
+
+Why Kotlin chose `final` as the default — show the Java disaster that motivated it:
+
+```
+Java (open by default):
+  AbstractList.addAll() internally calls add() for each item.
+  CountingList overrides add() to increment counter.
+  addAll(5 items) → counter jumps to 10, not 5.
+  The base class changed how it called its own methods → subclass broke.
+```
+
 ### Why Are Kotlin Classes `final` by Default?
 
 In Java, all classes are **open by default** — any class can be subclassed unless explicitly marked `final`. This caused a systemic problem: the **fragile base class problem**.
@@ -82,6 +114,21 @@ final class vtable:          open class vtable:
 
 **Why Kotlin's `final` default matters:** When a class is `final`, the JIT compiler knows there's only ONE possible implementation. It can devirtualize the call (see [Q0.4 — The JVM Call Stack](00_jvm_mental_model.md#q04--the-jvm-call-stack) for vtable details).
 
+### Memory Trick
+
+```
+final   → WALL. Nothing gets through. Default in Kotlin.
+open    → DOOR. You chose to open it. JIT pays the vtable cost.
+abstract → TEMPLATE. Door is open AND required. Can't instantiate.
+
+Performance direction:
+  final   → JIT can devirtualize → fastest
+  open    → vtable lookup on every call → slower
+  interface → INVOKEINTERFACE → slowest
+
+"Kotlin is final by default" = choosing performance AND safety by default.
+```
+
 ### `abstract` vs `open` — Architectural Choice
 
 | Modifier | Can Instantiate? | Must Override? | Use When |
@@ -114,6 +161,30 @@ open class Button {
 
 > **Builds on:** [Q0.1 — Primitives, hashing](00_jvm_mental_model.md#q01--primitives-vs-references)
 > **Connects to:** [Q3.2 (UnsafeVariance in covariant types)](03_generics_and_variance.md#q32--variance) · [Q7.1 (List covariance)](07_collections_and_sequences.md#q71--kotlins-collection-hierarchy)
+
+### The Concrete Picture
+
+Two parts of a data class. Only ONE part goes into equals/hashCode:
+
+```kotlin
+data class User(
+    val id: Int,       ← PRIMARY CONSTRUCTOR → included in equals/hashCode/copy
+    val name: String   ← PRIMARY CONSTRUCTOR → included in equals/hashCode/copy
+) {
+    var lastLogin: Long = 0  ← BODY PROPERTY → EXCLUDED from equals/hashCode/copy
+}
+```
+
+So:
+```kotlin
+val u1 = User(1, "Alice").also { it.lastLogin = 100 }
+val u2 = User(1, "Alice").also { it.lastLogin = 999 }
+
+u1 == u2   // TRUE  → lastLogin not compared
+u1.copy()  // copies id and name only, lastLogin resets to 0
+```
+
+This is by design but bites people when they assume all properties are compared.
 
 ### Which Properties Are Included in Generated Functions?
 
@@ -198,6 +269,23 @@ copy.settings    ──── [MutableList in heap]
 val deepCopy = original.copy(settings = original.settings.toMutableList())
 ```
 
+### Memory Trick
+
+```
+DATA CLASS = auto-generates: equals / hashCode / copy / componentN / toString
+But ONLY from PRIMARY CONSTRUCTOR properties. Body properties are invisible to these.
+
+TWO CLASSIC TRAPS:
+  1. var in data class + HashSet = CORRUPTION
+     Mutation changes hashCode → object "lost" in wrong bucket.
+     Rule: data class + hash collection = val only.
+
+  2. copy() is SHALLOW
+     copy.settings == original.settings (same object in memory)
+     Mutation through one affects the other.
+     Fix: copy(settings = original.settings.toMutableList())
+```
+
 ### `@UnsafeVariance` in `List.contains()`
 
 [`List<out E>`](07_collections_and_sequences.md#q71--kotlins-collection-hierarchy) is [covariant](03_generics_and_variance.md#q32--variance) — `E` only appears in "out" (producer) positions. But `contains(element: E)` takes `E` as a parameter (in position), which violates covariance.
@@ -219,6 +307,43 @@ It's "safe" here because `contains` only **reads** `element` to compare it — i
 
 > **Builds on:** [Q1.3 — Nothing, Unit](01_type_system_foundations.md#q13--nothing-unit-and-the-type-hierarchy) · [Q2.1 — Class Modifiers (final/open)](02_classes_and_objects.md#q21--class-modifiers)
 > **Connects to:** [Q1.3 (Nothing in sealed subtypes)](01_type_system_foundations.md#q13--nothing-unit-and-the-type-hierarchy) · [Q1.4 (when exhaustiveness)](01_type_system_foundations.md#q14--smart-casts)
+
+### The Concrete Picture
+
+A sealed class is a "known, closed set" of subtypes. Here's the key insight:
+
+```
+Enum:
+  Status.LOADING, Status.SUCCESS, Status.ERROR
+  All three carry the same fields (or none). Fixed structure.
+
+Sealed class:
+  Loading          → no data
+  Success<T>       → carries T data
+  Error            → carries message: String + retryable: Boolean
+  Each variant has its OWN shape.
+
+Sealed = "compiler knows ALL subtypes at compile time."
+when on sealed = "compiler checks ALL cases are handled."
+```
+
+Add a new subclass and not handle it in a `when` expression:
+
+```
+sealed class Result {
+    // You add:  data class Cancelled : Result()
+}
+
+fun handle(r: Result): String = when(r) {
+    is Success -> "..."
+    is Error   -> "..."
+    is Loading -> "..."
+    // COMPILE ERROR: 'when' expression must be exhaustive.
+    // Add an else or handle Cancelled.
+}
+```
+
+The compiler is your safety net. That's the whole point.
 
 ### What Bytecode Does `sealed class` Compile To?
 
@@ -295,6 +420,25 @@ sealed interface Draggable
 class Button : Clickable, Draggable  // implements both
 ```
 
+### Memory Trick
+
+```
+SEALED = "closed world assumption" for the compiler.
+  The compiler knows ALL subtypes → can enforce exhaustive when.
+
+sealed class  vs  enum:
+  enum:   fixed variants, same fields  → cheap but rigid
+  sealed: fixed variants, own fields   → flexible, full classes
+
+sealed class  vs  sealed interface:
+  sealed class   → single inheritance (Kotlin rule)
+  sealed interface → multi-inheritance allowed (Button : Clickable, Draggable)
+
+EXHAUSTIVENESS:
+  when used as EXPRESSION (assigned to val) → must be exhaustive
+  when used as STATEMENT (standalone)       → else optional (but dangerous)
+```
+
 ### Kotlin 1.5 Change: Sealed Subclass Location
 
 **Before Kotlin 1.5:** All subclasses of a sealed class must be in the **same file**.
@@ -318,6 +462,38 @@ data class Error(val msg: String) : Result<Nothing>()  // OK in Kotlin 1.5+
 
 > **Builds on:** [Q0.3 — JVM class loading](00_jvm_mental_model.md#q03--class-loading-and-the-static--block)
 > **Builds on:** [Q0.1 — reference capture](00_jvm_mental_model.md#q01--primitives-vs-references)
+
+### The Concrete Picture
+
+Three uses of the `object` keyword. Same syntax, different purposes:
+
+```kotlin
+object AppConfig { }         // 1. Top-level singleton (app-wide, one instance forever)
+
+class Foo {
+    companion object { }     // 2. "static" members attached to class Foo
+}
+
+val handler = object : ClickListener {   // 3. Anonymous object (one-time local implementation)
+    override fun onClick() { }
+}
+```
+
+How the singleton actually works in memory:
+
+```
+First access to DatabaseManager.URL:
+  JVM: Is DatabaseManager loaded? NO
+  JVM: Load class → run <clinit> → INSTANCE = new DatabaseManager()
+  JVM: Store INSTANCE in static field
+  ← All other threads WAITED during this. JVM held the class lock.
+
+Second access:
+  JVM: Is DatabaseManager loaded? YES
+  JVM: Return INSTANCE immediately (no lock needed)
+```
+
+You get thread safety for free. No double-checked locking. No `synchronized`. No `volatile`.
 
 ### How JVM Class Loading Guarantees Thread-Safe Singleton
 
@@ -409,6 +585,28 @@ Button (long-lived) → OnClickListener (anonymous object)
 
 **Fix:** Use a static/top-level reference, weak reference, or ensure proper cleanup in `onDestroy`.
 
+### Memory Trick
+
+```
+object = class + static INSTANCE field + <clinit> = free thread-safe singleton.
+
+THREE uses of object:
+  object Foo { }               → singleton (lives forever)
+  companion object { }         → "static" members attached to class
+  object : Interface { }       → anonymous one-time implementation
+
+ANONYMOUS OBJECT MEMORY LEAK pattern:
+  Activity creates anonymous object → anonymous object captures Activity reference
+  If anonymous object outlives Activity (e.g., stored in long-lived listener)
+  → Activity cannot be GC'd → LEAK
+
+Fix: use top-level/static reference or weak reference.
+
+@JvmStatic on companion object members → generates real static method for Java callers.
+Without @JvmStatic → Java must call: Foo.Companion.create()
+With    @JvmStatic → Java can call:   Foo.create()
+```
+
 ### `companion object` vs Java `static`
 
 ```kotlin
@@ -457,6 +655,31 @@ class Parser {
 
 > **Builds on:** [Q0.2 — JVM Type Mapping](00_jvm_mental_model.md#q02--jvm-type-mapping) · [Q3.1 — Type Erasure](03_generics_and_variance.md#q31--type-erasure)
 > **Connects to:** [Q3.1 (erased at runtime)](03_generics_and_variance.md#q31--type-erasure) · [Q0.2 (boxing scenarios)](00_jvm_mental_model.md#q02--jvm-type-mapping)
+
+### The Concrete Picture
+
+Value class is a compile-time wrapper that vanishes at runtime:
+
+```kotlin
+@JvmInline value class UserId(val id: String)
+@JvmInline value class OrderId(val id: String)
+```
+
+At compile time — fully distinct types:
+```
+fun getUser(id: UserId)  ← takes UserId, NOT String
+fun getOrder(id: OrderId) ← takes OrderId, NOT String
+
+getUser(OrderId("123"))  // COMPILE ERROR: type mismatch
+```
+
+At runtime — wrapper disappears:
+```
+JVM bytecode:   getUser-ABCD1234(String id)   // UserId → erased to String
+                getOrder-EFGH5678(String id)   // OrderId → erased to String
+```
+
+The hash suffix in the method name prevents collision since both erase to `String`.
 
 ### What "Erased at Runtime" Means
 
@@ -526,6 +749,26 @@ process(productId, userId)  // compiles! arguments are just Strings — no error
 
 fun process(userId: UserId, productId: ProductId) { }
 process(productId, userId)  // COMPILE ERROR: type mismatch — safety!
+```
+
+### Memory Trick
+
+```
+value class = TYPE-SAFE TYPEDEF that vanishes at runtime.
+
+typealias UserId = String   → NO safety (UserId IS String, interchangeable)
+value class UserId(val id: String) → SAFE (UserId ≠ OrderId at compile time)
+                                      but both are String at runtime
+
+WHEN value class boxes (becomes a real object):
+  1. UserId?          → nullable forces boxing
+  2. List<UserId>     → generics erase to Object, must box
+  3. Comparable<UserId> → interface needs object reference
+
+WHEN value class doesn't box:
+  fun doThing(id: UserId) { }   → JVM sees: doThing-HASH(String id)
+  val id: UserId = UserId("x")  → JVM sees: val id: String = "x"
+  Zero allocation, zero overhead.
 ```
 
 > **Key Takeaway:** Value classes give you the type safety of a wrapper class with zero runtime overhead (when not boxed). Typealias is just an alias — no type safety. Choose value class when you want to prevent mixing incompatible IDs, tokens, or domain primitives.

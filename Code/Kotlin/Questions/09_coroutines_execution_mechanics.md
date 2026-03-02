@@ -16,6 +16,34 @@
 > **Builds on:** [Q0.1 — Stack vs Heap (locals become heap fields)](00_jvm_mental_model.md#q01--primitives-vs-references) · [Q0.4 — JVM Call Stack](00_jvm_mental_model.md#q04--the-jvm-call-stack)
 > **Connects to:** [Q9.2 — Dispatchers](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers) · [Q10.1 — Job Hierarchy](10_structured_concurrency.md#q101--the-job-hierarchy) · [Q4.3 — suspend lambdas](04_functions_lambdas_inlining.md#q43--higher-order-functions-with-suspend)
 
+### The Concrete Picture
+
+You write two lines. The compiler writes a state machine with callbacks:
+
+```kotlin
+suspend fun loadData(): String {
+    val user = fetchUser()     // line 1: may pause here
+    val data = fetchData(user) // line 2: may pause here
+    return data
+}
+```
+
+What the JVM actually runs:
+```
+First call: label=0 → calls fetchUser → if suspended, returns COROUTINE_SUSPENDED
+  Thread is freed. Other work can run.
+
+fetchUser completes → resumes loadData at label=1
+  label=1 → calls fetchData → if suspended, returns COROUTINE_SUSPENDED
+  Thread freed again.
+
+fetchData completes → resumes loadData at label=2
+  label=2 → calls completion.resume(data)
+  Caller gets the result.
+```
+
+The state machine remembers WHERE to resume (label) and WHAT the local variables were (fields on the Continuation heap object).
+
 ### The Core Question: What Is Continuation Passing Style (CPS)?
 
 Continuation Passing Style is a transformation where instead of returning a value directly, a function receives an extra parameter — a **callback** — that it will call with the result when it is done. The "continuation" is "what to do next."
@@ -320,6 +348,30 @@ These are orthogonal concerns. A `suspend` function on `Dispatchers.Main` runs o
 
 ---
 
+### Memory Trick
+
+```
+SUSPEND = compiler transforms function into a STATE MACHINE.
+  Each suspension point → a label in a when() block.
+  label = "which line to resume at."
+
+LOCAL VARIABLES across suspension points:
+  Normal function: locals on stack (gone when method returns)
+  Suspend function: locals promoted to FIELDS on Continuation object (heap)
+  → They survive because the Continuation is a heap object that outlives the call.
+
+COROUTINE_SUSPENDED = "I'll call you back. Don't call me."
+  The function returns this sentinel to free the thread.
+  The thread does other work.
+  When async work completes: continuation.resumeWith(result) is called.
+  → State machine re-enters at the correct label.
+
+SUSPEND ≠ THREAD:
+  suspend = "this can pause" (compile-time concept)
+  Thread  = "this runs here" (runtime concept, determined by Dispatcher)
+  Same suspend function can run on Main, IO, or Default — depends on context.
+```
+
 ### Key Takeaways — 9.1
 
 | Concept | Fact |
@@ -336,6 +388,33 @@ These are orthogonal concerns. A `suspend` function on `Dispatchers.Main` runs o
 
 > **Builds on:** [Q9.1 — CPS and suspend](09_coroutines_execution_mechanics.md#q91--what-suspend-actually-does)
 > **Connects to:** [Q10.4 — Lifecycle Scopes](10_structured_concurrency.md#q104--lifecycle-scopes-and-process-death) · [Q13.3 — viewModelScope](13_android_architecture.md#q133--viewmodel-internals)
+
+### The Concrete Picture
+
+CoroutineContext = a typed map. Think of it as a bag with slots:
+
+```
+CoroutineContext bag:
+  [Job slot]         → Job (tracks lifecycle: active/cancelled/done)
+  [Dispatcher slot]  → Dispatchers.Main / IO / Default
+  [Name slot]        → CoroutineName("MyCoroutine")  (optional)
+  [Handler slot]     → CoroutineExceptionHandler      (optional)
+
+Only ONE element per slot. Right side wins when merging:
+  Dispatchers.IO + CoroutineName("X") + Dispatchers.Main
+  → Dispatcher slot = Main  (Main replaced IO)
+  → Name slot = "X"
+```
+
+Dispatchers.Default vs IO — they share ONE thread pool:
+```
+Same physical threads in the pool!
+  Default → max = CPU cores (e.g., 8 on 8-core machine)
+  IO      → max = 64 (expands for blocking work)
+
+Same pool means: switching Default→IO may not change the actual thread.
+Switching Main→IO ALWAYS changes the thread (Main is its own thread).
+```
 
 ### What Is a `CoroutineContext`?
 
@@ -517,6 +596,27 @@ This is useful when you have a resource that supports limited simultaneous acces
 
 ---
 
+### Memory Trick
+
+```
+CoroutineContext = TYPED MAP. Key per element. + merges, right side wins.
+
+FOUR DISPATCHER RULES:
+  Dispatchers.Main     → UI thread (Android handler queue)
+  Dispatchers.Default  → CPU work (max = core count)
+  Dispatchers.IO       → blocking I/O (max = 64, same pool as Default)
+  Dispatchers.Unconfined → runs wherever, rarely used
+
+Main vs Main.immediate:
+  Main          → always posts to Handler queue (even if already on Main)
+  Main.immediate → executes inline if already on Main (no queue round-trip)
+  viewModelScope uses Main.immediate for faster startup.
+
+limitedParallelism(N) → limits concurrent coroutines, NOT thread count.
+  .limitedParallelism(1) → serial execution through that view.
+  Threads still come from the shared IO pool.
+```
+
 ### Key Takeaways — 9.2
 
 | Concept | Fact |
@@ -534,6 +634,42 @@ This is useful when you have a resource that supports limited simultaneous acces
 
 > **Builds on:** [Q9.1 — suspend mechanics](09_coroutines_execution_mechanics.md#q91--what-suspend-actually-does) · [Q9.2 — CoroutineContext](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
 > **Connects to:** [Q10.2 — coroutineScope vs supervisorScope](10_structured_concurrency.md#q102--coroutinescope-vs-supervisorscope) · [Q10.3 — Exception handling](10_structured_concurrency.md#q103--exception-handling-rules)
+
+### The Concrete Picture
+
+launch vs async — two outcomes, one key difference:
+
+```
+launch {  } → returns Job  (fire and forget, no result)
+async  {  } → returns Deferred<T>  (result holder, call await() to get it)
+
+Deferred<T> extends Job. So it also has cancel(), join(), isActive.
+```
+
+Common misconception about async exception timing:
+```
+async exception propagation:
+
+coroutineScope {
+    val d = async { throw Exception("fail") }
+    // RIGHT NOW: exception propagates up to coroutineScope
+    // coroutineScope starts cancelling
+    delay(100)   // may never reach here
+    d.await()    // also throws here (but scope may already be dead)
+}
+
+NOT "contained until await()". That's the supervisorScope version.
+```
+
+try-catch around `launch` — why it doesn't work:
+```
+try {
+    launch { throw Exception() }  // schedules, returns immediately
+} catch (e: Exception) {
+    // NEVER fires — the exception is on a DIFFERENT call stack
+    // (inside the coroutine, not this code)
+}
+```
 
 ### Type Hierarchy: `Job` vs `Deferred<T>`
 
@@ -727,6 +863,27 @@ val result = a.await() + b.await() // now truly parallel
 
 ---
 
+### Memory Trick
+
+```
+launch = fire and forget (Job, no result)
+async  = get a result later (Deferred<T>, await() to retrieve)
+
+ASYNC EXCEPTION = propagates to parent IMMEDIATELY.
+  NOT "contained until await()". That's only in supervisorScope.
+  In coroutineScope: async failure cancels the whole scope NOW.
+
+TRY-CATCH AROUND LAUNCH = DOESN'T WORK.
+  launch returns immediately. Exception is on a different call stack.
+  Fix: put try-catch INSIDE the launch block.
+  Or use CoroutineExceptionHandler for root coroutines.
+
+LAZY ASYNC TRAP:
+  async(LAZY) { }  → NOT started until await() or start()
+  a.await() + b.await()  ← sequential if a and b are both LAZY
+  Fix: call a.start(); b.start() BEFORE any await().
+```
+
 ### Key Takeaways — 9.3
 
 | Concept | Fact |
@@ -742,6 +899,27 @@ val result = a.await() + b.await() // now truly parallel
 
 > **Builds on:** [Q9.3 — launch vs async](09_coroutines_execution_mechanics.md#q93--launch-vs-async) · [Q9.2 — Dispatchers](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
 > **Connects to:** [Q11.4 — Flow collection and lifecycle](11_flow.md#q114--flow-collection-and-lifecycle)
+
+### The Concrete Picture
+
+Four modes, one question each:
+
+```
+DEFAULT:       scheduled immediately. Cancel window before it starts running.
+               "Normal. Schedule now, run when dispatcher picks it up."
+
+LAZY:          nothing happens until you call start() or await().
+               "I'll tell you when to start."
+
+ATOMIC:        scheduled immediately. Cannot cancel before first suspension.
+               "Guaranteed to run at least to the first suspend point."
+               Use when: must acquire a resource before any cancellation.
+
+UNDISPATCHED:  runs RIGHT NOW on the CURRENT thread until first suspension.
+               Then switches to the dispatcher's thread after that.
+               "Start immediately here, then hand off after first pause."
+               Use when: must register listener BEFORE producer emits.
+```
 
 ### The Four Start Modes
 

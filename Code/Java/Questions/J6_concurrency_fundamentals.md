@@ -8,6 +8,37 @@ Java concurrency is one of the most tested and most misunderstood areas of the l
 
 > **Connects to:** [J6.2 — synchronized & Monitor Locks](J6_concurrency_fundamentals.md#j62--synchronized--monitor-locks) · [J6.3 — volatile & Java Memory Model](J6_concurrency_fundamentals.md#j63--volatile--java-memory-model)
 
+### The Concrete Picture
+
+Start: you call `thread.start()` on a freshly constructed thread:
+
+```
+new Thread(task)   ──► state = NEW  (Java object exists; no OS thread yet)
+thread.start()     ──► OS thread created; state = RUNNABLE
+
+RUNNABLE thread hits synchronized(lock) but lock is held:
+  state = RUNNABLE ──► BLOCKED
+  thread dump shows: "waiting to lock <0x...> held by Thread-0"
+
+BLOCKED thread acquires lock:
+  state = BLOCKED ──► RUNNABLE  (resumes execution)
+
+Thread calls obj.wait() inside synchronized block:
+  lock RELEASED atomically; state = RUNNABLE ──► WAITING
+  thread dump shows: "in Object.wait()"
+
+obj.notify() called by another thread:
+  WAITING ──► BLOCKED (re-competing for the lock) ──► RUNNABLE
+
+Thread calls Thread.sleep(5000):
+  state = RUNNABLE ──► TIMED_WAITING  (lock NOT released)
+  thread dump shows: "sleeping"
+
+run() returns or throws unchecked exception:
+  state ──► TERMINATED  (OS thread destroyed; Thread object still on heap)
+  thread.start() again ──► IllegalThreadStateException
+```
+
 ### WHY This Matters
 
 Understanding thread states is not academic — it is the primary tool for debugging live production issues. When a system freezes, hangs, or becomes unresponsive, you attach a profiler or run `jstack <pid>` to get a thread dump. That thread dump tells you the state of every thread in the JVM. If you can read those states, you can immediately distinguish a deadlock (threads permanently BLOCKED on each other's locks), a livelock (threads repeatedly transitioning between RUNNABLE states without making progress), starvation (a thread perpetually BLOCKED because higher-priority threads always win the lock), and a simple slow operation (a thread legitimately TIMED_WAITING on I/O or a sleep). Without this knowledge, a thread dump is noise. With it, it is a complete diagnostic map of your system's behavior at a point in time.
@@ -227,12 +258,54 @@ The single most common interview trap on this topic: **BLOCKED and WAITING are c
 
 A deadlocked thread is BLOCKED (stuck waiting for a lock that will never be released because the holder is also BLOCKED). A thread waiting on a `BlockingQueue.take()` is WAITING (deliberately suspended, will be woken when an item is added). These are not the same thing, and diagnosing them requires recognizing the difference in a thread dump.
 
+### Memory Trick
+
+```
+6 states: NEW → RUNNABLE → BLOCKED / WAITING / TIMED_WAITING → TERMINATED
+BLOCKED  = involuntary stop at synchronized door (no lock release)
+WAITING  = voluntary suspend via wait()/join()/park() (lock IS released)
+TIMED_WAITING = same as WAITING but with an automatic timeout
+sleep() → TIMED_WAITING, lock NOT released
+wait()  → WAITING, lock IS released
+TERMINATED: no restart — start() throws IllegalThreadStateException
+Daemon thread: JVM exits when all non-daemon threads finish, daemons killed
+jstack: "BLOCKED (on object monitor)" vs "in Object.wait()" = key distinction
+```
+
 ---
 
 ## J6.2 — synchronized & Monitor Locks
 
 > **Builds on:** [J6.1 — Thread Lifecycle](J6_concurrency_fundamentals.md#j61--thread-lifecycle)
 > **Connects to:** [J6.3 — volatile & Java Memory Model](J6_concurrency_fundamentals.md#j63--volatile--java-memory-model) · [J6.4 — wait/notify/notifyAll](J6_concurrency_fundamentals.md#j64--waitnotifynotifyall)
+
+### The Concrete Picture
+
+Two threads increment a shared counter without synchronization — what goes wrong:
+
+```
+int count = 0;  // shared field
+
+Thread1 reads count  ──► gets 5 (in register)
+Thread2 reads count  ──► gets 5 (in register)  ← both read SAME value
+Thread1 adds 1       ──► 6
+Thread2 adds 1       ──► 6
+Thread1 writes 6     ──► count = 6
+Thread2 writes 6     ──► count = 6  ← one increment LOST
+
+Add synchronized:
+  synchronized(this) {
+    count++;              ← MONITORENTER before; MONITOREXIT after
+  }                       ← implicit try-finally: lock released even on exception
+
+Thread1 acquires monitor ──► Thread2 hits MONITORENTER ──► state = BLOCKED
+Thread1 increments, releases ──► Thread2 unblocks, increments
+Result: count goes 5 → 6 → 7 (correct)
+
+Lock escalation path (Java 21+):
+  thin lock (CAS on mark word) ──► fat lock (OS mutex, threads parked)
+  fat lock stays fat for object's lifetime — no downgrade
+```
 
 ### WHY This Matters
 
@@ -494,12 +567,56 @@ Thread 1 calling `incrementWithA()` and Thread 2 calling `incrementWithB()` are 
 
 Similarly, `synchronized(this)` and `synchronized(myPrivateLock)` are different monitors. You cannot mix them. Decide on one lock per piece of state and use it consistently everywhere.
 
+### Memory Trick
+
+```
+Every object has a monitor encoded in its mark word (first 8 bytes of header)
+MONITORENTER = lock; MONITOREXIT = unlock (compiler adds implicit try-finally)
+synchronized(this) = instance lock; synchronized(Foo.class) = class lock
+Reentrant: same thread can re-enter; depth counter, released when hits 0
+Lock upgrade: thin (CAS) ──► fat (OS mutex) — one-way, fat stays fat (Java 21+)
+Biased locking REMOVED in Java 21 (revocation was too expensive)
+Memory visibility: unlock hb next lock (all writes visible to next acquirer)
+Trap: lockA + lockB on same field = ZERO mutual exclusion
+```
+
 ---
 
 ## J6.3 — volatile & Java Memory Model
 
 > **Builds on:** [J6.2 — synchronized & Monitor Locks](J6_concurrency_fundamentals.md#j62--synchronized--monitor-locks)
 > **Connects to:** [J6.4 — wait/notify/notifyAll](J6_concurrency_fundamentals.md#j64--waitnotifynotifyall)
+
+### The Concrete Picture
+
+Without `volatile`, Thread2 may never see Thread1's write:
+
+```
+Core0 (Thread1)                     Core1 (Thread2)
+  L1 cache:  running = false          L1 cache: running = false
+  JIT hoists loop check out of loop
+
+Thread1:  running = true              Thread2:  while (running) { ... }
+          └──► write to Core0 L1               └──► reads from Core1 L1 cache
+               NOT yet in main mem              └──► sees running = false FOREVER
+
+Add volatile:
+  volatile boolean running;
+
+Thread1:  running = true              Thread2:  while (running) { ... }
+          └──► StoreStore barrier               └──► LoadLoad barrier
+               flush to main memory             └──► forced read from main memory
+               invalidate other caches          └──► sees true ──► loop exits
+
+Double-checked locking — why volatile is MANDATORY:
+  new Singleton() compiles to 3 steps:
+    1. allocate memory  ──► get ref
+    2. initialize fields (call constructor)
+    3. assign ref to `instance`
+  CPU/JIT may reorder: steps 3 before 2
+  Thread2: reads instance != null ──► accesses UNINITIALIZED fields!
+  volatile instance: StoreStore barrier ──► step 2 always before step 3
+```
 
 ### WHY This Matters
 
@@ -765,12 +882,56 @@ Net effect: two increments happened, but count went from 5 to 6, not 5 to 7. One
 
 Second trap: **`volatile` makes `non-volatile` fields visible through the happens-before chain.** If you correctly use `volatile` as a publication flag (like the `ready` example above), you do NOT need to make every field `volatile`. The happens-before transitivity ensures that all writes before the `volatile` write become visible to threads that read the `volatile` variable. This is a performance feature: you don't need to declare every field of a published object `volatile` — just the reference/flag used to publish it.
 
+### Memory Trick
+
+```
+volatile = visibility (main memory) + ordering (memory barriers)
+volatile does NOT = atomicity for compound ops (i++ is still 3 steps)
+volatile write ──► StoreStore + StoreLoad barriers (nothing reordered past it)
+volatile read  ──► LoadLoad + LoadStore barriers (nothing reordered before it)
+Happens-before chain: volatile write hb volatile read (by transitivity)
+Publication idiom: write fields, THEN write volatile flag → reader sees all fields
+DCL pattern: volatile instance = MANDATORY (prevents seeing half-constructed object)
+volatile long/double: guarantees atomic 64-bit read/write (needed on 32-bit JVMs)
+```
+
 ---
 
 ## J6.4 — wait/notify/notifyAll
 
 > **Builds on:** [J6.2 — synchronized & Monitor Locks](J6_concurrency_fundamentals.md#j62--synchronized--monitor-locks) · [J6.3 — volatile & Java Memory Model](J6_concurrency_fundamentals.md#j63--volatile--java-memory-model)
 > **Connects to:** [J6.1 — Thread Lifecycle](J6_concurrency_fundamentals.md#j61--thread-lifecycle)
+
+### The Concrete Picture
+
+Producer-consumer with a bounded buffer of capacity 1:
+
+```
+Initial state: buffer empty, consumer waiting
+
+Consumer thread:
+  synchronized(lock) {
+    while (buffer.isEmpty()) {      ← check condition
+      lock.wait();                  ← ATOMICALLY: release lock + suspend (WAITING)
+    }                               ← woken up, re-checks while (not if!)
+    item = buffer.poll();
+    lock.notifyAll();               ← wake sleeping producers
+  }
+
+Producer thread:
+  synchronized(lock) {              ← acquires lock (consumer released it via wait())
+    buffer.add(item);               ← buffer now has 1 item
+    lock.notifyAll();               ← moves consumer from WAITING ──► BLOCKED
+  }                                 ← releases lock
+
+Consumer reacquires lock:
+  BLOCKED ──► RUNNABLE ──► while(!isEmpty) is false ──► poll() executes
+
+Why while (not if):
+  notifyAll() wakes ALL waiters → 2 consumers both wake → 1st takes item
+  2nd consumer: re-checks → buffer empty → wait() again (correct)
+  if statement: 2nd consumer skips check → buffer.poll() on empty → BUG
+```
 
 ### WHY This Matters
 
@@ -1038,6 +1199,18 @@ Two traps examiners use:
 **Trap 1: `if` instead of `while`.** Showing code with `if (!empty) obj.wait()` and asking "what's wrong?" The answer is spurious wakeups and the missed-notification race. The fix is `while (!empty) obj.wait()`. Always.
 
 **Trap 2: `notify()` without holding the lock.** Code that calls `obj.notify()` outside a `synchronized(obj)` block. This throws `IllegalMonitorStateException`. But more subtly, even if you try to "fix" it by removing the condition check (perhaps using a flag instead), you create a missed-notification race: the waiter checks the flag (false), the notifier sets the flag and calls `notify()`, the waiter calls `wait()` — and the notification has already been sent. The waiter waits forever. This is why the lock must be held for both the condition check AND the wait/notify. Holding the lock is what makes the check-then-act atomic.
+
+### Memory Trick
+
+```
+wait/notify/notifyAll: MUST be called while holding the monitor (else IllegalMonitorStateException)
+wait(): atomically releases lock + suspends (WAITING); returns when signalled + re-acquires lock
+ALWAYS use while loop: spurious wakeups + notifyAll wakes wrong-condition threads
+notify()    = wakes ONE (unspecified) thread; safe only if all waiters are fungible
+notifyAll() = wakes ALL; default choice; thundering herd but always correct
+sleep() ≠ wait(): sleep holds lock; wait releases lock
+missed signal: check flag THEN wait — must be inside same synchronized block
+```
 
 ---
 

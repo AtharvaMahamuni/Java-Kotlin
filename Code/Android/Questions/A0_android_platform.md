@@ -8,6 +8,32 @@ Before you can understand Activities, ViewModels, Coroutines, or any Android fra
 
 > **Connects to:** [A0.2 — Zygote & App Startup](A0_android_platform.md#a02--zygote--app-startup) · [A0.4 — Binder IPC](A0_android_platform.md#a04--binder-ipc)
 
+### The Concrete Picture
+
+Starting point: you call `context.getSystemService(Context.LOCATION_SERVICE)` in your Activity.
+
+```
+Your Activity (App process, UID 10023)
+    │ getSystemService("location")
+    ▼
+Java Framework Layer (android.location.LocationManager)
+    │ returns a LOCAL PROXY object
+    │ proxy.getLastKnownLocation() ──────────────────────────────►
+    │                                                           Binder IPC call
+    ▼                                                           (crosses process boundary)
+system_server (PID ~800, UID 1000)
+    │ LocationManagerService.getLastKnownLocation()
+    ▼
+Native GPS library (JNI call)
+    ▼
+HAL GPS interface (.so library from chip vendor)
+    ▼
+GPS hardware chip (Linux kernel driver)
+```
+
+Every Android API call traverses these layers bottom-to-top and back.
+The sandbox: your app cannot touch GPS hardware directly — it must go through Binder.
+
 ### WHY This Matters
 
 When you call `context.getSystemService(Context.LOCATION_SERVICE)`, where does that call actually go? When Android kills your app process under memory pressure, what mechanism decides which process dies first? When your code calls `startActivity(intent)`, how does the system find the right Activity across process boundaries? None of these questions are answerable without understanding how Android is layered.
@@ -116,12 +142,56 @@ App B (com.attacker.app):
 
 The only official cross-app communication mechanisms are: Intents (via AMS), Content Providers (via Binder), and AIDL services (via Binder). All of them go through the kernel's Binder driver.
 
+### Memory Trick
+
+```
+LAYERS (bottom to top): Linux → HAL → ART+Native → Framework → Apps
+"Laughing Hares Always Fight Angrily"
+
+SANDBOX = per-app Linux UID
+  App A (UID 10023) CANNOT read App B (UID 10087) — kernel enforces it.
+  Cross-app talk: Intents / ContentProvider / AIDL → all via Binder.
+
+SYSTEM_SERVER runs: AMS, WMS, PMS, NotificationManager, AlarmManager
+  All system services → started by system_server at boot.
+```
+
 ---
 
 ## A0.2 — Zygote & App Startup
 
 > **Builds on:** [A0.1 — Android System Stack](A0_android_platform.md#a01--the-android-system-stack)
 > **Connects to:** [A0.3 — ART](A0_android_platform.md#a03--art--dalvik--dex-compilation) · [A1.1 — Activity Lifecycle](A1_activity_fragment.md#a11--activity-lifecycle)
+
+### The Concrete Picture
+
+Starting point: device just booted. User taps your app icon.
+
+```
+Boot complete → Zygote (PID ~500) is already waiting
+  Zygote has pre-loaded: android.app.*, android.view.*, java.lang.* (~50MB)
+
+User taps icon
+    ──► Launcher.startActivity(intent)
+    ──► Binder IPC ──► ActivityManagerService (in system_server)
+    ──► AMS: "no process for com.myapp" ──► sends fork request to Zygote
+
+Zygote.fork()                       ← FAST: copy-on-write, no re-loading of framework classes
+    │
+    ▼
+New child process (com.myapp, UID 10023)
+    │  Inherits Zygote's pre-loaded classes (shared read-only pages)
+    │  Gets its own heap, stack, DEX-loaded app code
+    ▼
+ActivityThread.main()
+    ├── Looper.prepareMainLooper()   ← creates the main event loop
+    ├── thread.attach(...)           ← registers this process with AMS via Binder
+    └── Looper.loop()               ← blocks forever, dispatching Messages
+
+AMS sends "launch Activity" ──► Binder ──► Binder thread ──► Handler msg ──► Activity.onCreate()
+```
+
+Cold start time = fork + Application.onCreate() + Activity.onCreate() + first frame render.
 
 ### WHY This Matters
 
@@ -279,12 +349,55 @@ public static void main(String[] args) {
 
 Everything in your app — every touch event, every lifecycle callback, every layout pass — is a `Message` dispatched by this single `Looper.loop()`.
 
+### Memory Trick
+
+```
+COLD vs WARM vs HOT START:
+  Cold = fork + Application.onCreate + Activity.onCreate   (300ms–3s)
+  Warm = no fork, just Activity.onCreate                   (100ms–800ms)
+  Hot  = no fork, no onCreate, just onStart+onResume       (50ms–200ms)
+
+ZYGOTE trick: Copy-on-Write means all apps share the same physical
+  pages for android.app.* bytecode. You get ~50MB free per app.
+
+ENTRY POINT: ActivityThread.main()
+  1. prepareMainLooper  2. attach (registers with AMS)  3. Looper.loop()
+```
+
 ---
 
 ## A0.3 — ART, Dalvik & DEX Compilation
 
 > **Builds on:** [A0.2 — Zygote & App Startup](A0_android_platform.md#a02--zygote--app-startup)
 > **Connects to:** [J0.4 — JVM Bytecode](../../Java/Questions/J0_jvm_mental_model.md#j04--java-bytecode-basics)
+
+### The Concrete Picture
+
+Starting point: you run `./gradlew assembleRelease`. Follow the code:
+
+```
+YourActivity.kt  (Kotlin source)
+    │ kotlinc
+    ▼
+YourActivity.class  (JVM .class bytecode — stack-based, one file per class)
+    │ D8/R8 compiler (part of Android Gradle Plugin)
+    ▼
+classes.dex  (Dalvik Executable — register-based, ONE shared constant pool)
+    │ zipped with resources → APK
+    ▼
+Install on device (Android 7+):
+  Step 1: dex2oat VERIFIES bytecode → writes .vdex (fast)
+  Step 2: First few runs → ART INTERPRETS dex, JIT compiles hot methods
+  Step 3: JIT records profile → primary.prof saved to disk
+  Step 4: Device idle + charging → dex2oat AOT-compiles hot methods → .odex
+  Step 5: Next launch → hot path runs as pre-compiled native code (fast)
+
+R8 sits at the D8/R8 step:
+  Shrink (remove unused methods) → Optimize (inline) → Obfuscate (rename)
+```
+
+This is why a freshly-installed app feels slower than one you use daily —
+the profile-guided AOT hasn't run yet.
 
 ### WHY This Matters
 
@@ -395,12 +508,62 @@ This is why an app that you use regularly feels faster than one you just install
 
 R8 operates on DEX level (not Java bytecode level), which gives it visibility into the entire app including libraries.
 
+### Memory Trick
+
+```
+PIPELINE: .kt → .class → .dex → .odex/.oat
+  "Kotlin Classes Dare Outperform"
+
+DEX vs CLASS:
+  DEX = register-based (like real CPU), 1 shared constant pool, ~50% smaller
+  CLASS = stack-based, per-class constant pool (verbose)
+
+65,535 METHOD LIMIT: DEX method table = 16-bit index → max 65535 refs
+  Fix: multidex (classes.dex + classes2.dex) OR R8 shrinking
+
+ANDROID 7+ HYBRID MODEL: Install fast → JIT warms up → AOT at idle
+  Profile = /data/misc/profiles/cur/0/<pkg>/primary.prof
+  App gets faster over time as AOT covers more hot paths
+```
+
 ---
 
 ## A0.4 — Binder IPC
 
 > **Builds on:** [A0.1 — Android System Stack](A0_android_platform.md#a01--the-android-system-stack)
 > **Connects to:** [A1.1 — Activity Lifecycle](A1_activity_fragment.md#a11--activity-lifecycle) · [A2.1 — Handler & Looper](A2_main_thread_and_views.md#a21--looper-messagequeue--handler)
+
+### The Concrete Picture
+
+Starting point: your app calls `startActivity(intent)`. Watch what actually happens:
+
+```
+Your app process (UID 10023)                system_server (UID 1000)
+────────────────────────────                ──────────────────────────────
+ActivityManager proxy object
+proxy.startActivity(intent)
+    │
+    │ Parcel.writeToParcel(intent)  ←─── intent must be Parcelable!
+    │ ioctl(/dev/binder, BC_TRANSACTION, data=parcel)
+    │                               ──────────────────────────────►
+    │                               Binder kernel driver copies parcel
+    │                               (1 copy: sender addr → receiver addr)
+    │                                        ──────────────────────►
+    │ [main thread BLOCKS here]            ActivityManagerService.startActivity()
+    │                                      checks permissions, resolves Activity
+    │                               ◄──────────────────────────────
+    │                               BC_REPLY with result
+    ▼
+[main thread unblocks, receives result]
+
+Now AMS needs to call onResume() on YOUR Activity:
+  AMS ──► Binder ──► your app's Binder thread pool
+  ──► ApplicationThread.scheduleResumeActivity()  (runs on Binder thread)
+  ──► Handler.sendMessage(H.RESUME_ACTIVITY)       (posts to main Looper)
+  ──► Activity.onResume()                          (runs on main thread)
+```
+
+Every lifecycle callback follows this exact path: AMS → Binder → Binder thread → Handler → main thread.
 
 ### WHY This Matters
 
@@ -554,6 +717,24 @@ At runtime (your code):
 Binder transactions crossing process boundaries are NOT free. A typical Binder call takes 10-100 microseconds of overhead (kernel entry/exit, data copy, thread wakeup). Calling Binder-backed APIs in a tight loop on the main thread can cause jank.
 
 The most important rule: **never call Binder APIs that could block on the main thread.** The system is especially careful about calls that wait for `system_server` to respond, because `system_server` can be slow under memory pressure. This is why `PackageManager.getInstalledPackages()` (a Binder call) is off-limits on the main thread in strict mode — it can take hundreds of milliseconds.
+
+### Memory Trick
+
+```
+BINDER = kernel driver (/dev/binder), SINGLE-COPY data transfer
+  Data: serialized into Parcel → kernel copies to receiver → deserialized
+  Why Parcelable: Intent/extras must survive this Parcel round-trip
+
+LIFECYCLE PATH (always):
+  AMS ──► Binder ──► ApplicationThread (Binder thread) ──► Handler ──► main thread
+
+AIDL generates: Stub (server side) + Stub.Proxy (client side)
+THREAD POOL: up to 16 Binder threads per process (incoming calls)
+SERVICEMANAGER: Binder registry — like DNS for Binder objects (handle 0)
+
+TRAP: Binder calls = 10–100μs. PackageManager.getInstalledPackages()
+  on main thread → hundreds of ms → ANR. StrictMode catches this.
+```
 
 ---
 

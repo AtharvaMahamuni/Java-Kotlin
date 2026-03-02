@@ -18,6 +18,36 @@
 > **Builds on:** [Q9.3 — launch vs async (Job vs Deferred)](09_coroutines_execution_mechanics.md#q93--launch-vs-async) · [Q9.2 — CoroutineContext](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
 > **Connects to:** [Q10.2 — coroutineScope](10_structured_concurrency.md#q102--coroutinescope-vs-supervisorscope) · [Q10.3 — Exception propagation](10_structured_concurrency.md#q103--exception-handling-rules) · [Q13.3 — viewModelScope](13_android_architecture.md#q133--viewmodel-internals)
 
+### The Concrete Picture
+
+Start with any scope. Every `launch` / `async` becomes a child Job:
+
+```
+viewModelScope (SupervisorJob)
+  ├── Job A  ← launch { fetchProfile() }
+  ├── Job B  ← launch { fetchAds() }        ← crashes!
+  └── Job C  ← launch { fetchWeather() }
+```
+
+Two things happen in opposite directions:
+
+```
+CANCELLATION flows DOWN:
+  Parent cancelled → Job A cancelled → Job C cancelled (all children die)
+
+EXCEPTIONS flow UP (with regular Job):
+  Job B throws RuntimeException
+    → parent cancelled
+    → Job A cancelled (sibling killed!)
+    → Job C cancelled (sibling killed!)
+
+EXCEPTIONS stopped by SupervisorJob:
+  Job B throws RuntimeException
+    → SupervisorJob absorbs it (childCancelled returns false)
+    → Job A continues
+    → Job C continues
+```
+
 ### The Tree Structure of Coroutine Jobs
 
 Every coroutine has a `Job` object. When a coroutine is launched inside a scope, it becomes a **child** of the scope's Job. This forms a tree:
@@ -191,6 +221,22 @@ Child throws RuntimeException (or any non-CancellationException):
 
 ---
 
+### Memory Trick
+
+```
+CANCELLATION = DOWN the tree.   Cancel parent → all children die.
+EXCEPTIONS   = UP the tree.     Child fails → parent fails → siblings cancelled.
+SupervisorJob = FIREWALL.       Child fails → absorbed → siblings continue.
+
+3 INVARIANTS:
+  1. Parent WAITS for all children (never loses a coroutine)
+  2. Cancel parent → CANCEL all children (downward)
+  3. Child exception → CANCEL siblings (upward) — UNLESS SupervisorJob
+
+CancellationException = NOT a failure. Normal lifecycle event.
+  parent.childCancelled(CE) → "child ended normally" → siblings unaffected.
+```
+
 ### Key Takeaways — 10.1
 
 | Concept | Fact |
@@ -208,6 +254,38 @@ Child throws RuntimeException (or any non-CancellationException):
 
 > **Builds on:** [Q10.1 — Job Hierarchy](10_structured_concurrency.md#q101--the-job-hierarchy) · [Q9.3 — async exception propagation](09_coroutines_execution_mechanics.md#q93--launch-vs-async)
 > **Connects to:** [Q10.3 — Exception Handling Rules](10_structured_concurrency.md#q103--exception-handling-rules)
+
+### The Concrete Picture
+
+Two siblings. One crashes. What happens?
+
+```kotlin
+// coroutineScope — ALL OR NOTHING:
+coroutineScope {
+  val a = async { downloadFile() }     // ok
+  val b = async { loadConfig() }       // throws!
+
+  // b throws → coroutineScope cancels a → coroutineScope throws
+  a.await() + b.await()  // both gone
+}
+
+// supervisorScope — EACH STANDS ALONE:
+supervisorScope {
+  val news    = async { fetchNews() }     // ok
+  val weather = async { fetchWeather() }  // throws!
+  val ads     = async { fetchAds() }      // ok
+
+  // weather throws → only weather fails
+  // news and ads continue normally
+}
+```
+
+The ONE code difference between them:
+```kotlin
+// supervisorScope creates SupervisorCoroutine which overrides:
+override fun childCancelled(cause: Throwable): Boolean = false
+// ↑ That single line is the ENTIRE difference
+```
 
 ### The One Source-Code-Level Difference
 
@@ -378,6 +456,22 @@ The `SupervisorJob` root is what makes Android scopes resilient.
 
 ---
 
+### Memory Trick
+
+```
+coroutineScope    = ALL OR NOTHING.  One child fails → everything fails.
+                    Use when all parts MUST succeed (download + parse).
+
+supervisorScope   = EACH STANDS ALONE.  Child fails → only that child fails.
+                    Use when operations are INDEPENDENT (news, weather, ads).
+
+viewModelScope    = SupervisorJob at root.
+                    fetchAds() fails → fetchProfile() still runs. Safe.
+
+supervisorScope STILL throws when: scope BODY fails (not a child).
+supervisorScope does NOT throw when: child coroutines fail.
+```
+
 ### Key Takeaways — 10.2
 
 | Concept | Fact |
@@ -394,6 +488,39 @@ The `SupervisorJob` root is what makes Android scopes resilient.
 
 > **Builds on:** [Q10.1 — Job Hierarchy](10_structured_concurrency.md#q101--the-job-hierarchy) · [Q10.2 — supervisorScope](10_structured_concurrency.md#q102--coroutinescope-vs-supervisorscope)
 > **Connects to:** [Q4.3 — CancellationException in suspend lambdas](04_functions_lambdas_inlining.md#q43--higher-order-functions-with-suspend) · [Q11.4 — Flow lifecycle](11_flow.md#q114--flow-collection-and-lifecycle)
+
+### The Concrete Picture
+
+Three rules to know cold:
+
+**Rule 1: try-catch AROUND launch doesn't work — different call stacks:**
+```
+Thread A:  try { launch { ... } } catch (e) { }
+                   │
+                   └─ launch() returns Job immediately — NO exception here
+                      catch block: NEVER fires
+
+Thread B (later):  coroutine runs → throws → goes through childCancelled chain
+                   NOT your try-catch
+```
+
+**Rule 2: CoroutineExceptionHandler = last resort, root only:**
+```
+Nested coroutine throws
+  → propagates to parent (childCancelled)
+  → parent propagates to grandparent
+  → ... all the way up
+  → ROOT has no parent → now CEH fires
+
+Nested launch(handler) { throw }  ← handler IGNORED (not root)
+```
+
+**Rule 3: CancellationException MUST be rethrown:**
+```kotlin
+catch (e: Exception) { /* swallowed CE! coroutine keeps running */ }
+// CancellationException extends IllegalStateException extends Exception
+// catch(Exception) CATCHES IT — coroutine is now unkillable
+```
 
 ### Why `CoroutineExceptionHandler` Only Works on Root Coroutines with `launch`
 
@@ -697,6 +824,26 @@ Thread B (coroutine dispatcher thread):  [later]
 
 ---
 
+### Memory Trick
+
+```
+CEH (CoroutineExceptionHandler) = LAST RESORT. Root coroutines only.
+  Nested launch(handler) { } → handler IGNORED. Exception propagates to parent first.
+
+CancellationException = ALWAYS RETHROW.
+  catch (e: Exception) { } swallows it → coroutine becomes unkillable (LEAK).
+  catch (e: CancellationException) { throw e } ← correct pattern.
+  Or: catch only specific types (IOException) → CE propagates naturally.
+
+try-catch INSIDE launch  → works (same call stack as the throw).
+try-catch AROUND launch  → NEVER works (launch returns Job, not the exception).
+
+TIGHT CPU LOOP needs cooperative yield:
+  isActive   → check flag (no suspend)
+  yield()    → suspend + yield thread
+  ensureActive() → throw CE if cancelled (no suspend)
+```
+
 ### Key Takeaways — 10.3
 
 | Concept | Fact |
@@ -714,6 +861,35 @@ Thread B (coroutine dispatcher thread):  [later]
 
 > **Builds on:** [Q10.1 — Job Hierarchy](10_structured_concurrency.md#q101--the-job-hierarchy) · [Q13.3 — ViewModel internals](13_android_architecture.md#q133--viewmodel-internals)
 > **Connects to:** [Q11.4 — Flow collection with lifecycle](11_flow.md#q114--flow-collection-and-lifecycle) · [Q16.1 — Activity lifecycle](16_android_system_internals.md#q161--activity-and-fragment-lifecycle)
+
+### The Concrete Picture
+
+Three survival scenarios to know:
+
+```
+ROTATION (config change):
+  Activity destroyed
+    → ViewModelStore retained in NonConfigurationInstances (memory)
+    → Activity recreated
+    → same ViewModel object (coroutines keep running)
+
+PROCESS DEATH (OS kills app):
+  Process killed → ALL memory gone
+    → App relaunched → new Activity → new ViewModelStore → new ViewModel
+    → SavedStateHandle restores Bundle-sized data only
+
+BACKGROUND (app minimized):
+  lifecycleScope.launch { collect { } }   → KEEPS RUNNING in background (wasteful!)
+  repeatOnLifecycle(STARTED) { collect }  → PAUSES when stopped, RESUMES when started
+```
+
+`repeatOnLifecycle` lifecycle:
+```
+CREATED → STARTED → RESUMED → PAUSED → STOPPED → STARTED → ...
+              │                            │           │
+         block starts                block cancelled  block restarts
+         collecting                  not collecting   collecting
+```
 
 ### What `viewModelScope` Uses Internally
 
@@ -916,6 +1092,25 @@ class SearchViewModel @Inject constructor(
 
 ---
 
+### Memory Trick
+
+```
+viewModelScope = SupervisorJob() + Dispatchers.Main.immediate
+  SupervisorJob  → independent coroutines (one fails → others run)
+  Main.immediate → if already on Main, runs inline (no Handler post)
+
+ROTATION → ViewModel SURVIVES (in-memory NonConfigurationInstances).
+PROCESS DEATH → ViewModel DIES (everything in memory is gone).
+  SavedStateHandle → Bundle-backed → Parcelable/Serializable only → ~1MB limit.
+
+lifecycleScope.launch { collect }         → ALWAYS running (even background). WRONG.
+lifecycleScope.launch {
+  repeatOnLifecycle(STARTED) { collect }  → ON when visible, OFF when not. CORRECT.
+}
+
+For Fragments: use viewLifecycleOwner.repeatOnLifecycle (NOT this.repeatOnLifecycle).
+```
+
 ### Key Takeaways — 10.4
 
 | Concept | Fact |
@@ -933,6 +1128,28 @@ class SearchViewModel @Inject constructor(
 
 > **Builds on:** [Q10.1 — Job Hierarchy](10_structured_concurrency.md#q101--the-job-hierarchy) · [Q9.3 — Deferred](09_coroutines_execution_mechanics.md#q93--launch-vs-async)
 > **Connects to:** [Q11.2 — Flow operators](11_flow.md#q112--flow-operators)
+
+### The Concrete Picture
+
+Race between two async operations — first to finish wins:
+
+```kotlin
+val result = select<String> {
+  async { fetchFromCache() }.onAwait { "cache: $it" }   // ← if cache wins
+  async { fetchFromNetwork() }.onAwait { "net: $it" }   // ← if network wins
+}
+// result = whichever completes first
+
+// BOTH async blocks are still running after select picks a winner!
+// You must cancel the loser yourself.
+```
+
+Tie-breaking rule:
+```
+Both complete simultaneously?
+  → FIRST clause in declaration order wins (deterministic, not random)
+  → put preferred source first (e.g., cache before network)
+```
 
 ### What `select { }` Does — Racing Multiple Async Operations
 
@@ -1135,6 +1352,26 @@ suspend fun getDataWithCacheFallback(): Data = coroutineScope {
 
 ---
 
+### Memory Trick
+
+```
+select = FIRST TO FINISH WINS. Runs handler of the winner clause.
+
+CLAUSES:
+  deferred.onAwait { }   → when Deferred completes
+  channel.onReceive { }  → when element available
+  onTimeout(ms) { }      → when timer fires
+
+BIAS: if multiple clauses ready simultaneously → FIRST one declared wins.
+  Put preferred source first (cache before network).
+
+LOSERS NOT CANCELLED automatically.
+  select does not own the coroutines → must cancel losers manually in handler.
+  Forgetting this = resource leak (loser keeps running).
+
+vs anyOf(): select is type-safe (select<T>), suspending, coroutine-native.
+```
+
 ### Key Takeaways — 10.5
 
 | Concept | Fact |
@@ -1151,6 +1388,32 @@ suspend fun getDataWithCacheFallback(): Data = coroutineScope {
 
 > **Builds on:** [Q10.1 — Job Hierarchy](10_structured_concurrency.md#q101--the-job-hierarchy) · [Q9.2 — Dispatchers](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
 > **Connects to:** [Q15.2 — Token Refresh Pattern](15_networking.md#q152--token-refresh-pattern) · [Q17.3 — Shared Mutable State](17_performance_and_memory.md#q173--shared-mutable-state)
+
+### The Concrete Picture
+
+The race condition: 1000 coroutines, each does `counter++`:
+
+```
+counter++ = 3 steps: READ → ADD 1 → WRITE
+
+Coroutine A: READ(42) → ADD(43) →             WRITE(43)
+Coroutine B: READ(42) →           ADD(43) →   WRITE(43)
+                                               ↑ result: 43 not 44! One increment lost.
+```
+
+Mutex fix — only one coroutine in the critical section at a time:
+```
+Coroutine A: acquire lock → READ(42) → ADD(43) → WRITE(43) → release lock
+Coroutine B:                [suspended — waiting]   acquire lock → READ(43) → WRITE(44) → release
+                                                    ↑ correct: 44
+```
+
+Key difference: Mutex **suspends** (frees the thread). `synchronized` **blocks** (holds the thread).
+
+```
+synchronized { counter++ }  → thread BLOCKED. Thread can't serve other coroutines.
+mutex.withLock { counter++ } → coroutine SUSPENDED. Thread free to run other coroutines.
+```
 
 ### The Problem: Shared Mutable State in Coroutines
 
@@ -1345,6 +1608,30 @@ Request 2: ─ acquire permit(2) ────── release(2)
 Request 3: ─ acquire permit(3) ─────────────────────── release(3)
 Request 4:                [suspended]     acquire(after 2 releases) ──── release
 Request 5:                         [suspended]           acquire ──── release
+```
+
+### Memory Trick
+
+```
+@Volatile        → VISIBILITY only. flag = true seen by all threads.
+                   NOT atomic. flag++ is still a race condition.
+
+AtomicInteger    → SINGLE VARIABLE atomicity. counter.incrementAndGet().
+                   Compound ops across two Atomics: NOT atomic together.
+
+Mutex.withLock   → ANY code block atomic. Multiple variables. Compound ops.
+                   Waiting coroutines SUSPEND (thread freed). NOT blocking.
+
+synchronized     → Thread-blocking equivalent of Mutex. Use in non-coroutine code only.
+
+DEADLOCK rule: always acquire multiple locks in SAME fixed order.
+  Always lock A before B. Never B before A.
+
+SEMAPHORE = Mutex but allows N concurrent coroutines (not just 1).
+  Semaphore(3) → at most 3 network calls at once → rate limiting.
+
+ALWAYS: mutex.withLock { } NOT mutex.lock() / mutex.unlock().
+  withLock uses finally → lock ALWAYS released even on exception.
 ```
 
 > **Key Takeaway:** `Mutex.withLock` is the right tool when multiple coroutines share mutable state and a single `Atomic` isn't enough. The crucial advantage over `synchronized`: waiting coroutines **suspend** (freeing the thread) rather than blocking. Always use `withLock` (never manual lock/unlock) to avoid deadlocks on exceptions.

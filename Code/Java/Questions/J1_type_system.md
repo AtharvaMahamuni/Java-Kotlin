@@ -9,6 +9,27 @@ This phase covers the mechanics of Java's type system: the eight primitive types
 > **Builds on:** [J0.1 — Primitives vs References in Java](J0_jvm_mental_model.md#j01--primitives-vs-references-in-java)
 > **Connects to:** [J1.2 — Type Casting & instanceof](J1_type_system.md#j12--type-casting--instanceof)
 
+### The Concrete Picture
+
+Starting reality: Java has 8 types that live outside the object hierarchy.
+
+```
+int x = 5;        // stack slot, 4 bytes, direct value
+Integer obj = 5;  // heap pointer → Integer object (header + int field)
+
+Widening chain (implicit, left to right):
+  byte(8b) → short(16b) → int(32b) → long(64b) → float(32b) → double(64b)
+                                char(16b) ──►  int
+
+Narrowing (requires cast, may truncate):
+  int 300 = 0x0000_0001_0010_1100
+  (byte)300 ──► keeps only low 8 bits ──► 0010_1100 = 44
+
+JVM operand stack: boolean/byte/char/short ALL become int slots
+  byte a = 10; byte b = 20;
+  ILOAD a ──► (int)10   ILOAD b ──► (int)20   IADD ──► 30   I2B ──► (byte)30
+```
+
 ### WHY Primitives Exist
 
 Java is an object-oriented language, but it is not a purely object-oriented language. Unlike Smalltalk or Kotlin (with its value classes), Java has eight types that are not objects and do not inherit from `Object`. They exist entirely for performance.
@@ -186,12 +207,50 @@ char c4 = 'A' + 1;         // OK! 'A' + 1 is a COMPILE-TIME CONSTANT (both are l
 
 The key distinction: if the entire expression is a compile-time constant and the value fits in the target type, no cast is needed. If any operand is a variable, promotion to `int` occurs and an explicit cast is required.
 
+### Memory Trick
+
+```
+WIDENING   = byte → short → int → long → float → double (char → int branch)
+           = NO CAST needed, always safe (precision may slip: int→float)
+NARROWING  = MUST CAST, high bits discarded: (byte)300 = 44, (byte)200 = -56
+OVERFLOW   = silent wraparound: MAX_VALUE + 1 = MIN_VALUE (two's complement)
+IEEE 754   = 0.1 + 0.2 != 0.3   |   NaN != NaN (only value not equal to itself)
+JVM STACK  = boolean/byte/char/short → all stored as int on operand stack
+char TRAP  = char c='A'; char c2 = c+1; // ERROR: result is int, not char
+```
+
 ---
 
 ## J1.2 — Type Casting & instanceof
 
 > **Builds on:** [J1.1 — Java's 8 Primitive Types](J1_type_system.md#j11--javas-8-primitive-types)
 > **Connects to:** [J1.3 — Null in Java](J1_type_system.md#j13--null-in-java)
+
+### The Concrete Picture
+
+Starting hierarchy: Dog extends Animal extends Object.
+
+```
+Dog dog = new Dog();              // heap: [Dog object @ 0x1000]
+
+Upcast (implicit, always safe):
+  dog ──► Animal animal = dog;   // same pointer, narrower declared type
+  dog ──► Object  obj   = dog;   // same pointer, even narrower view
+
+Downcast (explicit, runtime check):
+  Object obj = Integer.valueOf(42);   // declared: Object, actual: Integer
+  String s = (String) obj;           // compiles → CHECKCAST String
+                                     // runtime: Integer != String → ClassCastException
+
+CHECKCAST bytecode flow:
+  ALOAD obj ──► peek stack ──► actual type Integer?
+                ──► target type String?
+                ──► mismatch ──► throw ClassCastException
+
+instanceof (never throws, returns boolean):
+  obj instanceof String  ──► false (Integer, not String)
+  null instanceof String ──► always false, never NPE
+```
 
 ### WHY Casting Exists
 
@@ -354,12 +413,46 @@ The key rule: the compiler rejects a cast only when it can prove the cast is ALW
 
 The practical implication: when working with generics and type erasure, CHECKCAST instructions can appear unexpectedly in generated code, causing `ClassCastException` in places that look perfectly safe in the source code (this is called a "heap pollution" scenario).
 
+### Memory Trick
+
+```
+UPCAST   = implicit, Dog → Animal, always safe, no bytecode instruction
+DOWNCAST = explicit (String)obj, CHECKCAST at runtime, ClassCastException if wrong
+INSTANCEOF = INSTANCEOF bytecode, returns bool, null → false, never throws
+PATTERN  = if (obj instanceof String s) { s.length(); }  // Java 16+
+COMPILER = rejects IMPOSSIBLE casts (String → Integer) but allows obj → String
+NULL CAST= (String) null → OK (CHECKCAST passes for null)
+```
+
 ---
 
 ## J1.3 — Null in Java
 
 > **Builds on:** [J1.2 — Type Casting & instanceof](J1_type_system.md#j12--type-casting--instanceof)
 > **Connects to:** [J1.4 — Array Covariance Trap](J1_type_system.md#j14--array-covariance-trap)
+
+### The Concrete Picture
+
+Starting state: every reference type variable can hold the null reference (address 0x0).
+
+```
+String s  = null;   // s points to address 0x0000...
+Integer i = null;   // also address 0x0000...
+
+NPE sources (what happens when you dereference 0x0):
+  s.length()          ──► OS: segfault on addr 0 ──► JVM: NullPointerException
+  int n = i           ──► unboxing: i.intValue() ──► NPE (i is null)
+  arr.length          ──► arr is null, not an array ──► NPE
+  throw t             ──► t is null ──► NPE
+
+Safe null patterns:
+  "literal".equals(s)         ──► literal is never null, safe
+  Objects.equals(a, b)        ──► handles both sides null
+  Optional.ofNullable(value)  ──► forces caller to handle absence
+
+null instanceof T ──► always false, never throws (INSTANCEOF bytecode returns 0 for null)
+null == null      ──► true (both are address 0x0)
+```
 
 ### WHY Null Is Complicated
 
@@ -560,11 +653,50 @@ if (Objects.equals(userInput, "logout")) { }  // safe for both sides being null
 
 `Objects.equals(a, b)` is implemented as `a == b || (a != null && a.equals(b))` — it handles all null combinations safely.
 
+### Memory Trick
+
+```
+NULL = address 0x0, not an object, no type, no methods
+NPE sources: method call, field access, unboxing, arr.length, throw null, sync(null)
+null instanceof T  = always false (safe, no throw)
+(T) null           = always OK (CHECKCAST passes)
+SAFE EQUALS: "known".equals(variable)  not  variable.equals("known")
+OPTIONAL: return type only; not field, not param; never .get() without .isPresent()
+```
+
 ---
 
 ## J1.4 — Array Covariance Trap
 
 > **Builds on:** [J1.3 — Null in Java](J1_type_system.md#j13--null-in-java)
+
+### The Concrete Picture
+
+Starting state: `String[] strings = {"Alice", "Bob"}` — the actual heap type is `String[]`.
+
+```
+Step 1 — covariant upcast (compiles silently):
+  String[] strings = {"Alice", "Bob"};
+  Object[] objects = strings;   // String[] IS-A Object[] in Java
+  // Both variables point to the SAME String[] array on the heap
+
+Step 2 — write through widened reference (compiler approves, runtime rejects):
+  objects[0] = "Charlie";       // OK: String compatible with String[]
+  objects[1] = Integer.valueOf(42);   // COMPILES (Object[] can hold Integer)
+                                      // RUNTIME ──► AASTORE checks actual type
+                                      // actual type is String[], not Object[]
+                                      // ──► ArrayStoreException!
+
+AASTORE guard (every array write goes through this):
+  ALOAD objects  ──► push array ref
+  ICONST_1       ──► push index
+  ALOAD integer  ──► push value
+  AASTORE        ──► check: is Integer assignable to String[]? NO ──► throw
+
+Generics fix (invariant, compile-time safety):
+  List<String> strings = new ArrayList<>();
+  List<Object> objects = strings;  // COMPILE ERROR — caught before runtime
+```
 
 ### WHY This Is a Famous Design Flaw
 
@@ -736,6 +868,17 @@ The type-safe alternatives are:
 - `List<?>` for read-only access to a list of unknown element type
 - `List<? extends T>` for read-only access to a list of T or any subtype
 - `List<? super T>` for write access to a list of T or any supertype
+
+### Memory Trick
+
+```
+ARRAYS     = covariant: String[] IS-A Object[] (Java 1.0 design choice)
+AASTORE    = runtime guard on every array write → ArrayStoreException if type wrong
+GENERICS   = invariant: List<String> is NOT List<Object> → compile error (safe)
+PECS       = Producer Extends (read), Consumer Super (write)
+List<?>    = existential type: read as Object, write nothing (except null)
+int[][]    = array of int[] references, jagged, non-contiguous heap layout
+```
 
 ---
 

@@ -16,6 +16,29 @@
 > **Builds on:** [Q0.2 — JVM Type Mapping](00_jvm_mental_model.md#q02--jvm-type-mapping)
 > **Connects to:** [Q3.3 (reified defeats erasure)](03_generics_and_variance.md#q33--reified-type-parameters) · [Q1.4 (is checks)](01_type_system_foundations.md#q14--smart-casts)
 
+### The Concrete Picture
+
+Write two lists. Kotlin sees them as different types. The JVM sees ONE type:
+
+```
+Compile time:           Runtime (JVM bytecode):
+List<String>       →   List
+List<Integer>      →   List
+Map<String, User>  →   Map
+
+All type parameters erased. The JVM can't see <String>, <Integer>, etc.
+```
+
+Consequence — this check fails at runtime:
+```kotlin
+val list: Any = listOf("hello")
+if (list is List<String>) { }   // COMPILE ERROR — nothing to check!
+                                  // Both List<String> and List<Int> are just List
+if (list is List<*>) { }        // OK — just checking "is it a List?"
+```
+
+Direction of information: type parameters travel from compile time → erased at runtime.
+
 ### First Principles: Why Does Erasure Exist?
 
 **The historical constraint:** Java 1.0 (1995) had no generics — you wrote `List` and stored `Object` references. When Java 5 added generics in 2004, the JVM bytecode format was already deployed on millions of machines. Changing the bytecode format to carry type parameters would have broken backward compatibility with every existing Java program and library.
@@ -126,6 +149,24 @@ String s = (String) rawList.get(0); // ClassCastException at runtime
 
 Kotlin prohibits raw types. Every generic type must have either a type argument or a wildcard (`*`). This eliminates an entire class of runtime type errors.
 
+### Memory Trick
+
+```
+TYPE ERASURE = "compiler draws a curtain at the class file boundary."
+  On the left (compile time): full generic types — List<String>, Map<String, User>
+  On the right (runtime):     raw types only — List, Map
+
+WHY? Java backward compatibility. JVM bytecode format frozen since 1995.
+
+WHAT GETS INSERTED INSTEAD:
+  Erased type → compiler adds CHECKCAST at every read point.
+  list.get(0) returns Object → compiler inserts cast to String for you.
+
+is List<String>  → COMPILE ERROR (erased, nothing to check)
+is List<*>       → OK (just checks "is it a List", no type param check)
+as List<String>  → UNCHECKED CAST WARNING (you're trusting, runtime can't verify)
+```
+
 > **Interview Answer:** Type erasure exists because Java 5 had to be backward-compatible with Java 1.0 bytecode. The JVM never learned about generic types — they're compile-time only. The Kotlin compiler erases them and inserts casts. This is why `is List<String>` fails: there's no type parameter at runtime to check against.
 
 ---
@@ -134,6 +175,37 @@ Kotlin prohibits raw types. Every generic type must have either a type argument 
 
 > **Builds on:** [Q2.1 — Liskov Substitution](02_classes_and_objects.md#q21--class-modifiers) · [Q0.2 — boxing](00_jvm_mental_model.md#q02--jvm-type-mapping)
 > **Connects to:** [Q2.2 (@UnsafeVariance)](02_classes_and_objects.md#q22--data-classes) · [Q7.1 (List covariance)](07_collections_and_sequences.md)
+
+### The Concrete Picture — Direction of Assignment
+
+We have this hierarchy:
+```
+Animal
+ └── Dog     (Dog is MORE SPECIFIC, Dog is LOWER)
+```
+
+Now: is `List<Dog>` a subtype of `List<Animal>`? It depends on what the container CAN DO.
+
+**Covariant (out) — assignment goes UP the hierarchy:**
+```kotlin
+val dogs: List<Dog> = listOf(Dog())
+val animals: List<Animal> = dogs      // List<Dog> → List<Animal>
+```
+Direction: `Dog → Animal` (moving UP, becoming more general)
+→ called COVARIANT because the container follows the SAME direction as the type hierarchy.
+
+**Contravariant (in) — assignment goes DOWN the hierarchy:**
+```kotlin
+val animalConsumer: Comparator<Animal> = compareBy { it.weight }
+val dogConsumer: Comparator<Dog> = animalConsumer   // Comparator<Animal> → Comparator<Dog>
+```
+Direction: `Animal → Dog` (moving DOWN, becoming more specific)
+→ called CONTRAVARIANT because the container goes the OPPOSITE direction.
+
+```
+OUT → UP the hierarchy   (more general)
+IN  → DOWN the hierarchy (more specific)
+```
 
 ### First Principles: The Liskov Substitution Principle
 
@@ -377,6 +449,25 @@ objects[0] = 42;  // RUNTIME ArrayStoreException! 42 is not a String
 
 Java added a runtime check (`ArrayStoreException`) to catch this. Kotlin fixed the design: arrays are **invariant** (`Array<String>` is NOT a subtype of `Array<Any>`), so this crash cannot happen.
 
+### Memory Trick
+
+```
+OUT → you get things OUT → Producer → reads only → safe to go UP the hierarchy
+IN  → you put things IN  → Consumer → writes only → safe to go DOWN the hierarchy
+
+Quick check: what can the container DO with T?
+  Only RETURN T  → out (covariant)   → Container<Dog> is-a Container<Animal>
+  Only ACCEPT T  → in (contravariant)→ Container<Animal> is-a Container<Dog>
+  BOTH           → invariant         → no subtyping relationship
+
+PRODUCER   → extends (out) → "I produce/read elements"
+CONSUMER   → super (in)    → "I consume/write elements"
+(PECS from Java: Producer Extends, Consumer Super — same concept)
+
+MutableList: both reads AND writes → INVARIANT → no subtyping allowed.
+List:        reads only             → COVARIANT  → List<Dog> is-a List<Animal>.
+```
+
 > **Interview Answer:** `MutableList<Dog>` is not a subtype of `MutableList<Animal>` because it can WRITE — and writing a Cat into a Dog list would corrupt the type system. `List<Dog>` IS a subtype of `List<Animal>` because `List` is `out E` (covariant) — it can only READ elements. Reads are safe because every Dog IS an Animal.
 
 ---
@@ -385,6 +476,28 @@ Java added a runtime check (`ArrayStoreException`) to catch this. Kotlin fixed t
 
 > **Builds on:** [Q3.1 (type erasure)](03_generics_and_variance.md#q31--type-erasure) · [Q4.2 (inline)](04_functions_lambdas_inlining.md#q42--inline-noinline-crossinline)
 > **Reference:** [Kotlin Docs — Reified type parameters](https://kotlinlang.org/docs/inline-functions.html#reified-type-parameters)
+
+### The Concrete Picture
+
+Normal generic function: T is erased. You can't ask "what is T?":
+```kotlin
+fun <T> check(list: List<*>): Boolean = list is List<T>  // COMPILE ERROR: T is erased
+```
+
+`inline` + `reified`: function body is PASTED at the call site. At the call site, T is KNOWN:
+```kotlin
+inline fun <reified T> check(list: List<*>): Boolean = list is List<T>  // WORKS!
+
+// Call site:  check<String>(myList)
+// Compiler pastes the body with T replaced by String:
+//   = myList is List<String>   ← concrete type, no erasure
+```
+
+Direction of information:
+```
+Without reified: T flows in → gets erased → compiler can't use it
+With reified:    inline pastes body at call site → T is known → compiler substitutes
+```
 
 ### First Principles: The Problem Reified Solves
 
@@ -556,6 +669,32 @@ This chain is impossible for classes:
 - Cannot substitute T in class body
 ```
 
+### Memory Trick
+
+```
+REIFIED requires INLINE. Always. No exceptions.
+
+WHY: inline = paste the body at the call site.
+     At the call site, the concrete type is KNOWN.
+     Compiler substitutes T → no erasure at that specific location.
+
+Chain to remember:
+  ERASURE   → T is gone at runtime (normal generic functions)
+  INLINE    → body pasted at call site (function disappears)
+  REIFIED   → T is known at paste site (concrete type substituted)
+
+Cannot use reified on CLASS type parameters:
+  class Box<reified T>  → COMPILE ERROR
+  Classes aren't inlined. Instantiation creates an object, not a paste.
+  Only FUNCTIONS can be inline → only FUNCTION type params can be reified.
+
+Android pattern:
+  inline fun <reified T : Activity> Context.startActivity() {
+      startActivity(Intent(this, T::class.java))
+  }
+  startActivity<DetailActivity>()   // T = DetailActivity, class known at call site
+```
+
 > **Key Takeaway:** Reified type parameters are a compiler trick: `inline` causes the function body to be copy-pasted at each call site, and at each call site the concrete type is known. The compiler substitutes the concrete type for `T` in the pasted body. This defeats erasure for that specific call site.
 
 ---
@@ -564,6 +703,24 @@ This chain is impossible for classes:
 
 > **Builds on:** [Q3.1 — Type Erasure](03_generics_and_variance.md#q31--type-erasure) · [Q3.2 — Variance](03_generics_and_variance.md#q32--variance)
 > **Connects to:** [Q3.3 — Reified](03_generics_and_variance.md#q33--reified-type-parameters) · [Q1.3 — Nothing and Any](01_type_system_foundations.md#q13--nothing-unit-and-the-type-hierarchy)
+
+### The Concrete Picture
+
+No bound: T is `Any?` — you can't call ANY methods on it:
+```kotlin
+fun <T> process(x: T) {
+    x.toDouble()   // COMPILE ERROR: Any? doesn't have toDouble()
+}
+```
+
+With a bound: T BORROWS the bound's methods:
+```kotlin
+fun <T : Number> process(x: T): Double {
+    x.toDouble()   // WORKS — compiler knows T is at least a Number
+}
+```
+
+The bound is what T "inherits" at compile time. The tighter the bound, the more methods you can call on T.
 
 ### What Are Type Parameter Bounds?
 
@@ -744,6 +901,25 @@ fun sumList(list: List<out Number>): Double {
 | Can call Number methods | No | Yes |
 | Caller can pass | `List<String>`, `List<Int>`, anything | Only `List<Number>` or subtypes |
 | Use when | Don't care about element type | Need element behavior |
+
+### Memory Trick
+
+```
+BOUND = "T must be AT LEAST this type."
+  <T : Number>       → T borrows Number's methods
+  <T : Comparable<T>>→ T can compare itself to itself (sortable)
+  <T : Any>          → T is guaranteed non-null (Any excludes null, Any? includes null)
+  <T>                → implicit T : Any? (nullable allowed, minimal methods)
+
+MULTIPLE BOUNDS need `where`:
+  fun <T> save(list: List<T>) where T : Serializable, T : Comparable<T>
+
+AT RUNTIME: T erases to its upper bound in bytecode:
+  <T : Number>  → erases to Number  (not Object)
+  <T>           → erases to Object
+
+Why this matters: <T : Number> means JVM can call number methods WITHOUT an extra cast.
+```
 
 > **Key Takeaway:** Type bounds are what let generic functions be useful rather than just holding `Any?`. `T : Number` means "I can call Number's methods on T"; `T : Comparable<T>` means "T can be sorted"; `T : Any` means "T is guaranteed non-null". At the JVM level, T erases to its upper bound — so `T : Number` compiles to use `Number` as the static type, with no cast needed.
 

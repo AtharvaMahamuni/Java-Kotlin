@@ -16,6 +16,29 @@
 > **Builds on:** [Q0.4 — JVM Call Stack & getter overhead](00_jvm_mental_model.md#q04--the-jvm-call-stack)
 > **Connects to:** [Q2.3 (companion object and const)](02_classes_and_objects.md#q23--sealed-classes-and-interfaces) · [Q5.3 (delegates also generate methods)](05_properties_and_delegation.md#q53--delegates)
 
+### The Concrete Picture
+
+Two declarations. They look almost the same. The bytecode is completely different:
+
+```kotlin
+object ApiConfig {
+    val BASE_URL = "https://api.example.com"   // looks like a constant
+    const val TAG = "MyApp"                    // IS a constant
+}
+```
+
+At the call site:
+
+```
+ApiConfig.BASE_URL  →  GETSTATIC instance + INVOKEVIRTUAL getBASE_URL()
+                        ↑ a method call! loads class, pushes frame, returns value
+
+ApiConfig.TAG       →  LDC "MyApp"
+                        ↑ compiler pastes the literal directly. No class. No call.
+```
+
+The difference: `val` is a **runtime property**. `const val` is a **compile-time substitution**.
+
 ### First Principles: What is a `val`?
 
 In Kotlin, `val` means **read-only** — you can only assign it once. But "read-only" at the language level does NOT mean "zero overhead." The compiler implements `val` as a **property with a getter** — a full method call.
@@ -110,6 +133,23 @@ object Config {
 | Allowed types | Any | Any | Primitives + String only |
 | Binary compatibility | Getter can change body | Field exposed (breaking to remove `@JvmField`) | Value baked into callers (breaking to change!) |
 
+### Memory Trick
+
+```
+val       →  METHOD CALL at every access (getter in bytecode)
+@JvmField →  FIELD ACCESS at every access (no getter, still runtime)
+const val →  COPY-PASTE into every call site (no class, no call, no runtime)
+
+Three questions to pick the right one:
+  1. Does it need to work as a Java constant? → const val (if String/primitive)
+  2. Does Java need clean field syntax? → @JvmField
+  3. Is it a complex type or runtime value? → val (only option)
+
+DANGER: const val = value baked into caller's bytecode.
+  Change const val "1.0" → "2.0" in a library?
+  Old callers still have "1.0" until they recompile.
+```
+
 > **Interview Trap:** `const val` inlining is a **binary compatibility hazard** for library authors. If you publish a library with `const val VERSION = "1.0"` and change it to `"2.0"`, callers that haven't recompiled will still use `"1.0"` — it was baked into their bytecode!
 
 ---
@@ -117,6 +157,29 @@ object Config {
 ## Q1.2 — Nullability at the Type Level
 
 > **Connects to:** [Q5.1 (lateinit null sentinel)](05_properties_and_delegation.md#q51--lateinit-internals) · [Q2.5.3 (null in open function init trap)](02_5_initialization_mechanics.md#q253--inheritance-initialization-order)
+
+### The Concrete Picture
+
+Same JVM type. Different Kotlin types:
+
+```
+Kotlin sees:      String              String?
+JVM sees:         java.lang.String    java.lang.String   ← identical at runtime!
+
+The difference lives ONLY in the compiler's type checker:
+  String  →  compiler adds @NotNull + generates null check at function entry
+  String? →  compiler adds @Nullable + lets you pass null
+```
+
+When Kotlin calls Java that has NO annotation:
+
+```
+Java returns:   String   (no @NotNull, no @Nullable)
+Kotlin sees:    String!  ← platform type = "I don't know"
+
+String! assigned to String  → compiles, but NPE possible at runtime  ← DANGER
+String! assigned to String? → safe, forces you to handle null
+```
 
 ### Are `String` and `String?` Different JVM Types?
 
@@ -234,6 +297,23 @@ val result = x ?: "default"   // compiler warning: Elvis branch is always false
 // Compiler eliminates the branch entirely
 ```
 
+### Memory Trick
+
+```
+NULL SAFETY = compile-time fiction. JVM has no concept of it.
+Both String and String? → java.lang.String in bytecode.
+
+The compiler enforces null safety through:
+  1. @NotNull / @Nullable annotations → compiler rules
+  2. Intrinsics.checkNotNullParameter() → runtime guard for Java callers
+
+PLATFORM TYPE (!) = Java gave you something, Kotlin doesn't know if it's nullable.
+  Rule: ALWAYS assign Java results to String? (not String) unless you're certain.
+
+?: is NOT free. It's IFNONNULL branch in bytecode.
+  Compiler removes it only when it can PROVE the value is never null.
+```
+
 > **Key Takeaway:** `?:` is not zero-cost. It's a null check + conditional branch in bytecode. The compiler eliminates it only when it can statically prove non-nullability.
 
 ---
@@ -241,6 +321,39 @@ val result = x ?: "default"   // compiler warning: Elvis branch is always false
 ## Q1.3 — `Nothing`, `Unit`, and the Type Hierarchy
 
 > **Connects to:** [Q2.3 (sealed class Error carries Nothing)](02_classes_and_objects.md#q23--sealed-classes-and-interfaces) · [Q3.2 (variance positions)](03_generics_and_variance.md#q32--variance)
+
+### The Concrete Picture
+
+Three different return types. One confusing one:
+
+```kotlin
+fun returns(): String = "hello"   // type: String
+fun returnsNothing(): Unit = println("done")   // type: Unit (returned = nothing useful)
+fun neverReturns(): Nothing = throw Exception()  // type: Nothing (never reaches caller)
+```
+
+The direction of "value flow" is the key:
+
+```
+String  → value flows OUT to the caller (a String object comes back)
+Unit    → nothing useful flows out (void in Java, but IS an object: Unit.INSTANCE)
+Nothing → no flow at all (exception thrown / infinite loop / process exits)
+```
+
+Why does this matter? `Nothing` sits at the BOTTOM of the type hierarchy:
+
+```
+         Any
+          │
+     ┌────┴────┐
+   String     Int     (all your types)
+          │
+        null  (nullable types)
+          │
+        Nothing  ← subtype of EVERYTHING
+```
+
+Because `Nothing` is a subtype of `String`, `Int`, `User`, anything — it can "stand in" for any type. That's why `throw` works inside a String expression.
 
 ### Kotlin's Complete Type Hierarchy
 
@@ -350,6 +463,25 @@ fun getResult(): Result<User> {
 // This is logically broken, so the compiler forbids it.
 ```
 
+### Memory Trick
+
+```
+THREE return types:
+  String  = "here's a value"       → value flows to caller
+  Unit    = "I'm done, no value"   → void (but is a real object)
+  Nothing = "I never get back"     → throw / infinite loop / exitProcess
+
+Nothing = BOTTOM of type pyramid = subtype of EVERYTHING.
+  Why useful? throw can appear inside any expression:
+    val x: String = throw Exception()   ← Nothing IS-A String → compiles!
+    val y: Int    = throw Exception()   ← Nothing IS-A Int    → compiles!
+
+Result<Nothing> trick:
+  Result<out T> is covariant.
+  Result<Nothing> IS-A Result<T> for ANY T.
+  → Loading and Error states work for any Result<T> without needing T.
+```
+
 > **Key Takeaway:** `Nothing` makes the type system complete. `throw` and infinite loops have type `Nothing`, enabling exhaustive `when` expressions and clean sealed class hierarchies.
 
 ---
@@ -357,6 +489,33 @@ fun getResult(): Result<User> {
 ## Q1.4 — Smart Casts
 
 > **Connects to:** [Q2.3 (sealed class exhaustiveness)](02_classes_and_objects.md#q23--sealed-classes-and-interfaces) · [Q3.1 (type erasure breaks is checks)](03_generics_and_variance.md#q31--type-erasure)
+
+### The Concrete Picture
+
+Two scenarios. One works, one doesn't:
+
+```kotlin
+// Scenario 1: local val — WORKS
+fun process(input: Any) {
+    if (input is String) {
+        input.length   // ✓ — compiler KNOWS input is String here, it can't change
+    }
+}
+
+// Scenario 2: var property — FAILS
+class Container {
+    var value: Any = "hello"
+    fun process() {
+        if (value is String) {
+            value.length  // ✗ COMPILE ERROR — another thread could change value
+        }                 //                   between the check and this line
+    }
+}
+```
+
+The question the compiler asks: **"Can this value change between the `is` check and the usage?"**
+- `val` local → NO, it can't change → smart cast allowed
+- `var` property → YES, another thread could change it → smart cast rejected
 
 ### What Conditions Enable a Smart Cast?
 
@@ -477,6 +636,27 @@ fun use(box: Box) {
 ```
 
 The compiler cannot smart-cast through a getter because the getter is a **method call** — it could return a different value each time. Even if the backing field is `val`, the getter could be overridden in a subclass (see [Q2.1 — Class Modifiers](02_classes_and_objects.md#q21--class-modifiers)) to return null.
+
+### Memory Trick
+
+```
+SMART CAST = compiler narrows type after is check.
+Works only if the variable is STABLE.
+
+STABLE = "can't change between check and use":
+  ✓  local val      → immutable, no threads can touch it
+  ✓  val property (no custom getter) → immutable once set
+  ✗  var property   → another thread could change it
+  ✗  any getter     → getter could return a different value each call
+
+GOLDEN RULE: always capture before checking
+  val v = maybeNullProperty   // capture into local val (stable!)
+  if (v != null) { v.foo() }  // smart cast works ✓
+
+is  → INSTANCEOF bytecode → no exception
+as  → CHECKCAST bytecode  → ClassCastException if wrong
+as? → INSTANCEOF + CHECKCAST → returns null if wrong (never throws)
+```
 
 > **Key Takeaway:** Smart casts are a compile-time guarantee. The compiler only performs them when it can prove the value is stable. Always capture mutable/getter-accessed values into local `val` before type-checking.
 

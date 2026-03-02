@@ -17,6 +17,44 @@
 > **Connects to:** [Q13.6 — Repository pattern](13_android_architecture.md#q136--repository-and-offline-first-patterns) · [Q14.2 — WorkManager](14_jetpack_components.md#q142--workmanager)
 > **Reference:** [Android Docs — Room persistence library](https://developer.android.com/training/data-storage/room)
 
+### The Concrete Picture
+
+Starting state — raw SQLite (what Room replaces):
+```kotlin
+// Without Room — raw SQLite, runtime crash risk:
+val cursor = db.rawQuery("SELECT * FROM usrs", null)  // typo "usrs" → crashes at runtime!
+while (cursor.moveToNext()) {
+    val name = cursor.getString(cursor.getColumnIndex("nam"))  // wrong column → silent null
+}
+```
+
+After Room — compile-time SQL verification:
+```kotlin
+@Entity(tableName = "users")
+data class UserEntity(@PrimaryKey val id: String, val name: String, val age: Int)
+
+@Dao
+interface UserDao {
+    @Query("SELECT * FROM usrs")        // ← COMPILE ERROR: Table 'usrs' not found
+    fun getAll(): List<UserEntity>
+
+    @Query("SELECT * FROM users")       // ← generates this at compile time:
+    fun observeAll(): Flow<List<UserEntity>>
+}
+```
+
+Room annotation processor pipeline:
+```
+Source code (@Entity, @Dao, @Database)
+    │  KAPT/KSP processes annotations at build time
+    ▼
+Generated: AppDatabase_Impl.java
+    ├── CREATE TABLE SQL embedded in code
+    ├── UserDao_Impl with null checks and type mappings
+    └── InvalidationTracker setup for Flow emissions
+```
+Any SQL error = build error, not runtime crash.
+
 ### First Principles: What Is Room?
 
 Room is a compile-time-verified ORM (Object-Relational Mapper) that sits on top of SQLite. Instead of writing raw SQL everywhere, you write Kotlin interfaces and data classes, and Room generates the implementation.
@@ -175,6 +213,25 @@ If you bump the version WITHOUT providing a migration: **`IllegalStateException:
 
 **Fallback:** `.fallbackToDestructiveMigration()` — drops and recreates the database. Data lost. Only use during development.
 
+### Memory Trick
+
+```
+Room query flow:
+  @Query write  →  InvalidationTracker marks table dirty
+                →  Flow re-executes query  →  new emission to UI
+
+@Transaction mnemonic: "ALL or NOTHING"
+  insertOrder() succeeds, insertItems() fails → WITHOUT @Transaction: corrupted state
+  WITH @Transaction: SQLite rolls back insertOrder too — both fail together
+
+@Embedded vs @Relation:
+  @Embedded  = same table row (flat, no JOIN needed)
+  @Relation  = separate table, triggers extra SELECT (requires @Transaction)
+
+Migration version bump without script = IllegalStateException (Room refuses to open)
+  "Room would rather crash than silently corrupt your data"
+```
+
 ---
 
 ## Q14.2 — WorkManager
@@ -182,6 +239,36 @@ If you bump the version WITHOUT providing a migration: **`IllegalStateException:
 > **Builds on:** [Q16.2 — Background Work Evolution](16_android_system_internals.md#q162--background-work-evolution)
 > **Connects to:** [Q10.4 — Lifecycle Scopes](10_structured_concurrency.md#q104--lifecycle-scopes-and-process-death)
 > **Reference:** [Android Docs — Schedule tasks with WorkManager](https://developer.android.com/topic/libraries/architecture/workmanager)
+
+### The Concrete Picture
+
+Starting state — background work in a plain Service (Android 8+):
+```
+User opens app → starts Service → starts upload
+User presses home (app goes to background)
+    │
+    └── Android 8+ Oreo: kills background service within ~60 seconds
+            ← upload cancelled, no retry, user never knows
+```
+
+After WorkManager:
+```
+WorkManager.enqueue(uploadWork)
+    │
+    ├── Persists request to WorkManager's internal Room DB
+    │       (survives process death, survives reboot)
+    │
+    ├── Registers with JobScheduler (API 23+)
+    │       (OS-managed, battery-friendly, Doze-safe)
+    │
+    └── When constraints met (CONNECTED network):
+            Worker.doWork() runs on background thread
+            Result.success() → work removed from DB
+            Result.retry()   → re-scheduled with backoff
+
+Chain: CompressWorker ──► UploadWorker ──► NotifyWorker
+  Output data from step N ──► becomes inputData for step N+1
+```
 
 ### Why a `Service` Doesn't Guarantee Background Work
 
@@ -282,6 +369,25 @@ WorkManager.enqueueUniqueWork("sync", ExistingWorkPolicy.APPEND, request)
 // Use: sequential queue — don't run new work until old work finishes
 ```
 
+### Memory Trick
+
+```
+WorkManager guarantee source:
+  "Persisted to Room → JobScheduler → runs even after reboot"
+  Service = RAM only; WorkManager = disk + OS scheduler
+
+ExistingWorkPolicy:
+  REPLACE  = cancel old, start fresh    (user-triggered manual refresh)
+  KEEP     = ignore new, keep old       (deduplicate periodic sync)
+  APPEND   = queue new after old        (ordered sequential tasks)
+
+Minimum periodic interval = 15 minutes (Android enforces, cannot go lower)
+
+CoroutineWorker vs Worker:
+  CoroutineWorker.doWork() is suspend → can call suspend functions directly
+  Worker.doWork() is blocking         → must use runBlocking (avoid in new code)
+```
+
 ---
 
 ## Q14.3 — Paging 3
@@ -289,6 +395,56 @@ WorkManager.enqueueUniqueWork("sync", ExistingWorkPolicy.APPEND, request)
 > **Builds on:** [Q11.2 — Flow Operators](11_flow.md#q112--flow-operators) · [Q14.1 — Room](14_jetpack_components.md#q141--room--internals)
 > **Connects to:** [Q11.4 — Flow collection](11_flow.md#q114--flow-collection-and-lifecycle)
 > **Reference:** [Android Docs — Paging 3 library](https://developer.android.com/topic/libraries/architecture/paging/v3-overview)
+
+### The Concrete Picture
+
+Starting state — manual pagination (what Paging 3 replaces):
+```kotlin
+var page = 1
+fun loadMore() {
+    viewModelScope.launch {
+        val users = api.getUsers(page, pageSize = 20)
+        _list.value = _list.value + users   // manual accumulation
+        page++
+        // Problems: no offline support, no Room integration,
+        //           scroll position lost on rotation, no retry UI
+    }
+}
+```
+
+After Paging 3 with RemoteMediator (network + Room SSoT):
+```
+User scrolls to bottom
+    │
+    ▼
+Pager detects "load more needed"
+    │
+    ▼
+RemoteMediator.load(APPEND)
+    │  api.getUsers(nextPage)          ← network fetch
+    │  db.withTransaction {
+    │      userDao.insertAll(users)    ← write to Room
+    │      remoteKeyDao.insert(key)   ← store next page number
+    │  }
+    │
+    ▼
+Room InvalidationTracker fires
+    │
+    ▼
+PagingSource (backed by Room) re-queries
+    │
+    ▼
+PagingData emitted → LazyColumn / RecyclerView shows new items
+
+Offline: RemoteMediator fails → Room still has existing pages → no blank screen
+```
+
+Cursor vs offset — the bug that cursor pagination eliminates:
+```
+Offset:  page 2 = "items 20-39"  →  but if item 5 was deleted, item 20 (old) = item 19 (new)
+         → item 19 appears in BOTH page 1 and page 2 (duplicate)
+Cursor:  page 2 = "items after id=XYZ"  →  stable ID, deletions don't shift positions
+```
 
 ### `PagingSource` vs `RemoteMediator`
 

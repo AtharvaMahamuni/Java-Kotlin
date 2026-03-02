@@ -6,6 +6,35 @@
 
 > **Connects to:** [J2.2 — Interfaces: default & static methods](J2_oop.md#j22--interfaces-default--static-methods)
 
+### The Concrete Picture
+
+Starting class hierarchy: `String` (final), `AbstractList` (abstract), `ArrayList` (concrete).
+
+```
+final class String {
+    // JIT sees: no subclasses possible
+    // s.length() call ──► INVOKEVIRTUAL ──► JIT: devirtualize ──► direct call / inline
+    // NO vtable lookup needed
+}
+
+abstract class Animal {         // cannot: new Animal()
+    String name;                // has state
+    Animal(String name) { }     // has constructor (called via super())
+    abstract String speak();    // subclass MUST implement
+    String describe() { return name + ": " + speak(); }  // can call abstract method
+}
+
+class Dog extends Animal {
+    Dog(String n) { super(n); }      // super() MUST be first
+    @Override String speak() { return "Woof"; }
+}
+
+Initialization order (each new Dog("Rex")):
+  1. static initializers (once per class load)
+  2. instance field init  ──► name = "Rex"
+  3. constructor body     ──► Animal() body, then Dog() body
+```
+
 ### WHY: Signals to the Compiler and JIT
 
 The keywords `final` and `abstract` are not just design-level hints for human readers. They carry deep meaning to both the Java compiler and, more importantly, to the JIT (Just-In-Time) compiler at runtime. When the JIT sees that a class is `final`, it knows with certainty that no subclass will ever override any of its methods. This enables a powerful optimization called **devirtualization**: instead of performing an expensive virtual dispatch through the vtable (which requires a pointer dereference, a method table lookup, and an indirect call), the JIT can emit a direct call — or even inline the method body entirely. This is why `String`, `Integer`, `Long`, `Double`, and all other wrapper types in `java.lang` are declared `final`. Every method call on a `String` is a candidate for devirtualization.
@@ -266,12 +295,53 @@ Method Area (Metaspace)
 
 **"Is a `final` method call faster?"** At bytecode level: no — it still emits `INVOKEVIRTUAL`. At JIT level: yes — the JIT can devirtualize and inline it. The performance difference only matters in hot loops.
 
+### Memory Trick
+
+```
+final class   = no subclasses → JIT devirtualizes ALL method calls (String, Integer)
+final method  = no override   → JIT can inline even in non-final class
+abstract class= no instantiation, HAS constructor (called via super()), HAS state
+abstract method = no body, subclass MUST implement
+INIT ORDER: static block → instance fields/blocks → constructor body
+super() MUST be first statement in constructor (compiler enforces)
+```
+
 ---
 
 ## J2.2 — Interfaces: default & static methods
 
 > **Builds on:** [J2.1 — Classes, final, abstract](J2_oop.md#j21--classes-final-abstract)
 > **Connects to:** [J2.3 — Enums Internals](J2_oop.md#j23--enums-internals)
+
+### The Concrete Picture
+
+Starting problem: `Collection` interface in Java 7 had no `stream()` method. Adding it would break every custom Collection implementation worldwide.
+
+```
+Before Java 8 (the evolution problem):
+  interface Collection<E> {
+    boolean add(E e);    // existing method
+    // adding stream() here would force ALL implementors to add it
+  }
+
+After Java 8 (default method solution):
+  interface Collection<E> {
+    boolean add(E e);
+    default Stream<E> stream() { return StreamSupport.stream(spliterator(), false); }
+    // existing implementations inherit this body — nothing breaks
+  }
+
+Method dispatch:
+  class ref   ──► INVOKEVIRTUAL  ──► vtable[slot] ──► O(1) direct lookup
+  iface ref   ──► INVOKEINTERFACE ──► itable lookup ──► slightly more complex
+
+Diamond resolution rules:
+  class method > specific interface > ambiguous (must call InterfaceName.super.method())
+
+static interface method:
+  Validator.nonEmpty()   ──► OK (called on interface name)
+  myValidator.nonEmpty() ──► COMPILE ERROR (not inherited by implementors)
+```
 
 ### WHY: Interface Evolution Without Breaking the World
 
@@ -442,12 +512,49 @@ The JIT typically handles this with inline caches — after the first call, it c
 
 **"Can an interface default method call abstract methods on `this`?"** Yes — and this is a powerful pattern. The default method calls `this.abstractMethod()`, and the concrete implementation at runtime provides the result.
 
+### Memory Trick
+
+```
+default method  = body in interface, inherited by implementors (Java 8)
+static method   = belongs to interface itself, NOT inherited by implementors
+private method  = shared helper for default/static methods (Java 9)
+DIAMOND: class wins > specific iface wins > must call B.super.hello() explicitly
+INVOKEVIRTUAL  (class ref)  vs  INVOKEINTERFACE (interface ref) — different dispatch
+static iface method: Interface.method() YES | instance.method() NO
+```
+
 ---
 
 ## J2.3 — Enums Internals
 
 > **Builds on:** [J2.2 — Interfaces: default & static methods](J2_oop.md#j22--interfaces-default--static-methods)
 > **Connects to:** [J2.4 — Records (Java 16+)](J2_oop.md#j24--records-java-16)
+
+### The Concrete Picture
+
+Starting state: `enum Color { RED, GREEN, BLUE }` — what does the compiler actually produce?
+
+```
+Source:  enum Color { RED, GREEN, BLUE }
+
+Compiler generates:
+  public final class Color extends Enum<Color> {
+    public static final Color RED   = new Color("RED",   0);  // ordinal=0
+    public static final Color GREEN = new Color("GREEN", 1);  // ordinal=1
+    public static final Color BLUE  = new Color("BLUE",  2);  // ordinal=2
+    private static final Color[] $VALUES = { RED, GREEN, BLUE };
+    private Color(String name, int ordinal) { super(name, ordinal); }
+    public static Color[] values() { return $VALUES.clone(); }  // CLONE every call!
+  }
+
+EnumSet bit vector (for Color with 3 constants, fits in one long):
+  EnumSet.of(RED, GREEN):
+  bit position:  2(BLUE)  1(GREEN)  0(RED)
+  long value:       0        1        1   = 0b011
+
+switch on enum compiles to ordinal lookup:
+  switch(c) ──► $switchMap[c.ordinal()] ──► tableswitch (O(1))
+```
 
 ### WHY: The Problem With the Int Enum Pattern
 
@@ -675,12 +782,58 @@ switch (c) {
 
 **"Can enums implement interfaces?"** Yes. This is the recommended way to add polymorphic behavior to enums. Each constant (or the enum class as a whole) can implement interface methods.
 
+### Memory Trick
+
+```
+enum = final class extending Enum<E>, each constant is public static final instance
+constructor = always private (compiler enforces), singleton guarantee per constant
+values()    = CLONES the array every call — cache it in tight loops
+ordinal()   = fragile on reorder — use explicit field instead: Priority(int level)
+EnumSet     = bit vector (long) indexed by ordinal — O(1) add/remove/contains
+EnumMap     = Object[] indexed by ordinal — no hashing, fastest Map for enum keys
+```
+
 ---
 
 ## J2.4 — Records (Java 16+)
 
 > **Builds on:** [J2.3 — Enums Internals](J2_oop.md#j23--enums-internals)
 > **Connects to:** [J2.5 — Sealed Classes (Java 17+)](J2_oop.md#j25--sealed-classes-java-17)
+
+### The Concrete Picture
+
+Starting problem: a 2D point requires 30+ lines of boilerplate for equals, hashCode, toString, constructor, accessors.
+
+```
+Before records (30+ lines):
+  public final class Point {
+    private final int x; private final int y;
+    public Point(int x, int y) { this.x = x; this.y = y; }
+    public int getX() { return x; }   // JavaBean style
+    public int getY() { return y; }
+    @Override public boolean equals(Object o) { ... }
+    @Override public int hashCode() { ... }
+    @Override public String toString() { ... }
+  }
+
+After records (1 line):
+  record Point(int x, int y) {}
+  // Compiler generates all of the above. Accessor: point.x() not point.getX()
+
+Compact constructor (validation without redundancy):
+  record Range(int min, int max) {
+    Range {                          // no parameter list
+      if (min > max) throw ...;      // validate
+      // compiler appends: this.min = min; this.max = max;
+    }
+  }
+
+What records cannot do:
+  extend classes (implicitly extends Record)
+  declare extra instance fields beyond components
+  be subclassed (implicitly final)
+  have mutable fields (all private final)
+```
 
 ### WHY: The Data Class Boilerplate Problem
 
@@ -911,12 +1064,61 @@ record Person(String name, int age) {
 
 **"Can a record field be null?"** Yes, unless you validate in the compact constructor. Records themselves have no built-in null-safety.
 
+### Memory Trick
+
+```
+record Point(int x, int y) {} = final class + private final fields + canonical ctor
+                               + x()/y() accessors + equals + hashCode + toString
+ACCESSOR: point.x()  not  point.getX()  (breaks JavaBean convention deliberately)
+COMPACT CTOR: validate/normalize params, compiler auto-appends this.x = x; this.y = y;
+CANNOT: extend classes, be subclassed, add instance fields, have mutable state
+CAN:    implement interfaces, add static fields/methods, add instance methods
+```
+
 ---
 
 ## J2.5 — Sealed Classes (Java 17+)
 
 > **Builds on:** [J2.4 — Records (Java 16+)](J2_oop.md#j24--records-java-16)
 > **Connects to:** [J3.1 — Type Erasure](J3_generics.md#j31--type-erasure)
+
+### The Concrete Picture
+
+Starting problem: a `Shape` interface with no subclass control. A `switch` on `Shape` cannot be exhaustive because any package can add a new `Shape` subtype.
+
+```
+Open hierarchy (before sealed):
+  interface Shape { }
+  class Circle    implements Shape { }   // known
+  class Rectangle implements Shape { }   // known
+  class Hexagon   implements Shape { }   // surprise! from external package
+
+  double area(Shape s) {
+    return switch (s) {
+      case Circle c    -> ...
+      case Rectangle r -> ...
+      default -> 0;  // required: compiler doesn't know all subtypes
+    };
+  }
+
+Sealed hierarchy (Java 17):
+  sealed interface Shape permits Circle, Rectangle, Triangle { }
+  final record Circle(double radius)           implements Shape { }
+  final record Rectangle(double w, double h)   implements Shape { }
+  final record Triangle(double b, double h)    implements Shape { }
+
+  double area(Shape s) {
+    return switch (s) {
+      case Circle c    -> Math.PI * c.radius() * c.radius();
+      case Rectangle r -> r.w() * r.h();
+      case Triangle t  -> 0.5 * t.b() * t.h();
+      // NO default needed — compiler knows exactly 3 subtypes exist
+    };   // adding a 4th Shape → compile error here immediately
+  }
+
+JVM enforcement: PermittedSubclasses attribute in .class file
+  javap -v Shape.class → PermittedSubclasses: Circle, Rectangle, Triangle
+```
 
 ### WHY: Controlled Inheritance for Closed Hierarchies
 

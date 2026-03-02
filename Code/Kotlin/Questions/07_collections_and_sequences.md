@@ -15,6 +15,28 @@
 > **Builds on:** [Q3.2 — Variance](03_generics_and_variance.md#q32--variance) · [Q0.2 — JVM Type Mapping](00_jvm_mental_model.md#q02--jvm-type-mapping)
 > **Reference:** [Kotlin Docs — Collections Overview](https://kotlinlang.org/docs/collections-overview.html)
 
+### The Concrete Picture
+
+Four types that look related but behave very differently:
+
+```kotlin
+val list: List<Int>          // read-only interface — no add/remove via this reference
+val mutableList: MutableList<Int>  // mutable — has add/remove/set
+
+val ro: List<Int> = mutableList   // SAME underlying object!
+mutableList.add(99)
+ro.size  // includes 99! Read-only ≠ immutable.
+```
+
+The hierarchy:
+```
+List<out E>         ← covariant (out): List<Dog> IS-A List<Animal>
+MutableList<E>      ← invariant: MutableList<Dog> is NOT MutableList<Animal>
+```
+
+Why the difference? List only reads (`get()`). MutableList reads AND writes (`add()`).
+Adding a `Cat` to a `Dog` list = type corruption → must be invariant.
+
 ### First Principles: Read-Only vs Immutable
 
 Before diving in, a crucial distinction:
@@ -108,6 +130,23 @@ Total:       ~16 bytes           ~60 bytes — 3.75× more memory!
 
 **Rule:** For numeric arrays in performance-critical code (game loops, image processing, audio), always use `IntArray`, `FloatArray`, `LongArray` — never `Array<Int>` (see [Q0.2 — boxing cost](00_jvm_mental_model.md#q02--jvm-type-mapping)).
 
+### Memory Trick
+
+```
+READ-ONLY ≠ IMMUTABLE.
+  List<Int> = "you can't modify through THIS reference"
+  Someone else holding MutableList to same data CAN modify it.
+  For true immutability: use ImmutableList (Guava) or toList() copy.
+
+List<out E> = COVARIANT (readonly → only reads → safe to widen)
+MutableList<E> = INVARIANT (can write → widening could corrupt types)
+
+ARRAY boxing shortcut:
+  TypeArray (IntArray, FloatArray) → primitive array → unboxed → fast
+  Array<Type> (Array<Int>)         → object array   → boxed   → slow
+  Choose TypeArray for performance-critical numeric data.
+```
+
 ### `listOf()` — Backed by `Arrays.asList()`
 
 ```kotlin
@@ -146,6 +185,30 @@ val b = listOf<Int>()      // also returns a SINGLETON empty list (same as empty
 > **Builds on:** [Q4.2 — inline (all sequence operators are inline)](04_functions_lambdas_inlining.md#q42--inline-noinline-crossinline) · [Q4.1 — lambda allocation cost](04_functions_lambdas_inlining.md#q41--lambda-compilation)
 > **Connects to:** [Q11.1 — Flow (async counterpart to Sequence)](11_flow.md#q111--cold-vs-hot-streams)
 > **Reference:** [Kotlin Docs — Sequences](https://kotlinlang.org/docs/sequences.html)
+
+### The Concrete Picture
+
+Same operations. Completely different execution strategy:
+
+```
+EAGER (list.filter.map.take):
+  filter ALL 10 → get [2,4,6,8,10]  — 10 elements processed, intermediate list
+  map    ALL 5  → get [4,16,36,64,100] — 5 elements processed, intermediate list
+  take first 3  → get [4,16,36]
+  TOTAL: 15 operations, 2 intermediate lists
+
+LAZY (list.asSequence.filter.map.take):
+  element 1: filter(no) → skip
+  element 2: filter(yes) → map → count 1 of 3
+  element 3: filter(no) → skip
+  element 4: filter(yes) → map → count 2 of 3
+  element 5: filter(no) → skip
+  element 6: filter(yes) → map → count 3 of 3 → DONE (elements 7-10 never touched)
+  TOTAL: 6 operations, 0 intermediate lists
+```
+
+When lazy is WORSE: small collections (~< 20 elements). Each sequence operator wraps
+another object (`FilteringSequence`, `TransformingSequence`). More overhead than savings.
 
 ### First Principles: Eager vs Lazy Evaluation
 
@@ -239,6 +302,24 @@ val lines = generateSequence(bufferedReader::readLine)  // null terminates
 lines.filter { it.isNotBlank() }.take(100).toList()
 ```
 
+### Memory Trick
+
+```
+SEQUENCE = lazy pipeline. One element travels the full pipeline before the next starts.
+
+USE SEQUENCE WHEN:
+  ✓ Large dataset (> ~100 elements)
+  ✓ Early termination (take, first, find) — stops after getting what it needs
+  ✓ Potentially infinite data (generateSequence)
+
+USE EAGER WHEN:
+  ✓ Small dataset (< ~20 elements) — overhead of wrappers outweighs savings
+  ✓ Multiple terminals on same intermediate (can't reuse lazy sequence)
+
+Sequence is SYNCHRONOUS (blocks thread).
+Flow = async Sequence (can suspend, non-blocking).
+```
+
 ### How `Flow` Relates to `Sequence`
 
 | | `Sequence` | `Flow` |
@@ -258,6 +339,33 @@ lines.filter { it.isNotBlank() }.take(100).toList()
 > **Builds on:** [Q7.1 — Collection Hierarchy](07_collections_and_sequences.md#q71--kotlins-collection-hierarchy) · [Q0.1 — heap allocation](00_jvm_mental_model.md#q01--primitives-vs-references)
 > **Connects to:** [Q14.4 — Thread-Safe Caching](14_jetpack_components.md#q144--thread-safe-caching)
 > **Reference:** [Kotlin Docs — Collection Operations](https://kotlinlang.org/docs/collection-operations.html)
+
+### The Concrete Picture
+
+Three classic pitfalls, each with a concrete example and fix:
+
+**Pitfall 1:** Modifying while iterating:
+```
+for (item in list) { if (item == 3) list.remove(item) }
+→ ConcurrentModificationException
+
+Fix: list.removeAll { it == 3 }          (no external iterator)
+     list.filter { it != 3 }              (new list)
+     iterator.remove() inside while loop  (safe mutation via iterator)
+```
+
+**Pitfall 2:** groupBy (eager) when you need groupingBy (lazy):
+```
+groupBy { it.length }  → Map<K, List<V>> created immediately, ALL elements processed
+groupingBy { it.length }.eachCount()  → aggregates in one pass, no intermediate lists
+```
+
+**Pitfall 3:** Race condition on getOrPut:
+```
+if (!cache.contains(key)) cache[key] = compute()  ← gap between check and put!
+cache.getOrPut(key) { compute() }                  ← single call (still not thread-safe)
+ConcurrentHashMap.computeIfAbsent(key) { compute() }  ← truly thread-safe
+```
 
 ### `ConcurrentModificationException` — The Modification Flag
 
@@ -375,6 +483,27 @@ Access-order LinkedHashMap (LRU):
 Head (LRU / evict first) ──────────────────── Tail (MRU / keep last)
 [image3]  ← accessed longest ago    [image1]  ← accessed most recently
            [image2]
+```
+
+### Memory Trick
+
+```
+CME (ConcurrentModificationException):
+  ArrayList tracks mutations with a modCount counter.
+  Iterator captures modCount at creation.
+  Any mutation → modCount changes → iterator detects on next() → CME.
+  NEVER modify while iterating with a for loop.
+  Safe options: removeAll, filter (new list), or iterator.remove().
+
+getOrPut vs computeIfAbsent:
+  getOrPut      → single Kotlin function (NOT thread-safe)
+  computeIfAbsent → ConcurrentHashMap method (thread-safe, truly atomic)
+  In multithreaded code: use ConcurrentHashMap.computeIfAbsent.
+
+LinkedHashMap(accessOrder=true) = free LRU:
+  On every get(), moves the entry to the tail.
+  Override removeEldestEntry() to evict head when over capacity.
+  That's LRU in ~10 lines.
 ```
 
 ---

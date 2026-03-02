@@ -8,6 +8,37 @@ Testing is the skill that separates engineers who ship confidently from engineer
 
 ## Q18.1 — The Test Pyramid and What to Test Where
 
+### The Concrete Picture
+
+Starting state: A feature with UserViewModel → UserRepository → UserDao + UserApi. Where do you put tests?
+
+```
+COMPONENT MAP:
+  UserApi       (Retrofit interface)
+  UserDao       (Room DAO)
+  UserRepository(UserApi, UserDao)     ← depends on network + database
+  UserViewModel (UserRepository)       ← depends on repository only
+  UserScreen    (Composable)           ← depends on ViewModel state
+
+TEST PLACEMENT:
+  UserViewModel ──────────────────────► Unit test (JUnit + Mockk/Fake repo)
+    mock/fake UserRepository               runs on JVM, <1ms each
+    runTest + advanceUntilIdle()
+
+  UserRepository ─────────────────────► Integration test (MockWebServer + Room in-memory)
+    real Room DAO against in-memory DB     runs on JVM or Robolectric, ~100ms
+    real Retrofit against MockWebServer
+
+  UserDao ─────────────────────────────► Integration test (Room in-memory + Robolectric)
+    actual SQL queries verified            runs on JVM via Robolectric
+
+  UserScreen (Compose UI) ─────────────► UI test (createComposeRule)
+    pass UiState directly, verify nodes    runs on emulator/device or Robolectric
+
+RULE: Most code at the BOTTOM (unit tests): fast, cheap, many
+      Least code at the TOP (E2E/Espresso): slow, brittle, few
+```
+
 ### WHY: Not All Tests Are Equal
 
 ```
@@ -31,9 +62,64 @@ Testing is the skill that separates engineers who ship confidently from engineer
 | Integration | Room DAO, Retrofit with mock server, Hilt modules | Room in-memory, MockWebServer | PR build |
 | UI | User flows, navigation, Compose UI | Compose testing, Espresso | Nightly / before release |
 
+### Memory Trick
+
+```
+PYRAMID (bottom to top = fast to slow, many to few):
+  Unit        ──► JVM, <1ms, no Android framework, run on every commit
+  Integration ──► JVM/Robolectric, ~100ms, real DB/network, run on PR
+  UI/E2E      ──► device/emulator, ~minutes, run nightly or before release
+
+TOOL MAP:
+  ViewModel logic  → JUnit + Mockk/Fake + runTest
+  Room DAO queries → Room.inMemoryDatabaseBuilder + Robolectric
+  Retrofit calls   → MockWebServer (OkHttp)
+  Compose UI       → createComposeRule + semantic node finders
+  Full flows       → Espresso (avoid unless necessary)
+
+ANTI-PATTERN: testing everything through UI tests
+  = slow feedback, brittle (UI changes break tests), hard to debug
+```
+
 ---
 
 ## Q18.2 — Mocks vs Fakes — The Critical Distinction
+
+### The Concrete Picture
+
+Starting state: You have `UserRepository` interface. You need it in a ViewModel test. Two choices.
+
+```
+interface UserRepository {
+    suspend fun getUser(id: String): User
+    suspend fun saveUser(user: User)
+}
+
+MOCK approach:
+  val repo = mockk<UserRepository>()
+  every { repo.getUser("123") } returns User("123", "Alice")
+  │
+  ├── repo.getUser("123") ──► returns Alice  (hard-coded per call)
+  ├── repo.getUser("456") ──► NOT STUBBED → MissingStubException!
+  └── repo.saveUser(user) ──► NOT STUBBED → crash unless relaxed = true
+
+FAKE approach:
+  class FakeUserRepository : UserRepository {
+    private val users = mutableMapOf<String, User>()
+    override suspend fun getUser(id: String) = users[id] ?: throw NotFoundException(id)
+    override suspend fun saveUser(user: User) { users[user.id] = user }
+  }
+  │
+  ├── fakeRepo.saveUser(alice)    ──► stored in memory map
+  ├── fakeRepo.getUser("1")       ──► returns alice (real lookup)
+  └── test sequence: save then get ──► works because state persists
+
+WHEN MOCK beats FAKE:
+  Verify analytics call:
+    verify { analytics.track("purchase_complete", mapOf("sku" to "abc")) }
+  You WANT to assert a specific method was called with specific args
+  Fakes can't express "was this called?" without adding extra test-helper state
+```
 
 ### WHY: This Is a Senior Interview Question
 
@@ -90,9 +176,58 @@ verify { analyticsService.track("button_click") }
 verify { userRepository.getUser(any()) }  // ← this test is useless
 ```
 
+### Memory Trick
+
+```
+FAKE vs MOCK decision tree:
+  Does the component have internal state? ──► YES → Fake
+  Do multiple tests share different states? ──► YES → Fake
+  Are you testing a sequence (save then get)? ──► YES → Fake
+  Are you verifying a method WAS called (analytics)? ──► YES → Mock
+
+"verify() smell":
+  verify { repo.getUser(any()) }  ← proves nothing about ViewModel behavior
+  verify { analytics.track(...) }  ← legitimate (side effect verification)
+
+FAKE advantage:
+  FakeUserRepository stores real data → test can do: save("Alice") then get()
+  Mock can only return what you stub per-call → no shared state between calls
+
+RULE: prefer Fakes for collaborators with behavior
+      use Mocks only for side-effect verification
+```
+
 ---
 
 ## Q18.3 — Mockk: The Kotlin-First Mocking Library
+
+### The Concrete Picture
+
+Starting state: `UserRepository` is an interface. `UserViewModel` depends on it. You use Mockk.
+
+```
+MOCKK VOCABULARY:
+  mockk<T>()        ── creates a strict mock (all calls must be stubbed)
+  mockk<T>(relaxed=true) ── creates a relaxed mock (returns defaults, no stubs needed)
+  spyk(realObj)     ── wraps a real object (real methods run unless overridden)
+
+STUBBING (set up return values BEFORE the test action):
+  every { repo.getUserCount() } returns 42          ← non-suspend
+  coEvery { repo.getUser("123") } returns alice     ← suspend function
+  coEvery { repo.getUser("999") } throws NotFoundException("999")
+
+VERIFICATION (assert calls happened AFTER the test action):
+  coVerify { repo.saveUser(alice) }                 ← was this called?
+  coVerify(exactly = 1) { repo.saveUser(any()) }    ← called exactly once?
+  coVerify(exactly = 0) { repo.deleteUser(any()) }  ← never called
+
+FLOW:
+  coEvery { ... }  →  viewModel.doAction()  →  advanceUntilIdle()  →  coVerify / assertEquals
+
+SPY use case:
+  spyk(realRepo)  ──► calls real methods for all except:
+  coEvery { spyRepo.getUser("special") } returns mockUser  ← overrides one path
+```
 
 ### Basic Setup
 
@@ -174,9 +309,76 @@ val repo = mockk<UserRepository>(relaxed = true)
 // and don't want to stub everything else
 ```
 
+### Memory Trick
+
+```
+MOCKK FUNCTION NAME RULES:
+  Non-suspend:  every { }   /  verify { }
+  Suspend:      coEvery { } /  coVerify { }
+  ("co" prefix = coroutine = suspend)
+
+ARGUMENT MATCHERS:
+  any()            ← matches anything
+  match { it > 0 }← matches by predicate
+  "literal"        ← exact string match
+  capture(slot)    ← capture the argument into a CapturingSlot
+
+STRICT vs RELAXED:
+  mockk<T>()           → crash if unstubbed method called
+  mockk<T>(relaxed=true) → return 0/false/""/null for unstubbed calls
+
+VERIFY ORDER:
+  coVerifyOrder { first(); second() }     ← first MUST be called before second
+  coVerifySequence { first(); second() }  ← EXACTLY these calls in this order
+```
+
 ---
 
 ## Q18.4 — ViewModel Testing with Coroutines
+
+### The Concrete Picture
+
+Starting state: `UserViewModel` calls `viewModelScope.launch { repository.getUser(...) }`. Test runs on JVM.
+
+```
+PROBLEM ON JVM:
+  viewModelScope uses Dispatchers.Main → no Android Looper on JVM → crash/deadlock
+
+FIX — two-part setup:
+
+  PART 1: MainDispatcherRule (TestWatcher)
+    @get:Rule val mainDispatcherRule = MainDispatcherRule()
+    │
+    ├── starting(): Dispatchers.setMain(StandardTestDispatcher())
+    └── finished(): Dispatchers.resetMain()
+    Now all Dispatchers.Main calls → StandardTestDispatcher (JVM-safe, virtual clock)
+
+  PART 2: runTest + advanceUntilIdle
+    runTest {
+      // ARRANGE
+      coEvery { repository.getUser("123") } returns User("123", "Alice")
+
+      // ACT
+      viewModel.loadUser("123")          ← coroutine is QUEUED (not yet run)
+
+      advanceUntilIdle()                 ← drain queue: coroutine runs to completion
+
+      // ASSERT
+      assertEquals(
+        UserUiState.Success(User("123", "Alice")),
+        viewModel.uiState.value
+      )
+    }
+
+WITHOUT advanceUntilIdle():
+  viewModel.loadUser("123")
+  // coroutine is queued but hasn't executed
+  assertEquals(Success, ...)  ← FAILS: state is still Loading
+
+StandardTestDispatcher vs UnconfinedTestDispatcher:
+  Standard:    manual advancement → full control over timing
+  Unconfined:  eager execution → simpler, no advanceUntilIdle() needed
+```
 
 ### The Problem: Coroutines Need a Test Dispatcher
 
@@ -295,9 +497,68 @@ fun `stateFlow emits Loading then Success`() = runTest {
 }
 ```
 
+### Memory Trick
+
+```
+REQUIRED SETUP for ViewModel coroutine tests:
+  1. testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:x.x.x")
+  2. @get:Rule val mainDispatcherRule = MainDispatcherRule()
+  3. wrap test body in runTest { }
+  4. call advanceUntilIdle() after triggering the action
+
+MainDispatcherRule replaces Dispatchers.Main → allows coroutines to run on JVM
+runTest provides virtual clock (delay(5000) = instant, no real wait)
+advanceUntilIdle() = "run everything that's pending now"
+
+TIMING VARIANTS:
+  advanceUntilIdle()      ← drain all pending, regardless of delay
+  advanceTimeBy(1001)     ← advance virtual clock by 1001ms only
+  runCurrent()            ← run only coroutines ready NOW (no time advance)
+
+COLLECTING STATEFLOW EMISSIONS:
+  launch(UnconfinedTestDispatcher()) { viewModel.uiState.collect { states.add(it) } }
+  (Must use UnconfinedTestDispatcher on collector to get emissions eagerly)
+```
+
 ---
 
 ## Q18.5 — Flow Testing with Turbine
+
+### The Concrete Picture
+
+Starting state: `UserViewModel.uiState: StateFlow<UserUiState>`. You need to assert it emits Loading then Success.
+
+```
+WITHOUT Turbine (manual approach — fragile):
+  val states = mutableListOf<UserUiState>()
+  val job = launch(UnconfinedTestDispatcher()) { viewModel.uiState.collect { states.add(it) } }
+  viewModel.loadUser("123")
+  advanceUntilIdle()
+  job.cancel()
+  assertEquals(listOf(Loading, Success(alice)), states)
+  // Problems: easy to forget job.cancel(), easy to start collecting too late
+
+WITH Turbine:
+  viewModel.uiState.test {
+    val initial = awaitItem()               ← suspends until StateFlow emits (initial state)
+    assertEquals(UserUiState.Loading, initial)
+
+    viewModel.loadUser("123")
+    advanceUntilIdle()
+
+    val result = awaitItem()                ← suspends until next emission
+    assertEquals(UserUiState.Success(alice), result)
+
+    cancelAndIgnoreRemainingEvents()        ← stop listening, ignore any buffered events
+  }
+
+TURBINE test { } block:
+  → sets up a subscriber on the Flow
+  → each awaitItem() suspends until the Flow emits, then returns the value
+  → awaitComplete() asserts the Flow emitted a terminal event (onComplete)
+  → expectNoEvents() asserts nothing emitted (useful for "no state change" tests)
+  → Turbine enforces that you consume all emissions (fail-fast on unexpected emissions)
+```
 
 Turbine is a library that makes testing Flow emissions clean and readable.
 
@@ -354,9 +615,72 @@ fun `inserting user makes it observable in Flow`() = runTest {
 }
 ```
 
+### Memory Trick
+
+```
+TURBINE API — 5 key functions:
+  awaitItem()                      ← wait for next emission, return it
+  awaitComplete()                  ← assert Flow called onComplete
+  awaitError()                     ← assert Flow threw an exception
+  expectNoEvents()                 ← assert nothing emitted right now
+  cancelAndIgnoreRemainingEvents() ← stop test, discard buffered events
+
+TURBINE vs manual mutableList approach:
+  Manual: easy to forget job.cancel(), race between collect start and emit
+  Turbine: structured, no races, enforces consuming events (unexpected = test fail)
+
+STATEFLOW quirk with Turbine:
+  StateFlow always has an initial value → awaitItem() returns initial state first
+  So tests often: awaitItem() for initial, trigger action, awaitItem() for updated
+
+Room DAO + Turbine:
+  dao.observeUsers().test {
+    assertEquals(emptyList(), awaitItem())  ← initial Room emission
+    dao.insert(user)
+    assertEquals(listOf(user), awaitItem())  ← Room emits updated list
+  }
+```
+
 ---
 
 ## Q18.6 — Room DAO Testing
+
+### The Concrete Picture
+
+Starting state: `UserDao` with `insert(user)` and `getUser(id): User?`. You need to verify the SQL query is correct.
+
+```
+REAL DATABASE (production):
+  AppDatabase → SQLite file on disk → persists across runs
+  Cannot use in tests: slow, side effects between tests, requires Android context
+
+IN-MEMORY DATABASE (test):
+  Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java).build()
+  → No file on disk
+  → Auto-cleared when db.close() is called (or process ends)
+  → Fast (no I/O wait)
+  → Requires real Room SQL engine → catches actual query bugs
+
+TEST SETUP PATTERN:
+  @Before fun setup() {
+    db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+             .allowMainThreadQueries()  ← disable main-thread check for tests only
+             .build()
+    dao = db.userDao()
+  }
+  @After fun teardown() { db.close() }  ← releases in-memory DB, clears data
+
+  @Test fun insertAndGet() = runTest {
+    val alice = User("1", "Alice")
+    dao.insert(alice)           ──► written to in-memory SQLite
+    val result = dao.getUser("1")  ──► real SQL SELECT executed
+    assertEquals(alice, result) ──► verifies query correctness
+  }
+
+WHY NOT mock the DAO?:
+  Mocking dao.getUser("1") returns alice → tests nothing about SQL correctness
+  In-memory DB tests the actual @Query annotation SQL → catches typos, wrong columns
+```
 
 ### Use an In-Memory Database
 
@@ -401,9 +725,72 @@ class UserDaoTest {
 }
 ```
 
+### Memory Trick
+
+```
+IN-MEMORY DB pattern (4 required pieces):
+  1. Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java).build()
+  2. .allowMainThreadQueries() ← TESTS ONLY, never production
+  3. @After db.close()         ← clears DB between tests
+  4. @RunWith(AndroidJUnit4::class) or Robolectric for Context
+
+REAL SQL TESTED = in-memory Room runs SQLite engine
+  → catches @Query typos, missing columns, wrong JOIN conditions
+  → mocking DAO skips all of this (tests nothing about SQL)
+
+FLOW DAO + Turbine:
+  dao.observeUsers() returns Flow<List<User>>
+  Room emits on every DB change → test with Turbine:
+    awaitItem() for empty → insert → awaitItem() for updated list
+
+allowMainThreadQueries() explanation:
+  Room normally throws exception on main-thread queries (prevents ANR)
+  In tests: no real main thread, synchronous is fine → allow it
+```
+
 ---
 
 ## Q18.7 — Hilt in Tests
+
+### The Concrete Picture
+
+Starting state: `NetworkModule` provides `UserApi` (real Retrofit). In tests, you want `FakeUserApi` instead.
+
+```
+PRODUCTION DI graph:
+  NetworkModule ──provides──► UserApi (real Retrofit → hits network)
+                                  │
+                              UserRepository ──► UserViewModel
+
+TEST DI graph (swap NetworkModule out):
+  FakeNetworkModule ──provides──► FakeUserApi (in-memory, deterministic)
+                                       │
+                                   UserRepository ──► UserViewModel
+
+MECHANISM — @TestInstallIn:
+  @TestInstallIn(
+    components = [SingletonComponent::class],
+    replaces = [NetworkModule::class]    ← tells Hilt: during tests, use THIS instead
+  )
+  @Module
+  object FakeNetworkModule {
+    @Provides fun provideUserApi(): UserApi = FakeUserApi()
+  }
+
+TEST SETUP — @HiltAndroidTest:
+  @HiltAndroidTest                        ← enables Hilt injection in this test
+  class UserViewModelTest {
+    @get:Rule(order = 0) val hiltRule = HiltAndroidRule(this)
+    @get:Rule(order = 1) val mainDispatcherRule = MainDispatcherRule()
+
+    @Inject lateinit var repository: UserRepository  ← Hilt injects FakeUserApi version
+
+    @Before fun setup() { hiltRule.inject() }  ← triggers actual injection
+  }
+
+ORDERING: HiltAndroidRule (order=0) must run BEFORE MainDispatcherRule (order=1)
+  because Hilt sets up the component graph that MainDispatcherRule might depend on
+```
 
 ### Replace Real Dependencies with Test Doubles
 
@@ -444,6 +831,30 @@ class UserViewModelTest {
         viewModel = UserViewModel(repository)
     }
 }
+```
+
+### Memory Trick
+
+```
+HILT TEST ANNOTATION MAP:
+  @HiltAndroidTest       ← marks test class as Hilt-enabled
+  HiltAndroidRule        ← JUnit rule that builds the component graph
+  @TestInstallIn(components=[...], replaces=[RealModule::class]) ← swap module
+  @Inject                ← inject test double from Hilt component graph
+  hiltRule.inject()      ← must call in @Before to trigger injection
+
+KEY DISTINCTION:
+  @TestInstallIn replaces entire module → all provides in that module are replaced
+  Want to replace only ONE binding? → use @BindValue in test class
+
+RULE ORDER matters:
+  HiltAndroidRule(order=0) must be FIRST → builds the graph
+  Other rules (order=1, order=2) can use the built graph
+
+ALTERNATIVE without Hilt:
+  Just construct ViewModel manually with fakes:
+    val viewModel = UserViewModel(FakeUserRepository())
+  Hilt in tests is only needed if ViewModel is also injected via Hilt
 ```
 
 ---

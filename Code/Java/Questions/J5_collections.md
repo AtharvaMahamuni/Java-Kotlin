@@ -8,6 +8,28 @@ Java's collections framework is where data structures theory meets JVM implement
 
 > **Connects to:** [J5.2 — HashMap Internals](J5_collections.md#j52--hashmap-internals) · [J5.4 — Concurrent Collections](J5_collections.md#j54--concurrent-collections)
 
+### The Concrete Picture
+
+Two data structures, both holding `["a", "b", "c", "d"]`:
+
+```
+ArrayList (contiguous memory):
+index:  [0]    [1]    [2]    [3]   [null][null]...
+value: "a"    "b"    "c"    "d"   <- one Object[] array, 4-byte refs side-by-side
+
+LinkedList (scattered heap nodes):
+[head] ──► Node("a",next=►) ──► Node("b",next=►) ──► Node("c",next=►) ──► Node("d",next=null)
+                                    ^ different heap page each time
+
+insert at index 1:
+  ArrayList: shift "b","c","d" right via System.arraycopy ──► O(n) but SIMD-fast
+  LinkedList: walk 1 step to find node ──► O(1) insert... but O(n) walk is cache-miss hell
+
+iterate all elements:
+  ArrayList: CPU loads cache line 64 bytes → gets ~16 refs for free → nearly 0 misses
+  LinkedList: each node.next is a new heap address → near-100% L1 cache miss rate
+```
+
 ### WHY This Comparison Matters
 
 The ArrayList vs LinkedList debate is one of the most frequently asked interview questions, and the textbook answer ("LinkedList for frequent middle insertions, ArrayList for random access") is wrong in practice. Understanding why requires going below the API surface to the memory layout of each structure and how modern CPU caches interact with them.
@@ -145,11 +167,49 @@ This advice appears in outdated textbooks and is wrong in practice. The correct 
 - **Queue/Deque operations:** `ArrayDeque` — O(1) head/tail access, cache-friendly, no per-element object overhead.
 - **LinkedList's actual use case:** when you hold an `Iterator` positioned at the insertion point and want true O(1) insertion without re-traversal. This is rare and only relevant with the `ListIterator.add()` method.
 
+### Memory Trick
+
+```
+ARRAY = Adjacent in RAM = Cache loves it = Always faster to iterate
+LINKED = Leaps across heap = Cache misses = Slow even for "O(1)" inserts
+ArrayList.add(mid): arraycopy is SIMD-vectorised → beats LinkedList's walk
+Default pick: ArrayList for list, ArrayDeque for queue/stack
+LinkedList wins ONLY: ListIterator positioned at insertion point (rare)
+Memory: ArrayList = 4 bytes/ref; LinkedList = ~32 bytes/node (3 refs + header)
+```
+
 ---
 
 ## J5.2 — HashMap Internals
 
 > **Connects to:** [J5.3 — TreeMap & LinkedHashMap](J5_collections.md#j53--treemap--linkedhashmap) · [J5.4 — Concurrent Collections](J5_collections.md#j54--concurrent-collections)
+
+### The Concrete Picture
+
+Start: `map.put("alice", 30)` on a fresh HashMap (capacity 16):
+
+```
+Step 1: hash("alice")
+  "alice".hashCode()  ──► some int h
+  spread: h ^ (h >>> 16)  ──► spreadHash
+
+Step 2: bucket index
+  index = spreadHash & 15  ──► e.g. index = 4
+
+Step 3: table[4] state?
+  table[4] == null  ──► insert directly as new Node("alice", 30)
+
+Step 4: map.put("charlie", 22) also hashes to bucket 4 (collision):
+  table[4] != null  ──► walk chain
+  chain length < 8  ──► append Node("charlie", 22) as linked list node
+
+  table[4] ──► Node("alice",30,next=►) ──► Node("charlie",22,next=null)
+
+Step 5: chain length reaches 8  ──► treeifyBin:
+  linked list  ──►  Red-Black tree (O(n) → O(log n) worst-case lookup)
+
+Step 6: size > 16 * 0.75 = 12  ──► resize: newCap = 32, rehash all entries
+```
 
 ### WHY HashMap Internals Matter
 
@@ -354,12 +414,51 @@ The correct answer:
 
 Saying "O(1)" without qualification is technically wrong. Interviewers who know HashMap internals will push back.
 
+### Memory Trick
+
+```
+BUCKET = (n-1) & spreadHash  ← bitwise AND because n is always power-of-2
+SPREAD = h ^ (h >>> 16)      ← XOR high bits into low bits for better distribution
+COLLISION → linked chain → treeify at 8 nodes → O(n) turns O(log n)
+RESIZE at size > capacity * 0.75  ── doubles capacity, rehashes all
+hashCode/equals MUST be consistent: same equals → same bucket, always
+MUTABLE KEY bug: key.hashCode() changes → entry stuck in wrong bucket
+null key → always bucket 0 (special-cased in put/get)
+get() complexity: O(1) avg, O(log n) worst (Java 8+), O(n) worst (pre-Java 8)
+```
+
 ---
 
 ## J5.3 — TreeMap & LinkedHashMap
 
 > **Builds on:** [J5.2 — HashMap Internals](J5_collections.md#j52--hashmap-internals)
 > **Connects to:** [J5.4 — Concurrent Collections](J5_collections.md#j54--concurrent-collections)
+
+### The Concrete Picture
+
+Two maps both storing `{3="c", 1="a", 5="e", 7="g"}`:
+
+```
+TreeMap (Red-Black tree, sorted by key):
+           5 (BLACK)
+          / \
+        3     7
+       /
+      1
+  → iteration always: 1, 3, 5, 7  (sorted)
+  → floorKey(4)  ──► 3   (greatest key <= 4)
+  → subMap(2, 6) ──► {3="c", 5="e"}  (live view)
+
+LinkedHashMap (HashMap + doubly-linked insertion-order list):
+  bucket array: O(1) get/put  (same as HashMap)
+  linked list:  header ↔ Entry(1) ↔ Entry(3) ↔ Entry(5) ↔ Entry(7) ↔ header
+  → iteration always in insertion order
+
+LinkedHashMap accessOrder=true:
+  after get(3):  header ↔ Entry(1) ↔ Entry(5) ↔ Entry(7) ↔ Entry(3) ↔ header
+  → Entry(3) moved to tail (most recently accessed)
+  → LRU cache: head = eldest (evict first)
+```
 
 ### WHY Ordered Maps Exist
 
@@ -558,11 +657,49 @@ System.out.println(map.get("APPLE"));   // 2
 
 The fix: ensure your comparator's notion of equality matches your objects' `equals()` method. If the comparator must differ from `equals()` (e.g., case-insensitive ordering for case-sensitive keys), document this explicitly and be aware that TreeMap's "duplicates" behavior may surprise you.
 
+### Memory Trick
+
+```
+TreeMap  = Red-Black tree = O(log n) all ops = sorted keys = range queries
+LinkedHashMap = HashMap + doubly-linked list = O(1) ops + ordered iteration
+accessOrder=true → get() moves entry to tail → head = LRU (evict first)
+LRU cache = LinkedHashMap(cap, 0.75f, true) + override removeEldestEntry
+TreeMap null key → NPE (compareTo(null) throws)
+Comparator returns 0 → same key in TreeMap regardless of equals()
+IdentityHashMap: uses == and identityHashCode (not equals/hashCode)
+WeakHashMap: key held weakly → entry disappears when key is GC'd
+```
+
 ---
 
 ## J5.4 — Concurrent Collections
 
 > **Builds on:** [J5.2 — HashMap Internals](J5_collections.md#j52--hashmap-internals) · [J5.3 — TreeMap & LinkedHashMap](J5_collections.md#j53--treemap--linkedhashmap)
+
+### The Concrete Picture
+
+Two threads writing to a map simultaneously:
+
+```
+synchronizedMap:                          ConcurrentHashMap (Java 8):
+
+Thread1: put("a", 1) ──► acquires        Thread1: put("a", 1)
+                          GLOBAL lock     ├── hash("a") ──► bucket 4
+Thread2: get("b")    ──► BLOCKED          └── table[4]==null?
+                          (waits for           YES → CAS(table[4], null, Node("a",1))
+                           Thread1)            ← no lock acquired at all!
+
+Thread2: put("z", 9)                    Thread2: put("z", 9)
+         (different key)                ├── hash("z") ──► bucket 11 (different bucket)
+         STILL BLOCKED on global lock   └── table[11]==null?
+                                             YES → CAS(table[11], null, Node("z",9))
+                                             ← runs CONCURRENTLY with Thread1
+
+Compound op race:                        Use atomic compound op instead:
+  if (!map.containsKey("k"))   ← check   map.computeIfAbsent("k", k -> compute(k))
+    map.put("k", compute("k")) ← act      ← single synchronized bucket op, atomic
+  Thread2 can insert between check+act
+```
 
 ### WHY Concurrent Collections
 
@@ -749,6 +886,20 @@ map.compute("count", (k, v) -> v == null ? 1 : v + 1);
 ```
 
 The rule: use `computeIfAbsent`, `compute`, `merge`, `putIfAbsent`, and `replace(key, old, new)` for all check-then-act patterns. Never split what should be one atomic operation into separate `get()` + `put()` calls.
+
+### Memory Trick
+
+```
+ConcurrentHashMap: empty bucket → CAS (no lock); collision → lock ONE bucket head
+No null keys/values: null return from get() unambiguously means "absent"
+size() is approximate (LongAdder-based); use mappingCount() for large maps
+ATOMIC ops: computeIfAbsent, compute, merge, putIfAbsent, replace(k,old,new)
+NOT atomic: containsKey+put, get+put → always use the single atomic method
+CopyOnWriteArrayList: every write copies entire array → O(n) per write
+  Use for: listener lists (rare writes, many reads)
+BlockingQueue: put() blocks on full; take() blocks on empty
+SynchronousQueue: zero capacity, put() blocks until take() matches (rendezvous)
+```
 
 ---
 
