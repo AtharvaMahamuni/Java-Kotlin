@@ -1398,5 +1398,4 @@ ViewModel survives rotation (NonConfigurationInstances)
 
 ---
 
-*Previous: [09_coroutines_execution_mechanics.md](./09_coroutines_execution_mechanics.md)*
-*Next: Phase 11 — Flow (cold vs hot, operators, StateFlow vs SharedFlow, lifecycle collection)*
+*← [Phase 9 — Coroutines](09_coroutines_execution_mechanics.md) | [Phase 11 — Flow →](11_flow.md)*

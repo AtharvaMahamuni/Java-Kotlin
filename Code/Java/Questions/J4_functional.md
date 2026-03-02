@@ -669,7 +669,7 @@ Parallel streams are faster when ALL of the following are true:
 - **CPU-bound work**: heavy computation per element (prime checking, encryption, parsing).
 - **Splittable source**: arrays, `ArrayList`, `IntStream.range()` split perfectly. `LinkedList` splits poorly (no random access). `Stream.iterate()` cannot split at all.
 - **No ordering dependency**: `findAny()` is faster in parallel than `findFirst()` (which requires imposing order after parallel execution).
-- **Stateless operations**: `filter` and `map` are stateless (each element processed independently). `sorted()`, `distinct()`, and `limit()` are stateful — they require coordination across all threads and often negate parallel gains.
+- **Stateless operations**: `filter` and `map` are stateless (each element processed independently). `sorted()` and `distinct()` are stateful — they require full-stream coordination across all threads and often negate parallel gains. `limit()` is different: it is a short-circuit operation that allows threads to stop early once *n* elements are collected, and does NOT require full materialisation.
 
 ### When Parallel Streams Are Slower
 

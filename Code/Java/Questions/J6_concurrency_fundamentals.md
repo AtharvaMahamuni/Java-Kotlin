@@ -340,10 +340,14 @@ Mark Word (64-bit JVM):
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-The JVM implements a three-tier locking strategy that escalates from cheap to expensive based on contention:
+The JVM implements a locking strategy that escalates from cheap to expensive based on contention. The exact tiers depend on JVM version:
+
+> **Version note:** Biased locking was deprecated in Java 15 (JEP 374) and **fully removed in Java 21**. On Java 21+, the monitor starts in thin (stack-lock / CAS) state directly — there is no biased lock tier.
+
+**Pre-Java 21 (three-tier):**
 
 ```
-  Biased Lock (cheapest)
+  Biased Lock (cheapest) — REMOVED in Java 21
   ─────────────────────
   Object "biased" toward first thread that locks it.
   Re-acquisition by same thread = just check thread ID in mark word.
@@ -374,7 +378,22 @@ The JVM implements a three-tier locking strategy that escalates from cheap to ex
   Trigger: high contention or wait() called.
 ```
 
-Lock inflation is one-way for fat locks: once a lock inflates to fat, it stays fat for the object's lifetime (it can never go back to thin or biased). Biased lock revocation is expensive (it requires stopping the world briefly) — which is one reason biased locking was deprecated in Java 15 and removed in Java 21 (modern hardware's CAS is cheap enough that biased locking's benefit is marginal).
+**Java 21+ (two-tier — biased locking removed):**
+
+```
+  Thin Lock (stack-lock / CAS) — starting state
+  ───────────────────────────────────────────────
+  CAS to write thread ID into mark word on first acquisition.
+  No biased lock phase. Modern hardware's CAS is cheap enough
+  that biased locking's revocation cost outweighs its benefit.
+
+         │ contention too high
+         ▼
+
+  Fat Lock / Inflated (OS mutex)
+```
+
+Lock inflation is one-way for fat locks: once a lock inflates to fat, it stays fat for the object's lifetime. Biased lock revocation was expensive (it required stopping the world briefly) — the primary reason biased locking was removed in Java 21.
 
 ### Reentrancy
 
@@ -521,6 +540,46 @@ The JMM uses the "happens-before" (hb) relationship to define visibility. If act
    If A hb B and B hb C, then A hb C.
    (Chains of hb relationships extend visibility.)
 ```
+
+**Happens-before as a directed graph:**
+
+Each edge below means "all writes before this point are visible after this point."
+
+```
+   THREAD A                          THREAD B
+   ────────                          ────────
+   write x = 1        ─────────────────────────────────────────────────────────
+   write y = 2             hb via                 hb via              hb via
+                           monitor unlock         volatile write       Thread.start()
+   synchronized(lock) {                                   │                 │
+     unlock  ─────────────────►  lock  ──────────────────┤                 │
+   }                          (Thread B)                  │                 │
+                                                          │                 │
+   volatile flag = true ──────────────────────────────────►  read flag      │
+                                                             sees x=1, y=2  │
+                                                                             │
+   Thread.start(T)  ──────────────────────────────────────────────────────► │
+   (all A's writes                                                           │ first action
+    before start)                                                            ▼ in T sees them
+```
+
+**Transitivity example — the publication idiom:**
+
+```
+  Thread A (publisher):                       Thread B (reader):
+
+  object.field = value;  ──►(prog. order hb)──► volatile flag = true
+                                                        │
+                                                        │ (volatile write hb volatile read)
+                                                        ▼
+                                                  read volatile flag
+                                                        │
+                                                        │ (prog. order hb)
+                                                        ▼
+                                                  read object.field → sees value
+```
+
+By transitivity: `write object.field` hb `write flag` hb `read flag` hb `read object.field`. Thread B is guaranteed to see the correct value — WITHOUT making `object.field` itself volatile.
 
 Without any of these relationships, there is no guarantee of visibility. A thread reading a plain field written by another thread may see stale data indefinitely.
 

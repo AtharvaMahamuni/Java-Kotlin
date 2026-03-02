@@ -505,6 +505,32 @@ The class is `final` (cannot be subclassed), extends `Enum<Color>` (so it cannot
 
 ---
 
+### Why Must Enum Constructors Be Private?
+
+The constraint "enum constructors are always private" exists to enforce the **singleton guarantee** for each constant.
+
+The invariant: for any enum constant, there is **exactly one instance** of that constant in the JVM, forever. Every reference to `Color.RED` points to the same object. This is a stronger guarantee than any regular singleton — the compiler and JVM both enforce it.
+
+If the constructor were not private, you could write:
+
+```java
+// Hypothetical — does NOT compile because enum constructors are private
+Color red2 = new Color("RED", 0);
+
+// Now: Color.RED == red2   → false
+// Same name, same ordinal, different object identity
+```
+
+This breaks:
+1. **Identity equality** — `Color.RED == someColor` would no longer reliably test "is this the RED constant?"
+2. **switch statements** — Java switch on enums uses identity comparison under the hood. A second `RED` instance would fall through every case.
+3. **`EnumSet` / `EnumMap`** — These use the ordinal as a bit-index. Two `RED` instances with `ordinal = 0` would both map to bit 0, corrupting the set.
+4. **Serialization** — Java's enum serialization is special: deserializing an enum reads the `name` field and calls `Enum.valueOf()` to return the existing singleton. If you could construct enums freely, deserialization would return a NEW object, breaking identity (`readObject()` is even disabled for enums).
+
+The private constructor, combined with `final class` and JVM-level special handling of enum serialization, makes each constant a true singleton — not just by convention, but by language enforcement.
+
+---
+
 ### `values()` Clones the Array Every Call
 
 This is a subtle performance trap. Every call to `Color.values()` creates a new array:
@@ -1133,3 +1159,10 @@ Open Hierarchy (before sealed):           Sealed Hierarchy:
 ---
 
 *← [Phase J1 — Type System](J1_type_system.md) | [Phase J3 — Generics →](J3_generics.md)*
+
+---
+
+**Cross-references:**
+- Records (J2.4) vs Kotlin data classes — same concept, different syntax: [Kotlin 02 — Classes & Objects](../../Kotlin/Questions/02_classes_and_objects.md)
+- Sealed classes (J2.5) — Kotlin's sealed classes are more powerful (subclasses not restricted to same file in Kotlin 1.5+): [Kotlin 02 — sealed class](../../Kotlin/Questions/02_classes_and_objects.md)
+- Sealed classes + exhaustive switch expressions (Java 21): [J9.2 — Pattern Matching](J9_modern_java.md)

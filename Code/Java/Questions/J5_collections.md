@@ -347,10 +347,10 @@ HashMap allows exactly one `null` key. The `hash(null)` function returns 0, so n
 
 ### Interview Trap: Time Complexity of get()
 
-The correct answer is:
+The correct answer:
 - **O(1) average case** — assuming a good hash function and low collision rate
-- **O(log n) worst case** — with Java 8 treeification, when all keys hash to one bucket
-- **O(n) worst case** — before Java 8, or when treeification hasn't triggered yet (< 8 collisions in a bucket)
+- **O(log n) worst case (Java 8+)** — treeification kicks in at 8 collisions in one bucket; the Red-Black tree bounds lookup to O(log n)
+- **O(n) worst case (pre-Java 8)** — linked-list chains with no treeification; a fully crafted hash-collision attack degrades all lookups
 
 Saying "O(1)" without qualification is technically wrong. Interviewers who know HashMap internals will push back.
 

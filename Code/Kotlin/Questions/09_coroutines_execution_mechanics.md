@@ -233,6 +233,57 @@ The `COROUTINE_SUSPENDED` return value is the signal: "do not call me again dire
 
 ---
 
+### How Exceptions Propagate Through Suspensions
+
+This is the mechanism behind the fact that `try/catch` works across suspension points — which seems magical until you see how it works.
+
+**The happy path** shown above has `fetchUser()` calling `sm.resumeWith(Result.success(user))`. The failure path is symmetric: `sm.resumeWith(Result.failure(exception))`.
+
+Here is what happens when an async operation fails:
+
+```
+1. fetchUser() call fails internally (e.g., IOException from network)
+
+2. Inside fetchUser's state machine:
+   sm.completion.resumeWith(Result.failure(IOException("timeout")))
+      │
+      └─► This sets the CALLER's sm.result = Result.failure(IOException)
+          then calls sm.invokeSuspend(sm.result)
+
+3. The caller (loadData) re-enters at label = 1:
+   1 -> {
+       ResultKt.throwOnFailure(sm.result)   // ← sm.result is Failure here
+       // throwOnFailure inspects the Result:
+       //   if Success → does nothing
+       //   if Failure → throws the wrapped exception
+       //               → throws IOException here, in the caller's try/catch scope
+   }
+```
+
+The critical insight: **`ResultKt.throwOnFailure(sm.result)` is the re-throw point.** Every label in the state machine starts with this call. When a suspended function fails, it resumes the caller with a `Result.failure(...)` — the caller's state machine re-enters at the correct label, and `throwOnFailure` immediately re-throws the exception as if it had been thrown at the original `fetchUser()` call site.
+
+This is why `try/catch` works across suspension points:
+
+```kotlin
+suspend fun loadData(): String {
+    return try {
+        val user = fetchUser()   // suspends here — if fetchUser fails,
+                                 // the exception is re-thrown HERE after resume
+        val data = fetchData(user)
+        data
+    } catch (e: IOException) {
+        "fallback"               // catches exceptions thrown at either suspension point
+    }
+}
+```
+
+The compiler wraps the entire `try` block's span in the state machine, and any `Result.failure(...)` that arrives during that span is thrown — and therefore caught — by your `catch`.
+
+> **Interview Q:** "Can you catch exceptions from suspended functions with a normal try/catch?"
+> Yes. The CPS transformation preserves try/catch semantics by re-throwing failures at the original call site inside the state machine. This is one of coroutines' key advantages over callbacks, where exception handling requires per-callback error handling.
+
+---
+
 ### Why Does `suspend` Say NOTHING About Which Thread a Function Runs On?
 
 `suspend` is purely a **compile-time annotation** about the function's calling convention. It means:
@@ -870,7 +921,9 @@ launch returns Job immediately
 - [Q10.3](10_structured_concurrency.md#q103--exception-handling-rules): Exception handling rules — why `CoroutineExceptionHandler` root-only, `CancellationException` rules
 - [Q11.1](11_flow.md#q111--cold-vs-hot-streams): Flow — how `Flow` uses `suspend` and the CPS model for reactive streams
 - [Q17.4](17_performance_and_memory.md#q174--testing): Testing — `StandardTestDispatcher`, `UnconfinedTestDispatcher`, `runTest`
+- [J6.3 — wait/notify](../../Java/Questions/J6_concurrency_fundamentals.md): The JVM primitive that coroutines abstract over — `suspend` replaces `wait()`, Dispatcher replaces thread pool management
+- [J9.3 — Virtual Threads](../../Java/Questions/J9_modern_java.md): Java's answer to the same I/O-blocking problem coroutines solve — understand the contrast before interviews
 
 ---
 
-*Next: [10_structured_concurrency.md](./10_structured_concurrency.md) — Job hierarchy, `coroutineScope` vs `supervisorScope`, exception handling rules, lifecycle scopes, and `select`.*
+*← [Phase 8 — Other Kotlin Features](08_other_kotlin_features.md) | [Phase 10 — Structured Concurrency →](10_structured_concurrency.md)*

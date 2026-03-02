@@ -63,7 +63,7 @@ HEAP
 └──────────────────────────────────────────┘
 ```
 
-`int x` costs 4 bytes, period. `Integer y` costs 4 bytes for the reference on the stack plus 16 bytes on the heap for the object — a 4× memory overhead just to store the same number. On a 64-bit JVM with compressed ordinary object pointers (compressed oops, enabled by default with `-XX:+UseCompressedOops`), the class pointer is compressed to 4 bytes, which is why the header totals 12 bytes (8-byte mark word + 4-byte class pointer). The `int` field then adds 4 bytes, giving 16 bytes total (JVM aligns objects to 8-byte boundaries).
+`int x` costs 4 bytes, period. `Integer y` costs 4 bytes for the reference on the stack plus 16 bytes on the heap for the object — a 4× memory overhead just to store the same number. On a 64-bit JVM with compressed ordinary object pointers (compressed oops, which are **enabled by default** on 64-bit JVMs — you'd need `-XX:-UseCompressedOops` to disable them), the class pointer is compressed to 4 bytes, which is why the header totals 12 bytes (8-byte mark word + 4-byte class pointer). The `int` field then adds 4 bytes, giving 16 bytes total (JVM aligns objects to 8-byte boundaries).
 
 ### JVM Object Header Detail
 
@@ -649,6 +649,53 @@ This allows the JDK to choose the optimal concatenation strategy per use site, w
 Both `INVOKEVIRTUAL` and `INVOKEINTERFACE` are subject to JIT devirtualization — if the JIT can prove that a call site always dispatches to the same concrete type (monomorphic call site), it replaces the dispatch with a direct call (inline or direct jump). This eliminates the table lookup entirely.
 
 The theoretical slowness of `INVOKEINTERFACE` is rarely significant in practice because of this optimization. However, if a call site is polymorphic (two types) or megamorphic (three or more types), the JIT falls back to the table lookup, and `INVOKEINTERFACE` is genuinely slightly slower due to the itable search.
+
+### JIT Speculative Inlining and Deoptimization
+
+This is the mechanism that makes call-site polymorphism a real performance concern — not just a theoretical one.
+
+**Phase 1 — Monomorphic inlining:**
+When a call site has only ever seen one concrete type, the JIT speculatively inlines the method body directly at the call site, as if you had written the code inline. No vtable lookup, no indirect call — just a direct register-to-register sequence.
+
+```
+// Source:
+renderer.draw(shape);   // shape is always Circle at this call site
+
+// JIT compiles to (roughly):
+// No virtual dispatch — inlined directly:
+// [draw_circle_asm_code here]
+```
+
+**Phase 2 — Type check guard:**
+The JIT inserts a cheap type guard before the inlined code: "if the receiver is still a `Circle`, execute the inlined code. Otherwise, jump to the *uncommon trap*."
+
+```
+if (shape.class != Circle.class) goto uncommon_trap;
+// inlined Circle.draw() code:
+...
+```
+
+The guard costs ~1 cycle — essentially free on a well-predicted branch.
+
+**Phase 3 — Deoptimization trigger:**
+The first time a `Rectangle` arrives at this call site, the guard fails. The JVM enters the **uncommon trap**: the currently executing frame is unwound, native compiled code is discarded for this method, and execution falls back to the interpreter.
+
+**Phase 4 — Re-compilation:**
+After enough interpreter cycles, the JIT recompiles the method. Now it emits a bimorphic inline cache (two type guards, two inlined paths). If a third type appears, the cache overflows and becomes megamorphic — the JIT gives up on inlining and reverts to a plain vtable/itable lookup.
+
+```
+Call site states:
+  UNINITIALIZED  →  MONOMORPHIC (1 type, inlined, fast)
+                 →  BIMORPHIC   (2 types, two guards, still fast)
+                 →  MEGAMORPHIC (3+ types, table lookup, no inlining)
+```
+
+**Why this matters for interviews:**
+> "Why does adding a second implementation of an interface slow down my hot path?"
+> Because the call site transitions from monomorphic → bimorphic, the JIT must deoptimize, discard the compiled code, and recompile with two type guards. During that window the method runs interpreted. In microbenchmarks this shows up as a sudden spike in latency when the second type first appears.
+
+> "I introduced a logging proxy that wraps my service. Performance dropped 30%. Why?"
+> The proxy introduces a second concrete type at every call site that previously saw only the real implementation — all those sites become bimorphic and lose their inlined fast paths.
 
 ---
 

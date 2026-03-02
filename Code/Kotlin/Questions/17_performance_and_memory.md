@@ -607,4 +607,11 @@ This is the only way to test:
 
 ---
 
-*← [Phase 16 — Android System Internals](16_android_system_internals.md) | [Master Chains →](master_chains.md)*
+*← [Phase 16 — Android System Internals](16_android_system_internals.md) | [Phase 18 — Testing →](18_testing.md)*
+
+---
+
+**Cross-references:**
+- JVM memory leak patterns (static collections, ThreadLocal) — Java perspective: [J8.4 — Memory Leaks & Profiling](../../Java/Questions/J8_gc_and_jvm_tuning.md)
+- GC algorithms and heap tuning (G1GC, ZGC, JVM flags): [J8 — GC & JVM Tuning](../../Java/Questions/J8_gc_and_jvm_tuning.md)
+- Android offline data layer and Room performance: [A4 — Offline & Data Layer](../../Android/Questions/A4_offline_and_data.md)
