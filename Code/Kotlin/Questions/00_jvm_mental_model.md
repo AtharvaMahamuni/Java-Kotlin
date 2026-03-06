@@ -4,9 +4,6 @@
 
 It preserves your structure and **adds the missing definitions + tricky interview insights**.
 
----
-
-```markdown
 # Phase 0: JVM Mental Model
 
 > The JVM has exactly **two worlds: primitives and objects**.  
@@ -856,6 +853,4 @@ Kotlin features exist to **bridge these worlds**.
 3. What triggers class initialization?
 4. Why are interface calls slower than virtual calls?
 5. Why is JVM stack-based instead of register-based?
-
-```
 
