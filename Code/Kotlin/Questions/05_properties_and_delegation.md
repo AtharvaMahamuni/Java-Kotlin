@@ -1,151 +1,105 @@
-# Phase 5: Properties and Delegation
+# Phase 5 — Properties and Delegation
+
+> A Kotlin property is not a field — it's a getter/setter pair with an optional backing field. `lateinit`, `lazy`, and `by` are all different answers to the same question: *when should initialisation happen?*
 
 ## Navigation
-[← Master Index](master_chains.md)
+
+[← Phase 4 — Functions and Lambdas](04_functions_lambdas_inlining.md) | [→ Phase 6 — Extension Functions](06_extension_functions.md)
 
 ## Questions in This File
+
 - [Q5.1 — `lateinit` Internals](#q51--lateinit-internals)
 - [Q5.2 — `lazy` Internals](#q52--lazy-internals)
-- [Q5.3 — Delegates](#q53--delegates)
+- [Q5.3 — Property Delegates](#q53--property-delegates)
 
 ---
 
-## Q5.1 — `lateinit` Internals
+# Q5.1 — `lateinit` Internals
 
-> **Builds on:** [Q0.1 — primitives vs references](00_jvm_mental_model.md#q01--primitives-vs-references) · [Q1.2 — nullability](01_type_system_foundations.md#q12--nullability-at-the-type-level)
-> **Reference:** [Kotlin Docs — Late-initialized properties](https://kotlinlang.org/docs/properties.html#late-initialized-properties-and-variables)
+> **Builds on:** [Q0.1 (primitives can't be null)](phase0_jvm_mental_model_v3.md#q01--primitives-vs-references-the-two-worlds) · [Q1.2 (nullability)](01_type_system_foundations.md#q12--nullability)
+> **Connects to:** [Q5.3 (Delegates.notNull for primitives)](#q53--property-delegates) · [Q2.2 (init block timing)](02_classes_and_objects.md#q22--constructor-mechanics-init-primary-secondary)
 
-### The Concrete Picture
+---
 
-You want a non-nullable property you can't initialize yet:
+## The Core Problem
 
-```kotlin
-class MyActivity : Activity() {
-    lateinit var binding: ActivityMainBinding   // declared non-nullable
-    // Can't initialize here — need inflater, which needs context from onCreate()
-
-    override fun onCreate(...) {
-        binding = ActivityMainBinding.inflate(layoutInflater)  // initialized here
-    }
-}
-```
-
-How lateinit tracks "not yet initialized":
-```
-Before onCreate():          After onCreate():
-binding field = null        binding field = 0x7f3a──► ActivityMainBinding object
-(JVM zero-init)             (set by you)
-
-Read binding before init:
-  getter checks: is backing field null?
-  YES → throw UninitializedPropertyAccessException (not NPE!)
-  NO  → return the value
-```
-
-`null` IS the sentinel. That's why `lateinit var count: Int` is IMPOSSIBLE:
-`Int` → JVM `int` (primitive) → can't be null → no sentinel → no lateinit.
-
-### First Principles: The Problem `lateinit` Solves
-
-Kotlin's null safety requires every property to be initialized at declaration time OR be declared nullable (`String?`). But some properties genuinely cannot be initialized in a constructor — for example:
-
-- Android `Activity` properties that need `onCreate()` to run first
-- Test class properties that need the test framework to inject
-- DI (Dependency Injection) fields injected post-construction
-
-Without `lateinit`, you'd have to write `var name: String? = null` — and then use `name!!` or `name?.` everywhere, losing null safety for a property you *know* will be non-null once initialized.
-
-`lateinit` bridges this gap: declare as non-nullable, initialize later, get an informative error if accessed before initialization.
-
-### The Sentinel Value — How `lateinit` Works Internally
-
-`lateinit var` uses the **null reference as its uninitialized sentinel**. The backing field is left `null` by the JVM's zero-initialization, and `lateinit` uses this to track whether the property has been set.
+Kotlin requires every non-nullable property to be initialised at declaration time. But some properties can't be initialised until a lifecycle callback runs:
 
 ```kotlin
 class MyActivity : Activity() {
-    lateinit var binding: ActivityMainBinding
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        binding = ActivityMainBinding.inflate(layoutInflater)
-    }
+    val binding: ActivityMainBinding  // COMPILE ERROR — must initialise here
+    // Can't: layoutInflater only available after super.onCreate()
 }
 ```
 
-**Decompiled Java:**
+Two alternatives, only one good:
+
+```kotlin
+var binding: ActivityMainBinding? = null  // forces ?. and !! everywhere
+lateinit var binding: ActivityMainBinding // declares intent: "I will set before use"
+```
+
+---
+
+## How `lateinit` Works — Null as Sentinel
+
+The JVM zero-initialises all object reference fields to `null`. `lateinit` exploits this: the backing field *is* null until you assign it, and the generated getter checks for null before returning:
+
 ```java
+// Decompiled lateinit var binding: ActivityMainBinding:
 public class MyActivity extends Activity {
-    // The backing field — initially null (JVM zero-initializes):
-    public ActivityMainBinding binding;  // null = uninitialized sentinel
+    public ActivityMainBinding binding;   // JVM zero-inits to null
 
-    @Override
-    public void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        binding = ActivityMainBinding.inflate(getLayoutInflater());
-    }
-
-    // Generated getter with null check:
     public final ActivityMainBinding getBinding() {
-        ActivityMainBinding var = this.binding;
-        if (var == null) {
-            // throw UninitializedPropertyAccessException (not NullPointerException!)
+        ActivityMainBinding v = this.binding;
+        if (v == null) {
             throw new UninitializedPropertyAccessException(
                 "lateinit property binding has not been initialized"
             );
         }
-        return var;
+        return v;
     }
 }
 ```
 
 ```
-MEMORY MODEL:
-                                    Heap
-┌──────────────────────────┐       ┌─────────────────────────────┐
-│  MyActivity object       │       │  ActivityMainBinding object  │
-│                          │       └─────────────────────────────┘
-│  binding ──────────────────────►  (set after onCreate)
-│                          │
-│  [before onCreate]       │
-│  binding = null ◄──────────  sentinel: property not initialized yet
-└──────────────────────────┘
+Before onCreate():          After binding = ...:
+backing field = null        backing field ──► ActivityMainBinding object
+
+Read before set:
+  getter checks: backing == null?
+  YES → UninitializedPropertyAccessException (NOT NullPointerException!)
+  NO  → return the value
 ```
 
-### Why `lateinit var count: Int` Fails
+---
 
-`Int` in Kotlin maps to the JVM primitive `int`. The JVM primitive `int` **cannot be null** — it's a value, not a reference.
+## Why `lateinit var count: Int` Fails
 
-The `lateinit` sentinel is `null`. If there's no `null`, there's no sentinel. There's no way to represent "this `int` has not been initialized yet."
+`Int` maps to JVM primitive `int`. Primitives have no null bit pattern — a 32-bit int can hold values 0 through 2³²-1, and none of those means "uninitialized." There is no sentinel available.
 
 ```
-Reference type (String):        Primitive type (int):
-┌──────────────────────┐        ┌──────────────────────┐
-│  null = no object    │        │  0 = valid value!    │
-│       = uninitialized│        │  Cannot distinguish   │
-│       → perfect      │        │  "not initialized"   │
-│         sentinel     │        │  from "value is 0"   │
-└──────────────────────┘        └──────────────────────┘
-      lateinit works ✓                 lateinit FAILS ✗
+Reference field (String):        Primitive field (Int → int):
+null = "not yet set" ✓           0 = valid integer, same as "uninitialized 0"
+     perfect sentinel                no way to distinguish
+→ lateinit works                 → lateinit fails — use Delegates.notNull() (Q5.3)
 ```
 
-**The alternative for primitives:** `Delegates.notNull<Int>()` — stores the value as `Any?`, using `null` as the sentinel but boxing the int when it IS initialized. (See Q5.3)
+---
 
-### Why `UninitializedPropertyAccessException` and NOT `NullPointerException`
+## `UninitializedPropertyAccessException` vs `NullPointerException`
 
-This is a design choice about information quality:
-- `NullPointerException` tells you: "something was null"
-- `UninitializedPropertyAccessException` tells you: "property X of class Y was not initialized"
+This is a deliberate design choice. `UIAPE` names the property in its message:
 
-The exception message explicitly names the property:
 ```
 UninitializedPropertyAccessException: lateinit property binding has not been initialized
 ```
 
-This is infinitely more debuggable than a generic NPE with no context.
+A generic NPE gives you a line number and a stack trace — but no indication of *which* variable was null. `UIAPE` tells you instantly.
 
-**Contract expressed:** "`lateinit` is a promise that you'll initialize before first use. If you break that promise, you get a descriptive error, not a mysterious null."
+---
 
-### `::property.isInitialized` — Null Check Under the Hood
+## `::property.isInitialized` — Just a Null Check
 
 ```kotlin
 if (::binding.isInitialized) {
@@ -153,320 +107,340 @@ if (::binding.isInitialized) {
 }
 ```
 
-**Decompiled:**
 ```java
-if (this.binding != null) {  // just a null check! No reflection!
+// Decompiled — it is literally a null check, not reflection:
+if (this.binding != null) {
     this.getBinding().doSomething();
 }
 ```
 
-`isInitialized` compiles to a simple `!= null` check on the backing field. No reflection API involved. It's as cheap as a null check.
-
-### Memory Trick
-
-```
-LATEINIT = "I promise I'll initialize this before using it."
-  Mechanism: null as sentinel on the backing field.
-  Read before init: throws UninitializedPropertyAccessException (NOT NullPointerException).
-
-WHY NOT INT?
-  int is a JVM primitive → can't be null → no sentinel possible.
-  String/Object can be null → null = "not yet set" → lateinit works.
-
-::property.isInitialized:
-  NOT reflection. Just a null check on the backing field.
-  Available only within the same class (to prevent race conditions from outside).
-```
-
-### Why `isInitialized` Is Class-Private
-
-`::property.isInitialized` can only be called from **within the same class** (or its `companion object`).
-
-**Reason:** `isInitialized` accesses the backing field directly (bypasses the getter's null check). Allowing this from outside the class would:
-1. Expose implementation detail (the null sentinel)
-2. Create TOCTOU (Time-Of-Check-Time-Of-Use) race conditions in multi-threaded code
-3. Encourage bad patterns: "check from outside, then access" — the check and use should be atomic within the owning class
+`isInitialized` accesses the backing field directly (bypassing the getter). This is why it is restricted to the **same class**: exposing it externally would:
+1. Leak the implementation detail (null = uninitialized)
+2. Create TOCTOU races — another thread could set/clear the property between your `isInitialized` check and your actual use
 
 ---
 
-## Q5.2 — `lazy` Internals
+## `lateinit` and Threading — An Interview Trap
 
-> **Builds on:** [Q0.1 — Heap allocation](00_jvm_mental_model.md#q01--primitives-vs-references) · [Q0.3 — Class loading timing](00_jvm_mental_model.md#q03--class-loading-and-the-static--block)
-> **Connects to:** [Q5.3 — Delegates](05_properties_and_delegation.md#q53--delegates) · [Q2.5.5 — lazy vs eager init](02_5_initialization_mechanics.md#q255--property-initializer-order-traps)
-> **Reference:** [Kotlin Docs — Lazy properties](https://kotlinlang.org/docs/delegated-properties.html#lazy-properties)
+`lateinit` backing fields are **not `@Volatile`**. Two threads can race:
 
-### The Concrete Picture
+```
+Thread 1: activity.binding = newBinding  // writes backing field
+Thread 2: if (binding != null) ...        // may read stale null from CPU cache
+                                           // even though Thread 1 already wrote!
+```
 
-Expensive property. You only want to compute it once, and only if needed:
+`lateinit` has no thread-safety guarantee. If multiple threads may access the same `lateinit` property, you must add your own synchronisation (or `@Volatile`).
+
+---
+
+## Memory Trick
+
+```
+LATEINIT = null as sentinel on the backing field.
+  null → uninitialized → throw UninitializedPropertyAccessException
+  non-null → return value
+
+WHY NOT PRIMITIVES:
+  int has no null bit pattern → no sentinel → can't distinguish 0 from unset
+
+::prop.isInitialized:
+  = backing_field != null (not reflection, zero overhead)
+  Restricted to owning class to prevent external TOCTOU races
+
+THREADING TRAP:
+  lateinit backing field is NOT @Volatile
+  Multi-thread access requires explicit synchronisation
+
+lateinit vs var: String?:
+  String? forces ?. and !! everywhere
+  lateinit = "I promise I'll set it before use" — compiler trusts you
+```
+
+---
+
+## Self-Test
+
+1. What does `lateinit` use as its uninitialized sentinel?
+2. Why can't you write `lateinit var count: Int`?
+3. What exception does reading an uninitialized `lateinit` throw? Why not NPE?
+4. What does `::binding.isInitialized` compile to? Is it reflection?
+5. Why is `isInitialized` restricted to the owning class?
+6. Is `lateinit` thread-safe? What can go wrong in a multi-threaded scenario?
+
+---
+
+# Q5.2 — `lazy` Internals
+
+> **Builds on:** [Q0.1 (heap allocation)](phase0_jvm_mental_model_v3.md#q01--primitives-vs-references-the-two-worlds) · [Q2.7 (property initializer order)](02_classes_and_objects.md#q27--property-initializer-order-traps)
+> **Connects to:** [Q5.3 (delegates — lazy is a delegate)](#q53--property-delegates)
+
+---
+
+## The Core Idea
+
+Expensive property. Compute once. Cache. Only when needed.
 
 ```kotlin
 class Screen {
-    val data by lazy { loadFromDatabase() }  // expensive
+    val data by lazy { loadFromDatabase() }
 }
 
-val s = Screen()     // loadFromDatabase() NOT called yet
-s.doOtherWork()      // still not called
-val d = s.data       // NOW loadFromDatabase() called — result cached
-val d2 = s.data      // cached result returned — NO second call
+val s = Screen()    // loadFromDatabase() NOT called yet
+s.doOtherWork()     // still not called
+val d = s.data      // NOW called — result cached in the Lazy object
+val d2 = s.data     // returns cached result — no second call
 ```
 
-How the thread-safe version works (two-check pattern):
-```
-First read:
-  Check 1 (no lock): value = UNINITIALIZED? → yes → go to slow path
-  Acquire lock
-  Check 2 (inside lock): still UNINITIALIZED? → yes → run initializer → cache → return
+`lazy` returns a `Lazy<T>` delegate. `by lazy { }` is just `by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { }`.
 
-Second read from another thread:
-  Check 1 (no lock): value = result (already set) → return immediately → no lock
-```
+---
 
-The double-check avoids locking on every read after initialization.
+## The `lazy` Implementation — Double-Checked Locking
 
-### First Principles: What Problem Does `lazy` Solve?
-
-Some properties are expensive to compute (database queries, network calls, parsing). If they're always initialized eagerly in the constructor, you pay the cost even if they're never used. `lazy` defers initialization to first access and caches the result.
+Default mode (`SYNCHRONIZED`) uses double-checked locking to be thread-safe without locking on every read:
 
 ```kotlin
-class ProfileScreen {
-    // Computed immediately when ProfileScreen is created:
-    val eagerUserData = loadUserFromDatabase()  // runs now, even if unused!
-
-    // Computed only when first accessed:
-    val lazyUserData by lazy { loadUserFromDatabase() }  // runs on first access
-}
-```
-
-### The `lazy` Implementation — Double-Checked Locking
-
-`LazyThreadSafetyMode.SYNCHRONIZED` (the default) uses **double-checked locking**:
-
-```kotlin
-// From Kotlin stdlib — simplified:
+// Simplified from Kotlin stdlib:
 class SynchronizedLazyImpl<out T>(val initializer: () -> T) : Lazy<T> {
-    @Volatile private var _value: Any? = UNINITIALIZED_VALUE  // sentinel
+    @Volatile private var _value: Any? = UNINITIALIZED_VALUE
 
-    override val value: T
-        get() {
-            // First check: no lock — fast path
-            val v1 = _value
-            if (v1 !== UNINITIALIZED_VALUE) {
-                @Suppress("UNCHECKED_CAST")
-                return v1 as T
-            }
+    override val value: T get() {
+        // CHECK 1 — fast path, no lock
+        val v1 = _value
+        if (v1 !== UNINITIALIZED_VALUE) return v1 as T
 
-            // Slow path: acquire lock
-            return synchronized(this) {
-                // Second check inside lock: another thread may have initialized it
-                val v2 = _value
-                if (v2 !== UNINITIALIZED_VALUE) {
-                    v2 as T
-                } else {
-                    val typedValue = initializer()   // run the block
-                    _value = typedValue              // cache it
-                    typedValue
-                }
+        // CHECK 2 — slow path, inside lock
+        return synchronized(this) {
+            val v2 = _value
+            if (v2 !== UNINITIALIZED_VALUE) {
+                v2 as T                  // another thread already initialized — return it
+            } else {
+                val result = initializer()
+                _value = result          // store result
+                result
             }
         }
+    }
 }
 ```
 
 **Why two checks?**
-- First check (no lock): fast path for the common case. If already initialized, just return — no synchronization overhead.
-- Second check (inside lock): after acquiring the lock, verify again. Another thread may have initialized between the first check and lock acquisition.
 
 ```
-Thread 1                          Thread 2
-────────────────────────────────  ────────────────────────────────
-reads _value = UNINITIALIZED      reads _value = UNINITIALIZED
-acquires lock                     tries to acquire lock → WAITS
-reads _value = UNINITIALIZED
-calls initializer()
-_value = result
-releases lock                     ← Thread 2 acquires lock
-                                  reads _value = result (initialized!)
-                                  returns result (no re-initialization!)
-                                  releases lock
+Thread 1                            Thread 2
+──────────────────────────────────  ──────────────────────────────────
+Check 1: _value == UNINITIALIZED    Check 1: _value == UNINITIALIZED
+Acquires lock                       Waits at synchronized
+
+Inside lock:
+  Check 2: still UNINITIALIZED?
+  YES → run initializer()
+  _value = result
+Releases lock                       Acquires lock
+
+                                    Inside lock:
+                                      Check 2: _value == result? NO LONGER UNINITIALIZED
+                                      → return cached result (no second init) ✓
+                                    Releases lock
 ```
 
-The `@Volatile` annotation ensures `_value` is written to/read from main memory, not a CPU cache — this is what makes the first check (without lock) safe to read.
+- **Check 1 (no lock):** After initialisation, every subsequent read takes this fast path — reads the cached value without locking.
+- **Check 2 (inside lock):** Handles the race where two threads both pass Check 1. Only one runs the initializer; the other gets the cached value.
 
-### What Happens If the `lazy` Block Throws?
+---
+
+## `@Volatile` — Why It's Critical
+
+`@Volatile` on `_value` means: every write to `_value` goes **directly to main memory**, and every read fetches from main memory. Without it:
+
+```
+Thread 1 writes _value = result  → stored in Thread 1's CPU cache
+Thread 2 reads  _value           → reads from ITS CPU cache → still UNINITIALIZED
+
+Result: Thread 2 sees a stale value and re-runs the initializer (double init bug)
+```
+
+With `@Volatile`:
+
+```
+Thread 1 writes _value = result  → flushed to main memory immediately
+Thread 2 reads  _value           → forced to read from main memory → sees result ✓
+```
+
+`@Volatile` provides visibility across threads, not atomicity. The lock in Check 2 provides atomicity (mutual exclusion).
+
+---
+
+## Three Thread-Safety Modes
+
+| Mode | Mechanism | Use case |
+|---|---|---|
+| `SYNCHRONIZED` (default) | Double-checked locking + `@Volatile` | Multi-threaded access — safe everywhere |
+| `PUBLICATION` | `@Volatile` only, no lock | Multiple threads may init, but only one result sticks |
+| `NONE` | No sync, no volatile | Single-threaded only — fastest |
+
+**`PUBLICATION` mode:**
 
 ```kotlin
-val data by lazy {
-    throw IOException("Cannot load data")  // throws on first access
-}
-
-try {
-    data  // IOException thrown here
-} catch (e: IOException) {
-    println("Failed")
-}
-
-data  // IOException thrown AGAIN — the result was NOT cached!
+val value by lazy(LazyThreadSafetyMode.PUBLICATION) { expensiveComputation() }
 ```
 
-**If the initializer throws, the value is NOT cached.** On the next access, the initializer runs again. The `_value` remains `UNINITIALIZED_VALUE` until the initializer completes successfully.
+Multiple threads can run `expensiveComputation()` concurrently, but only the **first** result is kept. All other results are discarded. Use when: initialisation is idempotent (running it twice is fine), you want to avoid the lock overhead.
 
-This means: if the first access fails, subsequent accesses retry. Each access has a chance to succeed (good for transient failures). But it also means repeated expensive work on repeated failures.
-
-### Why `lazy` Requires `val` Not `var`
-
-`lazy` provides a **caching contract**: compute once, return the same value every time. If `lazy` allowed `var`, you could reassign the property — breaking the caching contract and creating confusion about which value "the lazy value" refers to.
-
-The `Lazy<T>` interface only has `value: T` getter and `isInitialized()` — no setter. This reflects the immutability contract.
-
-### `LazyThreadSafetyMode.NONE` — The Unsafe Option
+**`NONE` mode — the race condition:**
 
 ```kotlin
-val cache by lazy(LazyThreadSafetyMode.NONE) {
-    expensiveComputation()
-}
-```
+val cache by lazy(LazyThreadSafetyMode.NONE) { expensiveComputation() }
 
-`NONE` has no synchronization — no locks, no `@Volatile`. This is the fastest mode, but only safe when:
-1. The property is accessed from a single thread (common for UI-only properties)
-2. You've verified there's no concurrent access
-
-**The concurrency bug:**
-```kotlin
-// TWO threads access simultaneously (NONE mode):
-Thread 1: reads _value = UNINITIALIZED
-Thread 2: reads _value = UNINITIALIZED
-Thread 1: calls expensiveComputation()
-Thread 2: calls expensiveComputation()  ← runs TWICE! Double initialization!
-Thread 1: _value = result1
-Thread 2: _value = result2  ← overwrites Thread 1's result!
-// result1 and result2 may be different! (especially if computation has side effects)
-```
-
-### The `lazy` in Fragment — Destroyed View Leak
-
-```kotlin
-class MyFragment : Fragment() {
-    // lazy initializes on first access and CACHES FOREVER:
-    private val adapter by lazy { MyAdapter() }
-
-    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
-        recyclerView.adapter = adapter  // adapter is created here, cached
-    }
-
-    // Fragment is hidden, view is destroyed, but adapter is still cached in `lazy`
-    // When fragment is shown again:
-    override fun onCreateView(...): View {
-        // lazy still returns the OLD adapter with reference to OLD views!
-    }
-}
-```
-
-**Why Fragment views are destroyed on backstack (not just rotation):** When a Fragment is placed on the back stack, Android calls `onDestroyView()` — destroying the Fragment's entire View hierarchy to reclaim memory — but **keeps the Fragment instance alive** (`onDestroy()` is NOT called). When the user navigates back, `onCreateView()` runs again, creating a fresh View hierarchy. This is by design: the Fragment object acts as a controller that outlives its views.
-
-```
-Back stack navigation lifecycle:
-                                                  Fragment instance: ALIVE throughout
-                                                          │
-navigate forward   ──►  onPause → onStop → onDestroyView()    ← view destroyed!
-navigate back      ──►  onCreateView() → onViewCreated()      ← fresh view created
-```
-
-This means anything held in a `lazy` property on the Fragment object **persists across backstack transitions** — but the Views it captured are gone (detached, null window token).
-
-**The problem:** `lazy` caches the first value forever. When a Fragment's view is destroyed and recreated (see [Q16.1 — Fragment Lifecycle](16_android_system_internals.md#q161--activity-and-fragment-lifecycle)), the cached adapter may hold references to the destroyed views. This is both a memory leak and a functional bug.
-
-**Fix:** Use `viewLifecycleOwner.lifecycleScope` and re-create view-related objects, or use `viewBinding` which is reset properly.
-
-### Memory Trick
-
-```
-LAZY = "compute once, cache forever."
-  Default mode: SYNCHRONIZED = double-checked locking = thread-safe.
-  NONE mode: no locks = fastest, but only safe for single-threaded access.
-
-IF THE BLOCK THROWS:
-  Result is NOT cached. Next access retries. Good for transient failures.
-  Bad for expensive operations that always fail → infinite cost on every access.
-
-REQUIRES val: lazy's contract is "same value every time."
-  Allowing var would break that contract.
-
-FRAGMENT LEAK with lazy:
-  lazy caches FOREVER on the Fragment object.
-  Fragment view is destroyed and recreated (back stack navigation).
-  Cached adapter holds references to old (destroyed) views.
-  Fix: use viewLifecycleOwner or reset in onDestroyView.
+// With two threads:
+Thread 1: _value == UNINITIALIZED → runs expensiveComputation() → result1
+Thread 2: _value == UNINITIALIZED → runs expensiveComputation() → result2 (ran TWICE!)
+Thread 2 finishes last → _value = result2 (overwrites result1!)
+// If expensiveComputation() has side effects, this is a serious bug
 ```
 
 ---
 
-## Q5.3 — Delegates
+## If the `lazy` Block Throws — Not Cached
 
-> **Builds on:** [Q5.1 — lateinit internals](05_properties_and_delegation.md#q51--lateinit-internals) · [Q0.1 — primitives vs references](00_jvm_mental_model.md#q01--primitives-vs-references)
-> **Connects to:** [Q5.1 — why primitives can't use lateinit](05_properties_and_delegation.md#q51--lateinit-internals) · [Q0.2 — boxing](00_jvm_mental_model.md#q02--jvm-type-mapping)
-> **Reference:** [Kotlin Docs — Delegated Properties](https://kotlinlang.org/docs/delegated-properties.html)
+```kotlin
+val data by lazy { throw IOException("Cannot load") }
 
-### The Concrete Picture
+try { data } catch (e: IOException) { }
+data  // throws IOException AGAIN — throw result is NOT cached
+```
 
-`by` redirects the property's getter/setter to another object:
+If the initializer throws, `_value` stays `UNINITIALIZED_VALUE`. Next access retries. Good for transient failures; bad for operations that always fail (infinite retry).
+
+---
+
+## `lazy` Requires `val` — Immutability Contract
+
+`lazy` promises "compute once, return the same value every time." A `var` would break this — you could reassign and the lazy-computed value would be gone. The `Lazy<T>` interface has no `setValue` method, so `by lazy` is only valid for `val`.
+
+---
+
+## Fragment View Lifecycle + `lazy` — The Memory Leak
+
+```kotlin
+class MyFragment : Fragment() {
+    private val adapter by lazy { MyAdapter() }  // cached FOREVER on Fragment object
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        recyclerView.adapter = adapter  // adapter created here, holds view references
+    }
+}
+```
+
+**The problem:** Fragment lifecycle on the back stack:
+
+```
+Push to back stack:
+  onPause → onStop → onDestroyView()   ← View hierarchy DESTROYED, Fragment ALIVE
+
+Pop from back stack:
+  onCreateView() → onViewCreated()     ← Fresh views created
+
+  lazy adapter: still cached on Fragment object
+               → holds references to the DESTROYED views
+               → memory leak + wrong views displayed
+```
+
+**Why Fragment instances survive `onDestroyView()`:** Android destroys only the *view hierarchy* when pushing to the back stack (to reclaim memory), but keeps the Fragment instance alive so you can navigate back. The Fragment object persists; the views do not.
+
+**Fix:** Null out view-related references in `onDestroyView()`. Don't use `lazy` for anything that holds view references.
+
+---
+
+## `lazy` vs `lateinit` — Which to Use
+
+| | `lateinit var` | `val by lazy { }` |
+|---|---|---|
+| Initialised by | You, manually | Automatically on first access |
+| Access style | `var` — reassignable | `val` — immutable once set |
+| Primitives | ✗ No | ✓ Yes (boxed in `Lazy` wrapper) |
+| Thread-safe | ✗ No (not `@Volatile`) | ✓ Yes (default mode) |
+| isInitialized | ✓ `::prop.isInitialized` | ✗ Not available |
+| Use when | Lifecycle callbacks, DI injection | Expensive one-time computation |
+
+---
+
+## Memory Trick
+
+```
+LAZY = "compute once, cache, on first access."
+  Default: SYNCHRONIZED = double-checked locking = thread-safe.
+  PUBLICATION: multiple inits allowed, first result wins. No lock.
+  NONE: no sync = fastest, single-thread only.
+
+@Volatile = writes go to main memory, reads come from main memory.
+  Without: threads may read stale CPU-cache value.
+  With: all threads see the write immediately.
+  Lock = mutual exclusion (only one thread in block at a time).
+  Volatile = visibility (writes immediately visible to all threads).
+
+THROW IN BLOCK → not cached → next access retries.
+REQUIRES val → "same value every time" = the contract.
+
+FRAGMENT LEAK:
+  lazy caches on Fragment object (survives view destroy/recreate)
+  → adapter holds destroyed views → memory leak
+  Fix: null out in onDestroyView()
+
+lazy vs lateinit:
+  lateinit = manual init, var, no thread-safety
+  lazy     = auto init on first access, val, thread-safe by default
+```
+
+---
+
+## Self-Test
+
+1. Explain both checks in double-checked locking. Why can't you use only one check?
+2. What does `@Volatile` guarantee? What does `synchronized` guarantee? Are they the same?
+3. What is `LazyThreadSafetyMode.PUBLICATION`? When would you choose it over `SYNCHRONIZED`?
+4. What happens if the `lazy` block throws an exception?
+5. Why does `lazy` require `val`?
+6. Explain the Fragment `lazy` memory leak from first principles.
+7. When would you use `lateinit` vs `lazy`?
+
+---
+
+# Q5.3 — Property Delegates
+
+> **Builds on:** [Q5.1 (lateinit as null-sentinel)](#q51--lateinit-internals) · [Q5.2 (lazy is a delegate)](#q52--lazy-internals)
+> **Connects to:** [Q0.2 (boxing — notNull boxes primitives)](phase0_jvm_mental_model_v3.md#q02--jvm-type-mapping-when-does-kotlin-box)
+
+---
+
+## The Core Idea
+
+`by` redirects every property read/write to a **delegate object**. The delegate's `getValue` and `setValue` operators handle all access:
 
 ```kotlin
 var value: String by SomeDelegate()
+
+val x = obj.value     // → SomeDelegate.getValue(obj, ::value)
+obj.value = "new"     // → SomeDelegate.setValue(obj, ::value, "new")
 ```
 
-What happens at every read/write:
-```
-val x = obj.value     → calls  SomeDelegate.getValue(obj, ::value)
-obj.value = "new"     → calls  SomeDelegate.setValue(obj, ::value, "new")
+The property is a façade. The delegate has all the logic.
 
-The compiler generates a getter and setter that forward to the delegate.
-Your property is just a thin façade.
-```
+---
 
-Real example — property that logs every access:
-```
-config.timeout         → prints "Getting timeout: 5000"  → returns 5000
-config.timeout = 3000  → prints "Setting timeout = 3000 (was 5000)"
-```
+## How `by` Compiles
 
-### First Principles: What Is Delegation?
+The delegate must implement operator functions with these exact signatures:
 
-Delegation is the pattern where an object hands off responsibility for some behavior to another object. In Kotlin property delegation, the **property's getter and setter are delegated to another object** (the delegate).
-
-```kotlin
-class MyClass {
-    var value: String by SomeDelegate()
-    //                ^^ `by` = delegate getter/setter to this object
-}
-```
-
-When you write `obj.value`, the compiler calls `SomeDelegate.getValue(obj, property)`. When you write `obj.value = "x"`, it calls `SomeDelegate.setValue(obj, property, "x")`.
-
-### How `by` Compiles — The Required Interface
-
-A delegate must implement `getValue` (and `setValue` for mutable properties):
-
-```kotlin
-// Read-only delegate:
-interface ReadOnlyProperty<in ThisRef, out V> {
-    operator fun getValue(thisRef: ThisRef, property: KProperty<*>): V
-}
-
-// Read-write delegate:
-interface ReadWriteProperty<in ThisRef, V> {
-    operator fun getValue(thisRef: ThisRef, property: KProperty<*>): V
-    operator fun setValue(thisRef: ThisRef, property: KProperty<*>, value: V)
-}
-```
-
-**Example custom delegate:**
 ```kotlin
 class LoggingDelegate<T>(private var value: T) {
     operator fun getValue(thisRef: Any?, property: KProperty<*>): T {
-        println("Getting ${property.name}: $value")
+        println("Reading ${property.name}: $value")
         return value
     }
     operator fun setValue(thisRef: Any?, property: KProperty<*>, newValue: T) {
-        println("Setting ${property.name} = $newValue (was $value)")
+        println("Writing ${property.name}: $value → $newValue")
         value = newValue
     }
 }
@@ -474,170 +448,289 @@ class LoggingDelegate<T>(private var value: T) {
 class Config {
     var timeout: Int by LoggingDelegate(5000)
 }
-
-val config = Config()
-config.timeout        // prints: Getting timeout: 5000
-config.timeout = 3000 // prints: Setting timeout = 3000 (was 5000)
 ```
 
-**Decompiled Java (how the compiler generates it):**
+What `KProperty<*>` gives you:
+- `property.name` — the property name as a String (`"timeout"`)
+- `property.returnType` — the Kotlin type (`Int`)
+
+`thisRef` — the object on which the property lives (the `Config` instance). Useful if your delegate needs to inspect the owner.
+
 ```java
+// Compiler generates:
 public class Config {
     private final LoggingDelegate timeout$delegate = new LoggingDelegate(5000);
 
     public int getTimeout() {
         return timeout$delegate.getValue(this, $$delegatedProperties[0]);
     }
-    public void setTimeout(int value) {
-        timeout$delegate.setValue(this, $$delegatedProperties[0], value);
+    public void setTimeout(int v) {
+        timeout$delegate.setValue(this, $$delegatedProperties[0], v);
     }
 }
 ```
 
-### `Delegates.notNull<Int>()` — The `lateinit` Workaround for Primitives
+---
 
-Recall: [`lateinit`](05_properties_and_delegation.md#q51--lateinit-internals) can't work with `Int` because `Int` maps to primitive `int` and there's no null sentinel.
+## `Delegates.notNull<Int>()` — `lateinit` for Primitives
 
-`Delegates.notNull<Int>()` stores the value as `Any?` internally ([boxing](00_jvm_mental_model.md#q02--jvm-type-mapping) the int), using `null` as the sentinel:
+`lateinit` can't use `Int` (no null sentinel for primitives). `Delegates.notNull<Int>()` boxes the int as `Any?` and uses `null` as the sentinel:
 
 ```kotlin
 class Counter {
-    var count: Int by Delegates.notNull()  // works! Even for Int!
-
-    fun initialize(value: Int) {
-        count = value
-    }
+    var count: Int by Delegates.notNull()
 }
 
-Counter().count  // throws BEFORE initialize() is called
+val c = Counter()
+c.count           // throws IllegalStateException: "Property count should be initialized"
+c.count = 5
+c.count           // 5
 ```
 
-**Decompiled equivalent:**
 ```java
-public class NotNullVar<T> {
-    private Object value = null;  // nullable — can store null sentinel
+// NotNullVar<T> internals:
+class NotNullVar<T> {
+    private Object value = null;  // null = uninitialized, Object = boxed T
 
-    public T getValue() {
-        if (value == null) {
-            throw new IllegalStateException("Property has not been initialized");
-        }
-        return (T) value;  // cast back to T (unboxing if needed)
+    T getValue() {
+        if (value == null) throw new IllegalStateException("...");
+        return (T) value;         // unboxes on return
     }
-
-    public void setValue(T newValue) {
-        value = newValue;  // stores the int as Integer (boxed)
-    }
+    void setValue(T v) { value = v; }  // boxes int as Integer
 }
 ```
 
-### `lateinit` vs `Delegates.notNull()` — Exception Type Difference
+---
 
-| Situation | `lateinit` | `Delegates.notNull()` |
-|-----------|-----------|----------------------|
-| Access before init | `UninitializedPropertyAccessException` | `IllegalStateException` |
-| Exception message | "lateinit property X has not been initialized" | "Property X should be initialized before get" |
-| Debugging clarity | ✓ Clear, specific | ✗ More generic |
-| Works with primitives | ✗ No | ✓ Yes |
-| Overhead | Zero (null check on field) | Slight (boxing + delegate call) |
+## `lateinit` vs `Delegates.notNull()` — Full Comparison
 
-### `by map` Delegation — JSON Deserialization Pattern
+| | `lateinit var` | `Delegates.notNull<T>()` |
+|---|---|---|
+| Works with primitives | ✗ No | ✓ Yes (boxes as `Any?`) |
+| Exception type | `UninitializedPropertyAccessException` | `IllegalStateException` |
+| Exception message | "lateinit property X not initialized" | "Property should be initialized" |
+| Overhead | Zero (null check on backing field) | Boxing + delegate call |
+| `isInitialized` | ✓ `::prop.isInitialized` | ✗ Not available |
+| Use when | Non-primitive reference types | Primitives needing deferred init |
 
-Property delegation to a `Map` lets you expose map keys as typed properties:
+---
+
+## `Delegates.observable` — React to Changes
 
 ```kotlin
+var status: String by Delegates.observable("IDLE") { property, old, new ->
+    // Callback signature: (KProperty<*>, T, T) -> Unit
+    // old: T = value before change
+    // new: T = value after change
+    println("${property.name}: $old → $new")
+    notifyListeners(new)
+}
+
+status = "LOADING"  // prints: status: IDLE → LOADING  (fires AFTER change)
+status = "SUCCESS"  // prints: status: LOADING → SUCCESS
+```
+
+Callback fires **after** the value has changed. Use for: change notifications, logging, UI updates.
+
+---
+
+## `Delegates.vetoable` — Conditional Change
+
+```kotlin
+var age: Int by Delegates.vetoable(0) { property, old, new ->
+    // Callback signature: (KProperty<*>, T, T) -> Boolean
+    // return true = allow the change, false = reject it
+    new >= 0
+}
+
+age = 25   // allowed: 25 >= 0 → true
+age = -1   // rejected: -1 >= 0 → false, age stays 25
+```
+
+Callback fires **before** the value changes. Return `true` to allow, `false` to reject. Use for: validation, constraints.
+
+---
+
+## `by map` Delegation — How It Works Internally
+
+A `Map` implements `getValue` as an operator extension, making it a valid delegate:
+
+```kotlin
+// Stdlib provides:
+operator fun <V, T : V> Map<in String, V>.getValue(thisRef: Any?, property: KProperty<*>): T =
+    getOrElse(property.name) { throw NoSuchElementException(property.name) } as T
+
+// This is what makes `by map` work:
 class User(val map: Map<String, Any?>) {
-    val name: String by map    // reads map["name"]
-    val age: Int by map        // reads map["age"]
-    val email: String by map   // reads map["email"]
+    val name: String by map   // → map.getValue(this, ::name) → map["name"]
+    val age: Int by map       // → map.getValue(this, ::age)  → map["age"]
 }
 
-val data = mapOf("name" to "Alice", "age" to 30, "email" to "alice@example.com")
-val user = User(data)
-println(user.name)  // "Alice" — reads from map
-println(user.age)   // 30
+val user = User(mapOf("name" to "Alice", "age" to 30))
+user.name  // "Alice"
+user.age   // 30
 ```
 
-This is the foundation of JSON deserialization libraries. A JSON object is parsed into a `Map<String, Any?>`, then typed properties access the values by key.
-
 ```kotlin
-// MutableMap for mutable properties:
+// Mutable version — MutableMap also implements setValue:
 class MutableUser(val map: MutableMap<String, Any?>) {
     var name: String by map
     var age: Int by map
 }
 
-val user = MutableUser(mutableMapOf("name" to "Alice", "age" to 30))
-user.name = "Bob"  // modifies map["name"]
-println(user.map)  // {name=Bob, age=30}
+val u = MutableUser(mutableMapOf("name" to "Alice", "age" to 30))
+u.name = "Bob"
+println(u.map)  // {name=Bob, age=30}
 ```
 
-### Memory Trick
+This is how JSON deserialisation libraries work: parse JSON into `Map<String, Any?>`, expose typed properties via map delegation.
 
-```
-DELEGATE = object that handles the property's get/set.
-`by` = "give this property's behavior to this delegate."
+---
 
-Compiler generates:
-  val p$delegate = SomeDelegate()
-  fun getP() = p$delegate.getValue(this, ::p)
-  fun setP(v) = p$delegate.setValue(this, ::p, v)
+## Local Delegated Properties
 
-COMMON DELEGATES:
-  lazy    → deferred initialization, cached
-  notNull → lateinit for primitives (boxes them as Any?)
-  by map  → reads/writes from a Map (JSON pattern)
-  observable → callback on every change (Delegates.observable)
-
-lateinit vs notNull:
-  lateinit    → null sentinel, no boxing, better error message (UIAPE)
-  notNull<Int> → null sentinel on boxed value, generic error (IllegalStateException)
-  Use lateinit when you can (non-primitive), notNull for primitives.
-```
-
-### `ReadOnlyProperty` vs `ReadWriteProperty`
+Delegates work inside functions too, not just classes:
 
 ```kotlin
-// ReadOnlyProperty: 1 method (getValue)
+fun loadConfig() {
+    val config: ServerConfig by lazy { parseConfigFile() }  // local lazy val
+    val host: String by someDelegate()                       // local delegated val
+
+    if (needsConfig) {
+        println(config.host)  // only parsed here, on first use
+    }
+}
+```
+
+The delegate object is created at the `val`/`var` declaration and lives for the scope of the function.
+
+---
+
+## `ReadOnlyProperty` and `ReadWriteProperty` Interfaces
+
+For implementing custom delegates with proper types:
+
+```kotlin
+// For val (read-only):
 interface ReadOnlyProperty<in ThisRef, out V> {
     operator fun getValue(thisRef: ThisRef, property: KProperty<*>): V
 }
 
-// ReadWriteProperty: 2 methods (getValue + setValue)
+// For var (read-write):
 interface ReadWriteProperty<in ThisRef, V> : ReadOnlyProperty<ThisRef, V> {
-    override operator fun getValue(thisRef: ThisRef, property: KProperty<*>): V
     operator fun setValue(thisRef: ThisRef, property: KProperty<*>, value: V)
 }
 ```
 
-- Use `ReadOnlyProperty` for `val` delegates (read-only properties)
-- Use `ReadWriteProperty` for `var` delegates (mutable properties)
-- Note: `ReadWriteProperty` extends `ReadOnlyProperty` in Kotlin 1.6+
+You don't have to implement these interfaces (any class with the right operator functions works), but implementing them makes the intent explicit and enables type checking.
 
 ---
 
-## Master Summary: Properties and Delegation in 5 Points
+## All Built-in Delegates
+
+| Delegate | Fires when | Use case |
+|---|---|---|
+| `lazy { }` | First access | Expensive one-time computation |
+| `Delegates.notNull()` | Read before set | Primitive deferred init |
+| `Delegates.observable(init) { }` | After every set | Change notification, logging |
+| `Delegates.vetoable(init) { }` | Before every set | Validation, constraints |
+| `by map` / `by mutableMap` | Every get/set | JSON/config-backed properties |
+
+---
+
+## Memory Trick
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│  1. `lateinit` uses null as the uninitialized sentinel.               │
-│     That's why Int (primitive, can't be null) is forbidden.           │
-│     Throws UninitializedPropertyAccessException, not NPE.            │
-│                                                                        │
-│  2. `lazy` uses double-checked locking by default (SYNCHRONIZED).     │
-│     If the block throws, the value is NOT cached — next access retries│
-│     `lazy` requires `val` to enforce its caching contract.            │
-│                                                                        │
-│  3. Delegates compile to getValue/setValue method calls on the        │
-│     delegate object. The `by` keyword is syntactic sugar.             │
-│                                                                        │
-│  4. `Delegates.notNull<Int>()` works for primitives by boxing the     │
-│     value as Any? and using null as the sentinel.                     │
-│                                                                        │
-│  5. `by map` lets you use a Map as backing storage for typed          │
-│     properties — the foundation of JSON deserialization patterns.     │
-└────────────────────────────────────────────────────────────────────────┘
+DELEGATE = object that handles get/set for a property.
+`by` = "give this property's access to this object."
+
+Compiler generates:
+  val p$delegate = TheDelegate()
+  fun getP() = p$delegate.getValue(this, ::p)
+  fun setP(v) = p$delegate.setValue(this, ::p, v)
+
+KProperty<*> gives you:
+  property.name       → "timeout" (the property name as String)
+  property.returnType → the Kotlin type
+  thisRef             → the object owning the property
+
+BUILT-IN DELEGATES:
+  lazy      → deferred, cached, thread-safe by default
+  notNull   → lateinit for primitives (boxes as Any?)
+  observable → callback AFTER change (T, T) → Unit
+  vetoable  → callback BEFORE change (T, T) → Boolean (true=allow, false=reject)
+  by map    → Map.getValue extension — uses property.name as key
+
+by map internals:
+  Map<String, Any?> implements getValue via extension
+  property.name becomes the map key
+  MutableMap also implements setValue
+
+LOCAL DELEGATES:
+  Delegates work inside functions, not just classes.
 ```
 
 ---
 
-*← [Phase 4 — Functions & Lambdas](04_functions_lambdas_inlining.md) | [Phase 6 — Extension Functions →](06_extension_functions.md)*
+## Self-Test
+
+1. What two operator functions must a delegate implement for `var`?
+2. What does `KProperty<*>` give you inside a delegate's `getValue`?
+3. `Delegates.notNull<Int>()` — how does it handle primitives without a null reference?
+4. What exception does `notNull` throw? How does it differ from `lateinit`'s exception?
+5. `observable` vs `vetoable` — when does the callback fire for each? What does each return?
+6. How does `by map` work internally? What stdlib function makes a `Map` a valid delegate?
+7. Write a custom delegate that logs every read of a property.
+
+---
+
+# Master Summary: Phase 5
+
+> `lateinit`, `lazy`, and delegates all answer "when does this initialise?" `lateinit` = I'll do it manually before use. `lazy` = automatically on first access, cached. Delegate = an external object decides everything.
+
+**1. `lateinit`** (Q5.1)
+Null sentinel on backing field. Reference types only. Getter checks null → `UninitializedPropertyAccessException`. `::prop.isInitialized` = null check, not reflection. Not thread-safe — backing field is not `@Volatile`.
+
+**2. `lazy`** (Q5.2)
+Double-checked locking (`SYNCHRONIZED`). `@Volatile` for visibility, `synchronized` for mutual exclusion. `PUBLICATION` = multiple inits OK, first wins. `NONE` = no sync, single-thread. Throw = not cached. `val` only — immutability contract. Fragment lazy = memory leak (survives view destroy).
+
+**3. Delegates** (Q5.3)
+`by` compiles to `getValue`/`setValue` on the delegate object. `KProperty<*>` gives name and type metadata. `notNull` = lateinit for primitives (boxes). `observable` = callback after change. `vetoable` = callback before (can reject). `by map` = `Map.getValue` extension uses `property.name` as key.
+
+---
+
+## Master Chain: Properties
+
+```
+Property = getter/setter + optional backing field
+      │
+      ├── eager: val x = compute()  → runs at construction time
+      │
+      ├── lateinit: deferred manual init
+      │     → null sentinel on backing field
+      │     → reference types only (primitives have no null)
+      │     → UIAPE if read before set
+      │     → NOT thread-safe (no @Volatile)
+      │
+      ├── lazy: deferred automatic init
+      │     → Lazy<T> delegate created at class load
+      │     → computed on first access, cached
+      │     → SYNCHRONIZED: double-checked locking (default)
+      │     → PUBLICATION: multiple inits OK, first wins
+      │     → NONE: no sync, single-thread only
+      │     → @Volatile: write goes to main memory immediately
+      │     → throw = not cached, retry on next access
+      │     → Fragment lazy = memory leak (view refs survive onDestroyView)
+      │
+      └── by delegate: external object controls all get/set
+            → getValue(thisRef, KProperty<*>)
+            → setValue(thisRef, KProperty<*>, value)
+            → notNull (primitives, boxes as Any?)
+            → observable (callback after change → notify)
+            → vetoable (callback before change → validate/reject)
+            → by map (Map.getValue extension, property.name = key)
+```
+
+---
+
+*← [Phase 4 — Functions and Lambdas](04_functions_lambdas_inlining.md) | [Phase 6 — Extension Functions →](06_extension_functions.md)*

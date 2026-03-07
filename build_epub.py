@@ -482,11 +482,14 @@ def make_nav(chapters):
     current_subject = None
     for cid, _, title, subject in chapters:
         if subject != current_subject:
+            if current_subject is not None:
+                items.append('      </ol></li>')  # Close previous subject
             current_subject = subject
             items.append(f'      <li><span>{escape(subject)}</span><ol>')
         items.append(f'        <li><a href="chapters/{cid}.xhtml">{escape(title)}</a></li>')
     # Close last subject
-    items.append('      </ol></li>')
+    if current_subject is not None:
+        items.append('      </ol></li>')
 
     nav_items = '\n'.join(items)
     return f'''<?xml version="1.0" encoding="UTF-8"?>
