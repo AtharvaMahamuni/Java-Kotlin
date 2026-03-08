@@ -1,197 +1,164 @@
-# Phase 17: Performance and Memory
+# Phase 17 — Performance and Memory
+
+> Performance problems in Android have a common root: the main thread doing too much. Memory leaks have a common root: a long-lived object holding a reference to a short-lived one. Understanding both from first principles — GC roots, reachability, the 16ms render budget — is what separates candidates who can spot the bug from those who need a profiler to find it.
 
 ## Navigation
-[← Master Index](master_chains.md)
+
+[← Phase 16 — Android System Internals](16_android_system_internals.md) | [→ Phase 18 — Testing](18_testing.md)
 
 ## Questions in This File
+
 - [Q17.1 — Memory Leaks — Top 5 Causes](#q171--memory-leaks--top-5-causes)
 - [Q17.2 — RecyclerView Internals](#q172--recyclerview-internals)
 - [Q17.3 — The 16ms Budget](#q173--the-16ms-budget)
-- [Q17.4 — Testing](#q174--testing)
 
 ---
 
-## Q17.1 — Memory Leaks — Top 5 Causes
+# Q17.1 — Memory Leaks — Top 5 Causes
 
-> **Builds on:** [Q0.1 — Heap allocation and GC](00_jvm_mental_model.md#q01--primitives-vs-references) · [Q2.4 — Anonymous objects and inner classes](02_classes_and_objects.md#q24--the-object-keyword)
-> **Connects to:** [Q17.2 — RecyclerView](17_performance_and_memory.md#q172--recyclerview-internals) · [Q16.1 — Activity lifecycle](16_android_system_internals.md#q161--activity-and-fragment-lifecycle)
-> **Reference:** [Android Docs — Inspect your app's memory usage](https://developer.android.com/studio/profile/memory-profiler)
-
-### The Concrete Picture
-
-Starting state: Five common scenarios where a short-lived object gets anchored to a long-lived one.
-
-```
-LEAK PATTERN (general):
-  Long-lived holder ──holds ref──► Short-lived object that should be freed
-                                   │
-                                   GC cannot collect it (still reachable!)
-                                   Memory grows on every rotation/navigation
-
-LEAK 1 — Singleton holds Activity context:
-  NetworkManager (singleton, lives forever)
-    └── context: Context  ──► MainActivity (should die on rotation)
-  Fix: context.applicationContext (same lifetime as singleton)
-
-LEAK 2 — Inner class holds outer:
-  MyActivity  ──implicit ref──► inner class MyHandler
-                                    └── posted in MessageQueue for 10s
-  Handler fires after 10s → Activity never GC'd during that window
-
-LEAK 3 — postDelayed captures Activity:
-  handler.postDelayed({ startActivity(Intent(this, ...)) }, 2000)
-  Lambda captures `this` (Activity) → Activity lives for 2s after destruction
-
-LEAK 4 — GlobalScope captures Activity:
-  GlobalScope.launch { ...; updateUI() }  ← lambda captures `this`
-  GlobalScope.Job never cancelled → coroutine holds Activity ref indefinitely
-
-LEAK 5 — Listener registered but never unregistered:
-  registerReceiver() in onResume → must unregisterReceiver() in onPause
-```
-
-### First Principles: What Is a Memory Leak?
-
-A memory leak occurs when an object that should be garbage collected is still **reachable** from a GC root (live reference). The GC cannot free it, so memory usage grows over time.
-
-GC roots in Android: threads, static fields, JNI references, and `Application.onCreate()` objects.
-
-**The leak chain:** A long-lived object holds a reference to a short-lived object that should have been freed.
+> **Builds on:** [Q0.1 (heap allocation and GC)](phase0_jvm_mental_model_v3.md#q01--primitives-vs-references) · [Q2.4 (anonymous objects and inner classes)](02_classes_and_objects.md#q24--the-object-keyword)
+> **Connects to:** [Q16.1 (Activity lifecycle)](16_android_system_internals.md#q161--activity-and-fragment-lifecycle)
 
 ---
 
-### Leak 1: Activity Context in Singleton
+## The Core Rule
+
+```
+Memory leak = long-lived holds ref
+  to short-lived → GC can't collect
+
+LIFETIME (longest → shortest):
+┌─────────────────────────────┐
+│          Process            │
+│   ┌─────────────────┐      │
+│   │   Application   │      │
+│   │  ┌───────────┐  │      │
+│   │  │ Activity  │  │      │
+│   │  │ ┌───────┐ │  │      │
+│   │  │ │ View  │ │  │      │
+│   │  │ └───────┘ │  │      │
+│   │  └───────────┘  │      │
+│   └─────────────────┘      │
+└─────────────────────────────┘
+Outer holds inner ref → LEAK!
+```
+
+---
+
+## Leak 1 — Singleton Holding Activity Context
 
 ```kotlin
-// WRONG — singleton holds Activity context:
+// WRONG — singleton (process lifetime) holds Activity (shorter lifetime):
 object NetworkManager {
-    lateinit var context: Context  // LEAKED!
-
-    fun init(context: Context) {
-        this.context = context  // storing Activity → Activity can never be GC'd!
-    }
+    var context: Context? = null
+    fun init(ctx: Context) { context = ctx }  // ctx is an Activity!
 }
+// Activity destroyed on rotation → still referenced by NetworkManager → never GC'd
 
-// NetworkManager lives forever (singleton)
-// Activity (short-lived) referenced by singleton → never GC'd!
-// Result: Every Activity instance leaks — memory grows with each rotation!
-
-// FIX: use Application context:
+// CORRECT — use Application context (same lifetime as the singleton):
 object NetworkManager {
-    lateinit var context: Context  // Application context is safe
-
-    fun init(context: Context) {
-        this.context = context.applicationContext  // lives as long as the app!
-    }
+    lateinit var context: Context
+    fun init(ctx: Context) { context = ctx.applicationContext }  // safe
 }
 ```
 
-**Why `applicationContext` fixes it:** `Application` is a singleton itself — its lifetime IS the app lifetime. Holding it in another singleton creates no extra retention.
+**Why `applicationContext` is safe:** The `Application` object is itself a singleton — holding it in another singleton creates no additional retention.
 
 ---
 
-### Leak 2: Non-Static Inner Class Holding Outer Reference
+## Leak 2 — Non-Static Inner Class Holding Outer Reference
 
 ```kotlin
+// WRONG — inner class holds implicit reference to MyActivity:
 class MyActivity : Activity() {
-    // Inner class (non-static) implicitly holds reference to outer MyActivity:
     inner class MyHandler : Handler(Looper.getMainLooper()) {
         override fun handleMessage(msg: Message) {
-            // Can access MyActivity's members because it holds a reference!
+            // accesses MyActivity's members via implicit outer reference
         }
     }
 
-    val handler = MyHandler()  // handler is posted with 10-second delay
+    val handler = MyHandler()
 
-    override fun onDestroy() {
-        super.onDestroy()
-        // handler.removeCallbacksAndMessages(null)  ← NOT called!
+    override fun onCreate(...) {
+        handler.postDelayed({ }, 10_000)  // message lives in queue for 10s
     }
+    // User rotates → Activity destroyed → handler still in MessageQueue
+    // handler holds MyActivity → MyActivity not GC'd → LEAK for 10s
 }
 
-// User rotates device → Activity destroyed
-// Handler still in MessageQueue (10-second delay not expired)
-// Handler holds MyActivity reference → MyActivity not GC'd → LEAK!
-```
+// CORRECT — option 1: remove callbacks in onDestroy:
+override fun onDestroy() {
+    super.onDestroy()
+    handler.removeCallbacksAndMessages(null)
+}
 
-Non-static inner classes and anonymous objects (see [Q2.4 — The object keyword](02_classes_and_objects.md#q24--the-object-keyword)) hold an implicit reference to their outer class.
-
-**Fix:**
-```kotlin
-// Option 1: Static inner class (no implicit outer reference):
-class MyActivity : Activity() {
-    private class StaticHandler(activity: WeakReference<MyActivity>) :
-        Handler(Looper.getMainLooper()) {
-        override fun handleMessage(msg: Message) {
-            activity.get()?.handleIt()  // null if Activity destroyed
-        }
-    }
-
-    // Option 2: Remove callbacks in onDestroy:
-    override fun onDestroy() {
-        super.onDestroy()
-        handler.removeCallbacksAndMessages(null)  // removes pending messages
+// CORRECT — option 2: static class + WeakReference:
+private class StaticHandler(activity: WeakReference<MyActivity>) :
+    Handler(Looper.getMainLooper()) {
+    override fun handleMessage(msg: Message) {
+        activity.get()?.handleIt()   // null if Activity was destroyed
     }
 }
 ```
+
+Non-static inner classes and anonymous objects (see [Q2.4](02_classes_and_objects.md#q24--the-object-keyword)) hold an implicit `this$0` reference to the outer class. The Kotlin `inner` keyword generates this reference.
 
 ---
 
-### Leak 3: Handler with `postDelayed` Leak
+## Leak 3 — `postDelayed` Capturing Activity
 
-Same as Leak 2 but worth emphasizing: `handler.postDelayed(runnable, delay)` keeps `runnable` in the MessageQueue until it fires. If the `runnable` captures the Activity (via anonymous class / lambda), the Activity leaks for the duration of the delay.
+Same root cause as Leak 2 — a lambda captures `this` and lives in the MessageQueue.
 
 ```kotlin
-// WRONG:
+// WRONG — lambda captures `this` (Activity) for 2 seconds:
 class SplashActivity : Activity() {
     override fun onCreate(...) {
         Handler(Looper.getMainLooper()).postDelayed({
-            startActivity(Intent(this, MainActivity::class.java))  // captures `this`!
+            startActivity(Intent(this, MainActivity::class.java))
         }, 2000)
     }
-    // If user presses back: Activity should die, but lambda holds `this` for 2 seconds
+    // User presses Back → Activity should die
+    // Lambda holds `this` → Activity lives for 2s → LEAK
 }
 
-// FIX: store the Runnable and cancel in onDestroy:
+// CORRECT — cancel the runnable if Activity is destroyed:
 class SplashActivity : Activity() {
-    private val navigateRunnable = Runnable {
+    private val handler = Handler(Looper.getMainLooper())
+    private val navigate = Runnable {
         startActivity(Intent(this, MainActivity::class.java))
     }
-    private val handler = Handler(Looper.getMainLooper())
 
-    override fun onCreate(...) {
-        handler.postDelayed(navigateRunnable, 2000)
-    }
-
+    override fun onCreate(...) { handler.postDelayed(navigate, 2000) }
     override fun onDestroy() {
         super.onDestroy()
-        handler.removeCallbacks(navigateRunnable)  // cancel if Activity is destroyed
+        handler.removeCallbacks(navigate)  // cancel before Activity is GC'd
     }
 }
 ```
 
 ---
 
-### Leak 4: `GlobalScope` Coroutine
+## Leak 4 — `GlobalScope` Coroutine
 
 ```kotlin
+// WRONG — GlobalScope lives as long as the process:
 class MyActivity : Activity() {
     override fun onCreate(...) {
-        GlobalScope.launch {  // WRONG! GlobalScope lives as long as the process!
+        GlobalScope.launch {
             val result = api.fetchData()
             withContext(Dispatchers.Main) {
-                updateUI(result)  // captures `this` (MyActivity) here!
+                updateUI(result)  // captures `this` (Activity) here!
             }
         }
     }
-    // Activity is destroyed → but coroutine in GlobalScope continues running!
-    // Holds reference to MyActivity (via `this` in the lambda) → LEAK!
 }
+// Activity destroyed → coroutine keeps running in GlobalScope
+// Coroutine holds Activity reference via lambda capture → LEAK
 
-// FIX: use lifecycle-bound scope:
+// CORRECT — lifecycle-bound scope:
 class MyActivity : Activity() {
     override fun onCreate(...) {
-        lifecycleScope.launch {  // cancelled when Activity is destroyed!
+        lifecycleScope.launch {   // cancelled when Activity is destroyed
             val result = api.fetchData()
             updateUI(result)
         }
@@ -199,642 +166,502 @@ class MyActivity : Activity() {
 }
 ```
 
-**`GlobalScope` leak chain:** `GlobalScope.Job` → coroutine → lambda → `this` (Activity). GlobalScope's Job is never cancelled → Activity never freed ([Q10.3 — Exception handling rules](10_structured_concurrency.md#q103--exception-handling-rules)).
+**Leak chain:** `GlobalScope.Job` (never cancelled) → coroutine → lambda → `this` (Activity). Since `GlobalScope.Job` is never cancelled, the chain is never broken.
 
 ---
 
-### Leak 5: Unregistered Listener
-
-Three common examples:
+## Leak 5 — Unregistered Listener
 
 ```kotlin
-// 1. BroadcastReceiver:
+// BroadcastReceiver — must pair register/unregister:
 class MyActivity : Activity() {
-    private val receiver = MyBroadcastReceiver()
+    private val receiver = MyReceiver()
 
     override fun onResume() {
-        registerReceiver(receiver, IntentFilter("MY_ACTION"))  // register
+        super.onResume()
+        registerReceiver(receiver, IntentFilter("MY_ACTION"))
     }
-
     override fun onPause() {
-        unregisterReceiver(receiver)  // MUST unregister! Or memory leaks.
+        super.onPause()
+        unregisterReceiver(receiver)  // MUST match the register call
     }
 }
 
-// 2. SensorManager:
-class SensorActivity : Activity() {
-    private val sensorManager by lazy { getSystemService(SENSOR_SERVICE) as SensorManager }
-    private val sensorListener = object : SensorEventListener { ... }
+// SensorManager — same pattern:
+override fun onResume() { sensorManager.registerListener(listener, sensor, RATE) }
+override fun onPause() { sensorManager.unregisterListener(listener) }
 
-    override fun onResume() { sensorManager.registerListener(sensorListener, ...) }
-    override fun onPause() { sensorManager.unregisterListener(sensorListener) }
-}
-
-// 3. EventBus / custom listener:
-class MyFragment : Fragment() {
-    override fun onStart() { EventBus.getDefault().register(this) }
-    override fun onStop() { EventBus.getDefault().unregister(this) }
-}
+// EventBus:
+override fun onStart() { EventBus.getDefault().register(this) }
+override fun onStop() { EventBus.getDefault().unregister(this) }
 ```
 
-### Memory Trick
+The system/bus holds a reference to the listener. If you never unregister, the system holds the Activity forever.
+
+---
+
+## ## Traps
+
+**Trap — `WeakReference` not checked before use:**
+
+```kotlin
+// WRONG:
+activity.get().doSomething()   // NPE if Activity was collected
+
+// CORRECT:
+activity.get()?.doSomething()  // safe-call, no-op if collected
+```
+
+**Trap — Forgetting that ViewBinding in Fragment leaks (Leak 2 variant):**
+
+Fragment's `binding` field holds a view reference. The Fragment object survives back-stack navigation but the view is destroyed in `onDestroyView`. See [Q16.1](16_android_system_internals.md#q161--activity-and-fragment-lifecycle).
+
+---
+
+## Memory Trick
 
 ```
 5 LEAKS — mnemonic "SHDGU":
-  S — Singleton with Activity context        (fix: applicationContext)
-  H — Handler inner class (non-static)       (fix: static + WeakReference)
-  D — Delayed Runnable captures `this`       (fix: removeCallbacks in onDestroy)
-  G — GlobalScope coroutine captures this    (fix: lifecycleScope)
-  U — Unregistered listener                  (fix: unregister in matching lifecycle)
+  S — Singleton with Activity context     fix: applicationContext
+  H — Handler inner class (non-static)   fix: static + WeakReference or removeCallbacks
+  D — Delayed Runnable captures `this`   fix: removeCallbacks in onDestroy
+  G — GlobalScope coroutine captures this fix: lifecycleScope
+  U — Unregistered listener              fix: unregister in matching lifecycle method
 
-RULE: lifecycle of HOLDER must not outlive lifecycle of HELD OBJECT
-  Singleton > Application > Activity > Fragment > View
-  If holder is higher in this chain than held → leak risk
+RULE: Lifetime of HOLDER must not outlive lifetime of HELD.
+  Process > Application > Activity > Fragment > View
+  If holder is higher → leak risk.
 
-LeakCanary detects these at runtime → install in debug builds only
+LeakCanary: install in debug builds only. It detects these automatically.
 ```
 
 ---
 
-## Q17.2 — RecyclerView Internals
+## Self-Test
 
-> **Builds on:** [Q17.1 — Memory Leaks](17_performance_and_memory.md#q171--memory-leaks--top-5-causes) · [Q16.1 — Fragment Lifecycle](16_android_system_internals.md#q161--activity-and-fragment-lifecycle)
-> **Connects to:** [Q17.3 — The 16ms Budget](17_performance_and_memory.md#q173--the-16ms-budget)
-> **Reference:** [Android Docs — RecyclerView](https://developer.android.com/develop/ui/views/layout/recyclerview)
+1. What is the definition of a memory leak in terms of GC reachability?
+2. Why does a non-static inner class in Java/Kotlin hold a reference to its outer class? What bytecode field is generated?
+3. You call `GlobalScope.launch { updateUI() }` in an Activity. Trace the complete leak chain.
+4. `registerReceiver()` in `onResume()` — where must the matching `unregisterReceiver()` call go? Why not `onDestroy()`?
+5. Why is `context.applicationContext` safe to hold in a singleton?
 
-### The Concrete Picture
+---
 
-Starting state: A list of 1,000 user items. Screen shows 10 at a time. User scrolls down.
+# Q17.2 — RecyclerView Internals
 
-```
-VISIBLE screen (10 items shown):
-  [Item 0] [Item 1] ... [Item 9]   ← currently on screen
+> **Builds on:** [Q17.1 (Memory leaks)](17_performance_and_memory.md#q171--memory-leaks--top-5-causes) · [Q16.1 (Fragment lifecycle)](16_android_system_internals.md#q161--activity-and-fragment-lifecycle)
+> **Connects to:** [Q17.3 (16ms budget)](17_performance_and_memory.md#q173--the-16ms-budget)
 
-User scrolls down → Item 0 scrolls off top:
+---
 
-  Step 1: RecyclerView tries Scrap cache
-          Item 0 still attached? NO → move to next cache level
-
-  Step 2: RecyclerView tries Cache (holds last 2 scrolled-off views)
-          Cache has Item 0: YES → retrieve with NO rebind (position matches!)
-          User scrolls back up → Item 0 is back instantly
-
-  Step 3 (if cache full, i.e. 3rd scroll-off): ViewCacheExtension (rarely used)
-
-  Step 4 (cache miss): RecycledViewPool
-          Pool has a ViewHolder of correct type → retrieve, call onBindViewHolder
-          (rebind required — position changed)
-
-  Step 5 (pool empty): onCreateViewHolder → inflate XML, create new ViewHolder
-          (most expensive, should be rare for normal scrolling)
-
-ANTI-PATTERN: RecyclerView wrap_content inside NestedScrollView
-  → RecyclerView measures ALL 1,000 items at once
-  → no recycling possible (all views stay inflated simultaneously)
-  Fix: ConcatAdapter with match_parent RecyclerView
-```
-
-### The 4-Level Cache
-
-RecyclerView has a sophisticated recycling system to avoid inflating views unnecessarily:
+## The Core Rule
 
 ```
-Level 1 — SCRAP CACHE (fastest):
-  Views that are still "attached" but about to be recycled (during layout pass)
-  Retrieved by exact position — no rebind needed!
+RecyclerView has a 4-level cache.
+Only levels 1 and 2 (Scrap and Cache) avoid onBindViewHolder.
+Level 4 (RecycledViewPool) requires a rebind.
+Level 5 (miss) calls onCreateViewHolder — inflate XML.
 
-Level 2 — CACHE (fast):
-  Recently scrolled-off views (default: holds 2)
-  Retrieved by position — no rebind needed!
-  (The view still has valid data for its position)
+wrap_content inside NestedScrollView defeats recycling entirely.
+```
 
-Level 3 — VIEW CACHE EXTENSION (custom):
-  User-defined cache layer (rarely used, very specialized)
+---
 
-Level 4 — RECYCLED VIEW POOL (slow):
-  Views by view type — need rebind (onBindViewHolder called)
-  Default capacity: 5 per view type
-  Shared across multiple RecyclerViews with setRecycledViewPool()
+## The 4-Level Cache
+
+```
+Scroll down: item goes off screen.
+RecyclerView tries each level:
+
+Level 1 — Scrap cache:
+  Views still "attached" during an ongoing layout pass.
+  Retrieved by exact position. NO rebind.
+  (Used internally during layout, rarely relevant to your code)
+
+Level 2 — Cache (default: 2 items):
+  Recently scrolled-off views, cached by position.
+  Retrieved by position. NO rebind (view data still valid for that position).
+  User scrolls back → item is back instantly from cache.
+
+Level 3 — ViewCacheExtension:
+  Custom cache layer. Rarely used. You implement the lookup logic.
+
+Level 4 — RecycledViewPool (default: 5 per view type):
+  Views by view type, not by position.
+  Retrieved, then MUST call onBindViewHolder (data is stale).
+  Shared across multiple RecyclerViews with setRecycledViewPool().
+
+Level 5 — Miss:
+  Pool empty. Calls onCreateViewHolder → inflate XML → expensive.
 ```
 
 ```
-Scroll down → item goes off screen:
-1. Try Scrap → not available (new layout)
-2. Try Cache → holds last 2 items → retrieved without rebind!
-3. Try ViewCacheExtension → custom logic
-4. Try RecycledViewPool → get a ViewHolder, call onBindViewHolder, rebind
-
-onCreateViewHolder called only when: pool is empty AND no recycled views available
+RECYCLERVIEW CACHE (fast → slow):
+┌─────────────────────────────┐
+│ L1: Scrap   → 0 rebind ✓  │
+│ L2: Cache   → 0 rebind ✓  │
+│ L3: Custom ext. (rare)     │
+│ L4: Pool    → rebind! ⚠   │
+│ L5: MISS    → inflate 🐢  │
+└─────────────────────────────┘
+Only L1+L2 skip onBindViewHolder
 ```
 
-### `setHasFixedSize(true)` — What It Skips
+---
+
+## `setHasFixedSize(true)` — What It Skips
 
 ```kotlin
 recyclerView.setHasFixedSize(true)
 ```
 
-This tells RecyclerView: "The adapter changes don't affect my size. Skip re-measuring me on every change."
+Without: Every `notifyDataSetChanged()` → `requestLayout()` → RecyclerView re-measures → re-measures parent → expensive chain up the view tree.
 
-Without `setHasFixedSize(true)`: Every `notifyDataSetChanged()` triggers a full `requestLayout()` → RecyclerView re-measures itself → potentially re-measures the parent → expensive!
+With: Only relays children. Skips `requestLayout()` to parent. RecyclerView's own size is declared stable.
 
-With `setHasFixedSize(true)`: Only re-layouts RecyclerView's children. Skips the parent chain re-measurement.
+**Use when:** RecyclerView height/width doesn't change when adapter content changes (e.g., `match_parent`, fixed `dp`).
 
-**Use when:** RecyclerView's size doesn't depend on adapter content (fixed height/width, `match_parent`, etc.).
+---
 
-### `notifyDataSetChanged()` vs `submitList()` with `DiffUtil`
+## `notifyDataSetChanged()` vs `DiffUtil`
 
 ```kotlin
-// BAD — notifyDataSetChanged():
+// WRONG — blunt hammer:
 adapter.notifyDataSetChanged()
-// Effect: EVERY visible item is recycled and rebound
-// Animation: none (no add/remove/move animations)
-// Performance: O(N) rebinds even if 1 item changed
-// Problem: RecyclerView can't animate changes — jarring UX
+// All visible items recycled and rebound. No animation. O(N) rebinds.
 
-// GOOD — DiffUtil + submitList (with ListAdapter):
+// CORRECT — surgical diff:
 class UserAdapter : ListAdapter<User, UserViewHolder>(
     object : DiffUtil.ItemCallback<User>() {
         override fun areItemsTheSame(old: User, new: User) = old.id == new.id
+        // identity check — is this the same logical item?
+
         override fun areContentsTheSame(old: User, new: User) = old == new
+        // equality check — did the data change?
     }
-) { ... }
+)
 
 adapter.submitList(newList)
-// DiffUtil runs on background thread, finds minimum changes,
-// then RecyclerView animates only the changed items!
+// DiffUtil runs Myers' diff on a background thread.
+// RecyclerView animates only the changed items.
+// Unchanged items: no rebind.
 ```
 
-### Myers' Diff Algorithm
+**Myers' diff complexity:** `O(N + D²)` where `N` = list size, `D` = edit distance. Practical limit: ~1,000 items. Beyond that, consider pre-computing diffs or paging.
 
-DiffUtil uses Myers' diff algorithm to find the minimum set of edits (insertions, deletions) to transform the old list to the new list.
+---
 
-- Time complexity: `O((N + D²)` where `N` = list size, `D` = edit distance
-- Practical limit: ~1,000 items efficiently. For larger lists, consider chunking.
-
-```kotlin
-// For lists > 1000 items, DiffUtil can be slow even on background thread:
-// Consider: paged loading, sorting changes, or limiting batch sizes
-```
-
-### RecyclerView Inside NestedScrollView — Anti-Pattern
+## `wrap_content` in `NestedScrollView` — The Anti-Pattern
 
 ```xml
-<!-- ANTI-PATTERN: RecyclerView inside NestedScrollView -->
+<!-- WRONG: -->
 <NestedScrollView>
     <LinearLayout>
-        <TextView android:text="Header" />
+        <TextView ... />
         <RecyclerView
-            android:layout_height="wrap_content" /> <!-- PROBLEM! -->
+            android:layout_height="wrap_content" />  ← kills recycling
     </LinearLayout>
 </NestedScrollView>
 ```
 
-**What happens:** `wrap_content` height causes RecyclerView to measure ALL items at once — it cannot recycle! Every item is inflated and measured, regardless of whether it's visible. For 1,000 items, all 1,000 views are in memory simultaneously.
+**What happens:** `wrap_content` forces RecyclerView to measure all items at once to determine its own height. All N items are inflated and kept in memory simultaneously. Recycling is disabled — the pool is never used.
 
 **Fix options:**
-1. **Use `ConcatAdapter`** — combine header adapter + content adapter, keep RecyclerView as the root with `match_parent`
-2. **Use `addItemDecoration`** — add header-like decorations to RecyclerView itself
-3. **Set a fixed height** on RecyclerView (not `wrap_content`) — recycling works
-4. **Use Compose** with `LazyColumn` — handles this natively
-
-### Memory Trick
 
 ```
-4-LEVEL CACHE (fastest → slowest):
-  1. Scrap       → still attached, exact position → NO rebind
-  2. Cache       → recently scrolled off (default 2) → NO rebind
-  3. Extension   → custom (rare)
-  4. Pool        → by view type (default 5 per type) → MUST rebind
+Option 1: ConcatAdapter
+  Combine header adapter + items adapter. Keep RecyclerView as the root with match_parent.
 
-KEY: only levels 1 and 2 avoid onBindViewHolder!
+Option 2: Fixed height
+  android:layout_height="400dp"  — recycling works but height is fixed.
 
-setHasFixedSize(true):
-  notifyDataSetChanged() → normally triggers requestLayout() up the full tree
-  setHasFixedSize(true) → skip parent re-measurement → only children re-laid out
-
-DiffUtil:
-  notifyDataSetChanged()  → O(N) rebinds, no animation, jarring
-  submitList(newList)     → Myers diff on background thread, animate only changes
-  DiffUtil limit: ~1,000 items; larger lists → consider paging
-
-NEVER: RecyclerView wrap_content inside NestedScrollView
-  = disables recycling = all N items inflated simultaneously = OOM risk
+Option 3: Compose LazyColumn
+  Handles this natively — only visible items are composed.
 ```
 
 ---
 
-## Q17.3 — The 16ms Budget
+## ## Traps
 
-> **Builds on:** [Q17.2 — RecyclerView](17_performance_and_memory.md#q172--recyclerview-internals) · [Q16.5 — Handler/Looper (main thread)](16_android_system_internals.md#q165--handler-looper-and-messagequeue)
-> **Connects to:** [Q17.4 — Testing](17_performance_and_memory.md#q174--testing)
-> **Reference:** [Android Docs — Slow rendering](https://developer.android.com/topic/performance/vitals/render)
-
-### The Concrete Picture
-
-Starting state: A custom `TemperatureView` redraws every frame (animated thermometer).
-
-```
-FRAME TIMELINE (60 FPS = 16.67ms per frame):
-
-  t=0ms     Choreographer signals new frame (Vsync)
-               │
-               ├── MEASURE: how big is TemperatureView?
-               │     ViewGroup.measure() → recursive → O(depth) calls
-               │
-               ├── LAYOUT: where is TemperatureView positioned?
-               │     ViewGroup.layout() → final x/y/width/height
-               │
-               └── DRAW: paint TemperatureView onto Canvas
-                     View.onDraw(canvas) ← THIS is where the bug lives
-
-  t=16.67ms  Next Vsync — new frame expected
-
-  IF onDraw() creates Paint object:
-    Paint() allocation → GC pressure → GC pause → frame takes 20ms → DROP!
-
-CORRECT:
-  init { val paint = Paint() ... }   ← allocated once
-  onDraw { canvas.drawText(..., paint) }  ← reused every frame, 0 allocations
-
-requestLayout() → triggers all 3 phases (Measure + Layout + Draw)
-invalidate()    → triggers only Draw phase (cheapest)
-```
-
-### First Principles: Why 16ms?
-
-Displays typically refresh at 60 frames per second (60 FPS). Time per frame = 1000ms / 60 = **16.67ms**. If any frame takes longer than 16ms to produce, the display misses that frame and shows the previous one — a dropped frame, visible as "jank" (stuttering animation).
-
-High refresh rate displays (90Hz, 120Hz) reduce this budget to 11ms or 8ms.
-
-### Three Phases of Rendering
-
-```
-Every frame: Measure → Layout → Draw
-
-1. MEASURE: How big should each view be?
-   ViewGroup.measure() → recursive, can be expensive for complex hierarchies
-
-2. LAYOUT: Where should each view be positioned?
-   ViewGroup.layout() → sets final positions and sizes
-
-3. DRAW: Paint each view onto a Canvas.
-   View.onDraw() → most expensive if creating objects, complex paths
-
-Each phase is triggered when:
-  - Measure/Layout: view requests layout (invalidate + requestLayout)
-  - Draw: view requests redraw (invalidate only)
-
-requestLayout() triggers all 3. invalidate() triggers only Draw.
-```
-
-**Optimization:** Only call `invalidate()` (not `requestLayout()`) when only appearance changes, not size/position. `setHasFixedSize(true)` on RecyclerView avoids unnecessary `requestLayout()` up the tree.
-
-### Never Create Objects in `onDraw`
+**Trap — `setHasFixedSize(true)` when size CAN change:**
 
 ```kotlin
-// WRONG — creates Paint object on every frame:
+// WRONG — RecyclerView grows as items are added:
+recyclerView.layoutParams.height = WRAP_CONTENT
+recyclerView.setHasFixedSize(true)
+// RecyclerView won't re-measure on notifyItemInserted → wrong size shown
+```
+
+**Trap — `notifyDataSetChanged()` in animations:**
+
+```kotlin
+// WRONG — no animation, all items flash:
+fun onUserUpdated(newList: List<User>) {
+    items = newList
+    adapter.notifyDataSetChanged()
+}
+
+// CORRECT — smooth animation:
+fun onUserUpdated(newList: List<User>) {
+    adapter.submitList(newList)  // DiffUtil handles animation
+}
+```
+
+**Trap — `areContentsTheSame` returning false for equal objects:**
+
+```kotlin
+// WRONG — data class with a mutable list field breaks equality:
+data class User(val id: String, val tags: MutableList<String>)
+// MutableList equality depends on content, but if mutated in place,
+// the same list reference shows equal even when content changed.
+// Fix: use immutable List<String>
+```
+
+---
+
+## Memory Trick
+
+```
+4-LEVEL CACHE (fastest → slowest):
+  1. Scrap     → still attached, exact position → NO rebind
+  2. Cache     → recently scrolled off (2) → NO rebind
+  3. Extension → custom (rare)
+  4. Pool      → by view type (5 per type) → MUST rebind
+  5. Miss      → onCreateViewHolder → inflate → expensive
+
+Only 1 and 2 skip onBindViewHolder.
+
+setHasFixedSize(true): skip requestLayout() to parent → only when size doesn't change.
+
+DiffUtil vs notifyDataSetChanged:
+  notifyDataSetChanged → O(N) rebinds, no animation.
+  submitList (ListAdapter) → Myers' diff on BG thread, animate only changes.
+  DiffUtil limit: ~1,000 items.
+
+NEVER: RecyclerView wrap_content inside NestedScrollView
+  = all N items inflated simultaneously = recycling disabled = OOM risk for large lists.
+```
+
+---
+
+## Self-Test
+
+1. Name the 4 cache levels in RecyclerView. Which ones avoid `onBindViewHolder`? Which requires it?
+2. What does `setHasFixedSize(true)` skip? When is it wrong to use it?
+3. You change one item in a list of 500 and call `notifyDataSetChanged()`. How many `onBindViewHolder` calls happen? What about `submitList()`?
+4. Why does `wrap_content` on a RecyclerView inside a `NestedScrollView` disable recycling?
+5. What is Myers' diff algorithm? What is its practical size limit for smooth performance?
+
+---
+
+# Q17.3 — The 16ms Budget
+
+> **Builds on:** [Q17.2 (RecyclerView)](17_performance_and_memory.md#q172--recyclerview-internals) · [Q16.5 (main thread message loop)](16_android_system_internals.md#q165--handler-looper-and-messagequeue)
+> **Connects to:** [Q17.1 (allocation → GC pressure)](17_performance_and_memory.md#q171--memory-leaks--top-5-causes)
+
+---
+
+## The Core Rule
+
+```
+60 FPS = 16.67ms per frame. 90Hz = 11ms. 120Hz = 8ms.
+Miss the budget → dropped frame → visible jank.
+
+Three phases per frame: Measure → Layout → Draw.
+requestLayout() triggers all 3. invalidate() triggers only Draw.
+NEVER allocate objects inside onDraw() — runs 60 times/second.
+```
+
+---
+
+## Three Phases of Rendering
+
+```
+16ms FRAME BUDGET (60 FPS):
+┌──────────┬────────┬────────┐
+│ MEASURE  │ LAYOUT │  DRAW  │
+│ how big? │ where? │ paint  │
+└──────────┴────────┴────────┘
+requestLayout() → all 3 phases
+invalidate()    → Draw only ✓
+
+Triggered by:
+  size/pos changes → requestLayout
+  color/text       → invalidate
+
+onDraw() runs 60×/sec:
+  ✗ new Paint() inside → GC → jank
+  ✓ val paint in init  → zero alloc
+```
+
+**Optimization rule:** Call `invalidate()` when only appearance changes (color, text content). Call `requestLayout()` only when size or position changes.
+
+---
+
+## Never Allocate in `onDraw()`
+
+```kotlin
+// WRONG — creates Paint on every frame (60 times/second):
 class TemperatureView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
-        val paint = Paint()  // ALLOCATED ON EVERY DRAW CALL!
+        val paint = Paint()    // 60 allocations/second → GC pressure → dropped frames
         paint.color = Color.RED
         paint.textSize = 48f
         canvas.drawText("23°C", 0f, 100f, paint)
     }
 }
 
-// CORRECT — create once in init:
+// CORRECT — allocate once in init:
 class TemperatureView(context: Context) : View(context) {
-    private val paint = Paint().apply {  // created ONCE
+    private val paint = Paint().apply {   // created ONCE
         color = Color.RED
         textSize = 48f
     }
 
     override fun onDraw(canvas: Canvas) {
-        canvas.drawText("23°C", 0f, 100f, paint)  // no allocation!
+        canvas.drawText("23°C", 0f, 100f, paint)  // zero allocation per frame
     }
 }
 ```
 
-**Why:** `onDraw` is called at 60 FPS = 60 times per second. Creating a `Paint` object 60 times/second generates significant GC pressure. GC pauses can cause dropped frames.
+**Objects to pre-allocate:** `Paint`, `Path`, `RectF`, `Rect`, `Matrix`, any `Bitmap` used for drawing.
 
-Same rule applies to: `Path`, `RectF`, `Rect`, `Matrix`, `Bitmap`, any `new` in `onDraw`.
+---
 
-### Baseline Profiles
+## `requestLayout()` vs `invalidate()` — Cost Comparison
 
-A Baseline Profile is a set of **AOT (Ahead-Of-Time) compilation rules** that tell ART which code paths to compile at install time, rather than JIT-compiled at runtime.
+```
+requestLayout():
+  View → parent.requestLayout() → parent.parent.requestLayout() → ... → root
+  Full Measure + Layout + Draw chain.
+  Slow for deep hierarchies. Avoid in animations.
 
-Without Baseline Profiles, ART uses JIT compilation — hot code paths are compiled progressively as the app runs. The first several seconds of app use may be slower as JIT hasn't compiled the hot paths yet.
+invalidate():
+  View → mark as dirty → next Vsync: only Draw phase runs.
+  No re-measurement. No re-layout. Fast.
 
-With Baseline Profiles:
-1. You run the app through key user journeys and record which methods are executed
-2. This creates a `baseline.prof` file included in your APK
-3. At install time, the Play Store / ART pre-compiles those methods
-4. **Cold start** and **first-scroll** performance improves dramatically
+Animation rule: use invalidate() in onDraw(), not requestLayout().
+```
 
-**Reported improvements:** Major apps (Tinder, Reddit, etc.) report **~30% cold start improvement** and **~15-20% frame time improvement** for first scrolls.
+---
+
+## Baseline Profiles — AOT for Hot Paths
+
+Without a Baseline Profile, ART uses JIT compilation. The first several seconds of app use are slower as JIT hasn't compiled the hot paths.
+
+With a Baseline Profile:
+1. Record critical user journeys (app startup, first scroll) using `Macrobenchmark`
+2. Generate `baseline.prof` — a list of methods to pre-compile
+3. Include in the APK → Play Store pre-compiles at install time
+4. Cold start and first-scroll are faster
 
 ```kotlin
-// Generate a Baseline Profile with Macrobenchmark:
+// Macrobenchmark to generate the profile:
 @ExperimentalBaselineProfilesApi
 class BaselineProfileGenerator {
-    @get:Rule
-    val rule = BaselineProfileRule()
+    @get:Rule val rule = BaselineProfileRule()
 
     @Test
-    fun generate() = rule.collectBaselineProfile(
-        packageName = "com.example.myapp"
-    ) {
+    fun generate() = rule.collectBaselineProfile("com.example.myapp") {
         startActivityAndWait()
         device.findObject(By.text("Feed")).click()
-        device.waitForIdle()
-        // Record: scrolling through feed
         repeat(3) { device.swipe(540, 1500, 540, 500, 100) }
     }
 }
 ```
 
-### Memory Trick
+**Reported improvement:** ~30% cold start, ~15-20% first-scroll frame time. Major apps (Tinder, Reddit) have published these numbers.
+
+---
+
+## ## Traps
+
+**Trap — `postInvalidate()` vs `invalidate()`:**
+
+```kotlin
+// From a background thread:
+invalidate()         // crashes — not on main thread!
+postInvalidate()     // safe — posts invalidate() as a message to main thread Looper
+```
+
+**Trap — `clipRect` forgetting to restore canvas state:**
+
+```kotlin
+// WRONG — clipRect state leaks to next onDraw:
+override fun onDraw(canvas: Canvas) {
+    canvas.clipRect(...)
+    drawSomething(canvas)
+    // forgot to restore
+}
+
+// CORRECT:
+override fun onDraw(canvas: Canvas) {
+    val save = canvas.save()
+    canvas.clipRect(...)
+    drawSomething(canvas)
+    canvas.restoreToCount(save)   // restore clip state
+}
+```
+
+**Trap — `setWillNotDraw(false)` missing on custom ViewGroups:**
+
+By default, `ViewGroup.setWillNotDraw(true)`. If you override `onDraw()` in a ViewGroup, Android may skip your `onDraw()` unless you call `setWillNotDraw(false)` in `init`.
+
+---
+
+## Memory Trick
 
 ```
-16ms = 1000ms / 60 FPS (90Hz → 11ms, 120Hz → 8ms)
+16ms = 1000ms / 60 FPS. (90Hz → 11ms. 120Hz → 8ms.)
 
-THREE PHASES: Measure → Layout → Draw
-  requestLayout() → triggers all 3 (expensive)
-  invalidate()    → triggers only Draw (cheaper)
-  Use invalidate() when only appearance changes (color, text, not size)
+THREE PHASES: Measure → Layout → Draw.
+  requestLayout() = all 3.  invalidate() = Draw only.
+  Rule: invalidate() for appearance. requestLayout() for size/position.
 
-ONDRAW RULE: NEVER allocate inside onDraw
-  BAD:  val paint = Paint()  ← inside onDraw = 60 allocs/second = GC pressure
-  GOOD: val paint = Paint()  ← in init block, reused every frame
-  Objects to pre-allocate: Paint, Path, RectF, Rect, Matrix, Bitmap
+ONDRAW RULE: NEVER allocate. NEVER.
+  BAD:  val paint = Paint()  inside onDraw = 60/s = GC = dropped frames
+  GOOD: val paint = Paint()  in init block, reused forever
+
+Pre-allocate: Paint, Path, RectF, Rect, Matrix, Bitmap.
 
 BASELINE PROFILES:
-  Without: JIT compiles hot paths at runtime → first use is slow
-  With:    AOT compiles hot paths at install time → ~30% faster cold start
-  Tool: Macrobenchmark + BaselineProfileRule → generates baseline.prof in APK
+  JIT = compile at runtime (slow first use).
+  AOT via Baseline Profile = compile at install time (~30% faster cold start).
+  Tool: Macrobenchmark + BaselineProfileRule → baseline.prof → include in APK.
 ```
 
 ---
 
-## Q17.4 — Testing
+## Self-Test
 
-> **Builds on:** [Q9.2 — Dispatchers (TestDispatcher)](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers) · [Q10.3 — Exception handling in tests](10_structured_concurrency.md#q103--exception-handling-rules)
-> **Connects to:** [Q13.1 — MVVM testability](13_android_architecture.md#q131--mvvm-and-unidirectional-data-flow)
-> **Reference:** [Kotlin Coroutines Testing Docs](https://kotlinlang.org/docs/coroutines-test.html)
-
-### The Concrete Picture
-
-Starting state: A ViewModel calls `repository.getUser()` (suspend fun) on `viewModelScope`. You need to test the loading → success state transition.
-
-```
-PROBLEM without test infrastructure:
-  viewModel.loadUser("123")
-  assertEquals(Success, viewModel.uiState.value)  ← FAILS: coroutine hasn't run yet!
-
-PROBLEM on JVM:
-  viewModelScope uses Dispatchers.Main → no Android main thread on JVM → deadlock
-
-SOLUTION — two tools working together:
-
-  Tool 1: MainDispatcherRule (replaces Dispatchers.Main with TestDispatcher)
-    @get:Rule val rule = MainDispatcherRule()
-    → Dispatchers.Main now points to StandardTestDispatcher (virtual clock, JVM-safe)
-
-  Tool 2: runTest + advanceUntilIdle
-    runTest {
-      viewModel.loadUser("123")    ← queues coroutine but does NOT run it yet
-      advanceUntilIdle()           ← drains ALL pending coroutines to completion
-      assertEquals(Success, ...)  ← now safe to assert
-    }
-
-StandardTestDispatcher: manual advancement (explicit advanceUntilIdle / advanceTimeBy)
-UnconfinedTestDispatcher: eager, coroutines run immediately without advancement
-  → use Unconfined when: you don't care about timing, want simplest test code
-
-Turbine for Flows:
-  flow.test {
-    awaitItem()      ← suspends until next emission arrives
-    awaitComplete()  ← asserts flow completed
-  }
-```
-
-### `runTest` vs `runBlockingTest`
-
-**`runBlockingTest`** was the old API (deprecated in kotlinx.coroutines 1.6).
-**`runTest`** is the current API.
-
-```kotlin
-// OLD (deprecated):
-@Test
-fun testOld() = runBlockingTest {
-    // Automatically advances time
-}
-
-// NEW:
-@Test
-fun testNew() = runTest {
-    // runTest by default uses StandardTestDispatcher
-    // Time is controlled, virtual clock
-    delay(5000)  // doesn't actually wait 5 seconds — advances virtual clock!
-}
-```
-
-Key feature: `runTest` uses a **virtual clock**. `delay(5000)` doesn't pause the test for 5 real seconds — it advances virtual time instantly.
-
-### `StandardTestDispatcher` vs `UnconfinedTestDispatcher`
-
-[**`StandardTestDispatcher`**](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers) (default in `runTest`):
-- Coroutines do NOT run until you explicitly advance time or call `runCurrent()`
-- Gives you full control: test assertions can happen "between" coroutine steps
-
-```kotlin
-@Test
-fun testStandard() = runTest {
-    // StandardTestDispatcher — coroutines queued but NOT running
-
-    val job = launch { delay(1000); emit("result") }
-    // job is queued but hasn't run yet!
-
-    advanceTimeBy(1001)  // advance clock past the delay
-    // Now the coroutine runs!
-
-    assertEquals("result", lastEmitted)
-}
-```
-
-**`UnconfinedTestDispatcher`:**
-- Coroutines run eagerly — they execute as far as possible before returning control
-- Easier for simple tests, but less control
-
-```kotlin
-@Test
-fun testUnconfined() = runTest(UnconfinedTestDispatcher()) {
-    val result = mutableListOf<Int>()
-
-    launch {
-        emit(1)
-        delay(100)
-        emit(2)
-    }
-    // With UnconfinedTestDispatcher: 1 is emitted immediately
-    // Test can check result without needing to advance time for the first emission
-
-    assertEquals(listOf(1), result)
-}
-```
-
-### Turbine — Flow Testing
-
-[Turbine](https://github.com/cashapp/turbine) is a testing library for Kotlin Flows:
-
-```kotlin
-@Test
-fun testFlow() = runTest {
-    val flow = flowOf(1, 2, 3)
-
-    flow.test {
-        assertEquals(1, awaitItem())  // wait for next emission, assert value
-        assertEquals(2, awaitItem())
-        assertEquals(3, awaitItem())
-        awaitComplete()               // assert the flow completes
-    }
-}
-
-// Testing StateFlow:
-@Test
-fun testStateFlow() = runTest {
-    val viewModel = MyViewModel()
-
-    viewModel.uiState.test {
-        assertEquals(UiState.Loading, awaitItem())  // initial state
-
-        viewModel.loadData()
-        assertEquals(UiState.Content(testData), awaitItem())  // after load
-    }
-}
-```
-
-### Test Double Hierarchy
-
-| Type | Description | When to Use |
-|------|-------------|-------------|
-| **Stub** | Returns hardcoded values | When you need deterministic responses, don't care about call verification |
-| **Mock** | Records calls, verifiable | When you need to verify interactions (was method called with correct args?) |
-| **Fake** | Working implementation (simplified) | When you need realistic behavior (fake DB, fake network) |
-| **Spy** | Wraps real object, records calls | When you need real behavior + call verification |
-
-**Prefer Fakes for Repositories:**
-
-```kotlin
-// Fake repository — actually stores data in memory, real behavior:
-class FakeUserRepository : UserRepository {
-    private val users = mutableMapOf<String, User>()
-
-    override suspend fun getUser(id: String): User =
-        users[id] ?: throw NotFoundException("User $id not found")
-
-    override suspend fun saveUser(user: User) {
-        users[user.id] = user
-    }
-
-    // Test helper:
-    fun addUser(user: User) { users[user.id] = user }
-}
-
-// Test:
-@Test
-fun `loading user shows content state`() = runTest {
-    val fakeRepo = FakeUserRepository()
-    fakeRepo.addUser(User("1", "Alice"))
-    val viewModel = UserViewModel(fakeRepo)
-
-    viewModel.loadUser("1")
-
-    assertEquals(UiState.Content(User("1", "Alice")), viewModel.uiState.value)
-}
-```
-
-### Why `adb shell am kill` Simulates Process Death Better Than Home Button
-
-Home button: process stays alive, Activity goes to stopped state.
-
-```bash
-# Simulates actual process death (OS kills the process):
-adb shell am kill com.example.myapp
-# Process is killed as if Android killed it for memory pressure
-# SavedStateHandle data will be restored on next launch
-# ViewModel is NOT restored (was in memory — gone!)
-```
-
-This is the only way to test:
-- `SavedStateHandle` restoration
-- Room state persistence
-- "Process death and restore" user scenario
-
-### Memory Trick
-
-```
-TEST DISPATCHER CHOICE:
-  StandardTestDispatcher (default in runTest):
-    coroutines queued → run only on advanceUntilIdle() / advanceTimeBy()
-    → use when: testing state BETWEEN coroutine steps, time-sensitive logic
-
-  UnconfinedTestDispatcher:
-    coroutines run eagerly → no advancement needed
-    → use when: just want coroutines to finish, don't care about timing
-
-TURBINE API:
-  flow.test {
-    awaitItem()                        ← assert next emitted value
-    awaitComplete()                    ← assert flow is done
-    cancelAndIgnoreRemainingEvents()   ← stop collecting, ignore rest
-    expectNoEvents()                   ← assert nothing emitted
-  }
-
-PROCESS DEATH test:
-  Home button    → process STAYS alive (Activity stopped, not killed)
-  adb shell am kill <package>  → REAL process death (SavedStateHandle survives)
-
-FAKE > MOCK for repositories:
-  Fake: stores data, tests sequences (save then get), reused across tests
-  Mock: good only for verifying side effects (analytics events)
-```
+1. Why is the render budget 16ms? What happens if a frame takes 20ms?
+2. What is the difference between `requestLayout()` and `invalidate()`? When should you use each?
+3. Why is allocating a `Paint` inside `onDraw()` a problem? What is the correct pattern?
+4. What is a Baseline Profile? What problem does it solve and how is it generated?
+5. You update an animated progress bar's progress value. Should you call `requestLayout()` or `invalidate()`? Why?
 
 ---
 
-## Master Summary: Performance and Memory in 5 Points
+## Phase 17 — Summary
 
 ```
-┌───────────────────────────────────────────────────────────────────────┐
-│  1. Memory leaks: Activity context in singletons, non-static inner   │
-│     classes, postDelayed Runnables, GlobalScope coroutines,          │
-│     unregistered listeners. Fix: applicationContext, removeCallbacks,│
-│     lifecycleScope, unregister in onStop/onDestroy.                 │
-│                                                                        │
-│  2. RecyclerView 4-level cache: Scrap (no rebind) → Cache (no rebind)│
-│     → ViewCacheExtension → RecycledViewPool (rebind required).       │
-│     Never put RecyclerView with wrap_content in NestedScrollView.   │
-│                                                                        │
-│  3. 16ms budget: requestLayout triggers all 3 phases; invalidate     │
-│     only triggers Draw. NEVER create objects (Paint, Path) in       │
-│     onDraw — pre-allocate in init.                                   │
-│                                                                        │
-│  4. Baseline Profiles: AOT compile hot paths at install time.        │
-│     ~30% cold start improvement. Generated via Macrobenchmark.      │
-│                                                                        │
-│  5. StandardTestDispatcher: manual time control. UnconfinedTestDispatcher:
-│     eager execution. Use Turbine for Flow assertions (awaitItem,    │
-│     awaitComplete). Prefer Fake over Mock for repositories.          │
-└───────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  1. 5 leaks (SHDGU): Singleton context, Handler inner class,        │
+│     postDelayed capture, GlobalScope, Unregistered listener.        │
+│     Rule: holder lifetime must not outlive held object lifetime.    │
+│                                                                      │
+│  2. RecyclerView 4-level cache: Scrap → Cache → Extension → Pool.  │
+│     Only Scrap and Cache skip onBindViewHolder.                     │
+│     wrap_content in NestedScrollView disables recycling.            │
+│     DiffUtil (submitList) > notifyDataSetChanged for UX + perf.    │
+│                                                                      │
+│  3. 16ms budget: Measure → Layout → Draw.                          │
+│     requestLayout = all 3. invalidate = Draw only.                 │
+│     NEVER allocate in onDraw (Paint, Path, RectF, etc.).           │
+│     Baseline Profiles: AOT compile hot paths → ~30% faster start.  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 *← [Phase 16 — Android System Internals](16_android_system_internals.md) | [Phase 18 — Testing →](18_testing.md)*
-
----
-
-**Cross-references:**
-- JVM memory leak patterns (static collections, ThreadLocal) — Java perspective: [J8.4 — Memory Leaks & Profiling](../../Java/Questions/J8_gc_and_jvm_tuning.md)
-- GC algorithms and heap tuning (G1GC, ZGC, JVM flags): [J8 — GC & JVM Tuning](../../Java/Questions/J8_gc_and_jvm_tuning.md)
-- Android offline data layer and Room performance: [A4 — Offline & Data Layer](../../Android/Questions/A4_offline_and_data.md)

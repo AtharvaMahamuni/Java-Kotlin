@@ -1,67 +1,38 @@
-# Phase 14: Jetpack Components
+# Phase 14 — Jetpack Components
+
+> Room, WorkManager, and Paging 3 all solve the same problem: persisting data reliably across process boundaries. Room wraps SQLite with compile-time safety. WorkManager wraps OS schedulers with guaranteed execution. Paging 3 wraps both with lazy loading. All three ultimately write to disk — because disk survives what RAM doesn't.
 
 ## Navigation
-[← Master Index](master_chains.md)
+
+[← Phase 13 — Android Architecture](13_android_architecture.md) | [→ Phase 15 — Networking](15_networking.md)
 
 ## Questions in This File
-- [Q14.1 — Room — Internals](#q141--room--internals)
+
+- [Q14.1 — Room Internals](#q141--room-internals)
 - [Q14.2 — WorkManager](#q142--workmanager)
 - [Q14.3 — Paging 3](#q143--paging-3)
 - [Q14.4 — Thread-Safe Caching](#q144--thread-safe-caching)
 
 ---
 
-## Q14.1 — Room — Internals
+# Q14.1 — Room Internals
 
-> **Builds on:** [Q11.3 — Flow (Room returns Flow)](11_flow.md#q113--stateflow-vs-sharedflow) · [Q9.2 — Dispatchers.IO for DB](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
-> **Connects to:** [Q13.6 — Repository pattern](13_android_architecture.md#q136--repository-and-offline-first-patterns) · [Q14.2 — WorkManager](14_jetpack_components.md#q142--workmanager)
-> **Reference:** [Android Docs — Room persistence library](https://developer.android.com/training/data-storage/room)
+> **Builds on:** [Q11.3 (Room returns Flow)](11_flow.md#q113--stateflow-vs-sharedflow) · [Q9.2 (Dispatchers.IO for DB)](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers)
+> **Connects to:** [Q13.6 (Repository pattern)](13_android_architecture.md#q136--repository-and-offline-first) · [Q14.2 (WorkManager)](14_jetpack_components.md#q142--workmanager)
 
-### The Concrete Picture
+---
 
-Starting state — raw SQLite (what Room replaces):
-```kotlin
-// Without Room — raw SQLite, runtime crash risk:
-val cursor = db.rawQuery("SELECT * FROM usrs", null)  // typo "usrs" → crashes at runtime!
-while (cursor.moveToNext()) {
-    val name = cursor.getString(cursor.getColumnIndex("nam"))  // wrong column → silent null
-}
+## The Core Rule
+
+```
+Room = compile-time SQL verification + generated DAO implementation + InvalidationTracker.
+SQL error → build error, not runtime crash.
+Flow<List<T>> → re-emits whenever the observed table changes.
 ```
 
-After Room — compile-time SQL verification:
-```kotlin
-@Entity(tableName = "users")
-data class UserEntity(@PrimaryKey val id: String, val name: String, val age: Int)
+---
 
-@Dao
-interface UserDao {
-    @Query("SELECT * FROM usrs")        // ← COMPILE ERROR: Table 'usrs' not found
-    fun getAll(): List<UserEntity>
-
-    @Query("SELECT * FROM users")       // ← generates this at compile time:
-    fun observeAll(): Flow<List<UserEntity>>
-}
-```
-
-Room annotation processor pipeline:
-```
-Source code (@Entity, @Dao, @Database)
-    │  KAPT/KSP processes annotations at build time
-    ▼
-Generated: AppDatabase_Impl.java
-    ├── CREATE TABLE SQL embedded in code
-    ├── UserDao_Impl with null checks and type mappings
-    └── InvalidationTracker setup for Flow emissions
-```
-Any SQL error = build error, not runtime crash.
-
-### First Principles: What Is Room?
-
-Room is a compile-time-verified ORM (Object-Relational Mapper) that sits on top of SQLite. Instead of writing raw SQL everywhere, you write Kotlin interfaces and data classes, and Room generates the implementation.
-
-The key advantage over raw SQLite: **compile-time SQL verification**. If your SQL query references a column that doesn't exist, it's a **build error**, not a runtime crash.
-
-### What `@Entity` Compiles To
+## What Room Compiles To
 
 ```kotlin
 @Entity(tableName = "users")
@@ -71,129 +42,131 @@ data class UserEntity(
     val age: Int,
     @ColumnInfo(name = "email_address") val email: String
 )
-```
 
-Room's annotation processor generates:
-```sql
--- CREATE TABLE SQL generated at compile time:
-CREATE TABLE IF NOT EXISTS `users` (
-    `id` TEXT NOT NULL,
-    `name` TEXT NOT NULL,
-    `age` INTEGER NOT NULL,
-    `email_address` TEXT NOT NULL,
-    PRIMARY KEY(`id`)
-)
-```
-
-This SQL is embedded in the generated `RoomDatabase` implementation and run when the database is first created.
-
-### `@Transaction` — Atomic Guarantee
-
-```kotlin
 @Dao
-interface OrderDao {
-    @Insert
-    suspend fun insertOrder(order: OrderEntity)
+interface UserDao {
+    @Query("SELECT * FROM usrs")          // COMPILE ERROR — "usrs" doesn't exist
+    fun getAll(): List<UserEntity>
 
-    @Insert
-    suspend fun insertItems(items: List<OrderItemEntity>)
+    @Query("SELECT * FROM users")         // OK — generates implementation below
+    fun observeAll(): Flow<List<UserEntity>>
+}
+```
 
-    @Transaction  // ← guarantees both inserts are atomic
-    suspend fun insertOrderWithItems(order: OrderEntity, items: List<OrderItemEntity>) {
-        insertOrder(order)
-        insertItems(items)  // if this fails, insertOrder is rolled back!
+**Generated code (simplified):**
+
+```java
+// AppDatabase_Impl.java — generated by KAPT/KSP:
+public final class UserDao_Impl implements UserDao {
+
+    // On first DB open, this SQL is executed:
+    // CREATE TABLE IF NOT EXISTS `users` (`id` TEXT NOT NULL,
+    //   `name` TEXT NOT NULL, `age` INTEGER NOT NULL,
+    //   `email_address` TEXT NOT NULL, PRIMARY KEY(`id`))
+
+    @Override
+    public Flow<List<UserEntity>> observeAll() {
+        // Registers query with InvalidationTracker on table "users"
+        // Re-executes query whenever "users" table is marked dirty
+        return RoomDatabase.__internalCreateFlowForQuery(
+            this.__db, new String[]{"users"},
+            () -> { /* execute SELECT * FROM users */ }
+        );
     }
 }
 ```
 
-Without `@Transaction`, if `insertItems` fails after `insertOrder` succeeds, you'd have an order with no items — corrupted data. `@Transaction` wraps everything in a SQLite `BEGIN TRANSACTION ... COMMIT` block. Either both succeed or neither does.
+---
 
-Also used for `@Query` that returns relations:
-```kotlin
-@Transaction  // required when returning @Relation
-@Query("SELECT * FROM users WHERE id = :userId")
-suspend fun getUserWithOrders(userId: String): UserWithOrders
-// Without @Transaction, multiple queries might see inconsistent intermediate state
-```
-
-### How Room's `Flow<List<T>>` Auto-Emits
-
-Room uses an **invalidation tracker** to detect when a table has changed. [`Flow`](11_flow.md#q111--cold-vs-hot-streams) from Room auto-emits whenever the observed table is invalidated:
+## How Room's `Flow` Auto-Emits — `InvalidationTracker`
 
 ```
-Room Invalidation Mechanism:
-┌──────────────────────────────────────────────────────────────────┐
-│  Any write to table "users" (insert, update, delete)            │
-│         │                                                        │
-│         ▼                                                        │
-│  InvalidationTracker marks "users" table as dirty               │
-│         │                                                        │
-│         ▼                                                        │
-│  All active Flow collectors for queries on "users"              │
-│  receive "invalidated" signal                                   │
-│         │                                                        │
-│         ▼                                                        │
-│  Each Flow re-executes its query                                │
-│         │                                                        │
-│         ▼                                                        │
-│  New results emitted to collectors                              │
-└──────────────────────────────────────────────────────────────────┘
+Write to "users" table (INSERT / UPDATE / DELETE)
+     │
+     ▼
+InvalidationTracker marks "users" as dirty
+     │
+     ▼
+All active Flow collectors for queries on "users" receive signal
+     │
+     ▼
+Each Flow re-executes its query on Dispatchers.IO
+     │
+     ▼
+New results emitted → UI updates
 ```
+
+This is why Room + Flow = SSoT: any write anywhere (network sync, local edit) triggers UI refresh automatically. No manual `notifyDataSetChanged` required.
+
+---
+
+## `@Transaction` — Atomic Guarantee
 
 ```kotlin
-@Dao
-interface UserDao {
-    @Query("SELECT * FROM users")
-    fun observeAllUsers(): Flow<List<UserEntity>>
-    // This Flow auto-emits whenever the "users" table changes
+// WRONG — two operations, non-atomic:
+suspend fun insertOrderWithItems(order: OrderEntity, items: List<OrderItemEntity>) {
+    orderDao.insert(order)        // succeeds
+    itemsDao.insertAll(items)     // fails → order exists but has no items → corrupt!
 }
 
-// Usage:
-userDao.observeAllUsers()
-    .map { it.toDomain() }
-    .collect { users -> updateUI(users) }
-// Every INSERT/UPDATE/DELETE to "users" triggers a new emission!
+// CORRECT — @Transaction wraps in SQLite BEGIN...COMMIT:
+@Transaction
+suspend fun insertOrderWithItems(order: OrderEntity, items: List<OrderItemEntity>) {
+    orderDao.insert(order)
+    itemsDao.insertAll(items)     // if this throws, orderDao.insert is rolled back
+}
 ```
 
-### `@Embedded` vs `@Relation`
+```java
+// Generated:
+db.beginTransaction();
+try {
+    insertOrder(order);
+    insertItems(items);
+    db.setTransactionSuccessful();   // commit
+} finally {
+    db.endTransaction();             // rollback if setTransactionSuccessful not called
+}
+```
 
-**`@Embedded`:** Flattens a nested object's fields into the same table row:
+Also required on `@Query` returning `@Relation` — without it, two separate selects might see inconsistent intermediate state.
+
+---
+
+## `@Embedded` vs `@Relation`
 
 ```kotlin
-data class Address(val street: String, val city: String)
-
+// @Embedded — same table row, flattened fields:
 @Entity
 data class UserEntity(
     @PrimaryKey val id: String,
     val name: String,
-    @Embedded val address: Address  // address fields added to users table
+    @Embedded val address: Address   // adds street, city columns to users table
 )
 // Table: users(id, name, street, city)
-```
 
-**`@Relation`:** Fetches related entities from a SEPARATE table:
-
-```kotlin
+// @Relation — separate table, extra SELECT:
 data class UserWithPosts(
     @Embedded val user: UserEntity,
-    @Relation(
-        parentColumn = "id",
-        entityColumn = "user_id"
-    )
+    @Relation(parentColumn = "id", entityColumn = "user_id")
     val posts: List<PostEntity>
 )
-// Executes: SELECT * FROM posts WHERE user_id = users.id
-// Requires @Transaction to be consistent
+// Executes: SELECT * FROM posts WHERE user_id IN (user IDs)
+// MUST have @Transaction on the query — two SELECTs must be consistent
 ```
 
-### Room Migrations
+```
+@Embedded  = one table, one SELECT, no JOIN. Fast.
+@Relation  = two tables, two SELECTs. Requires @Transaction.
+```
+
+---
+
+## Migrations
 
 ```kotlin
-// Room checks version on open. If db version != schema version → needs migration
-@Database(entities = [UserEntity::class], version = 2)  // bumped from 1 to 2!
+@Database(entities = [UserEntity::class], version = 2)  // bumped 1 → 2
 abstract class AppDatabase : RoomDatabase() {
-    abstract fun userDao(): UserDao
-
     companion object {
         val MIGRATION_1_2 = object : Migration(1, 2) {
             override fun migrate(database: SupportSQLiteDatabase) {
@@ -203,129 +176,160 @@ abstract class AppDatabase : RoomDatabase() {
     }
 }
 
-// Provide migration when building:
 Room.databaseBuilder(context, AppDatabase::class.java, "app.db")
     .addMigrations(AppDatabase.MIGRATION_1_2)
     .build()
 ```
 
-If you bump the version WITHOUT providing a migration: **`IllegalStateException: A migration from 1 to 2 was required but not found.`** Room refuses to open the database to prevent data corruption.
+**Bump version without migration → `IllegalStateException` on open.** Room refuses to open rather than silently corrupt data.
 
-**Fallback:** `.fallbackToDestructiveMigration()` — drops and recreates the database. Data lost. Only use during development.
+`fallbackToDestructiveMigration()` drops and recreates. Development only — all data lost.
 
-### Memory Trick
+---
 
+## ## Traps
+
+**Trap — Running Room queries on the main thread:**
+
+```kotlin
+// WRONG — crashes with "Cannot access database on the main thread":
+val users = db.userDao().getAll()   // blocking call on main thread
+
+// CORRECT — suspend function on Dispatchers.IO:
+suspend fun loadUsers() = withContext(Dispatchers.IO) { db.userDao().getAll() }
+// Or: Room handles this automatically for suspend functions and Flow
 ```
-Room query flow:
-  @Query write  →  InvalidationTracker marks table dirty
-                →  Flow re-executes query  →  new emission to UI
 
-@Transaction mnemonic: "ALL or NOTHING"
-  insertOrder() succeeds, insertItems() fails → WITHOUT @Transaction: corrupted state
-  WITH @Transaction: SQLite rolls back insertOrder too — both fail together
+**Trap — `@Relation` without `@Transaction`:**
 
-@Embedded vs @Relation:
-  @Embedded  = same table row (flat, no JOIN needed)
-  @Relation  = separate table, triggers extra SELECT (requires @Transaction)
+```kotlin
+// WRONG — two separate SELECTs, no consistency guarantee:
+@Query("SELECT * FROM users WHERE id = :id")
+suspend fun getUserWithPosts(id: String): UserWithPosts   // MISSING @Transaction!
 
-Migration version bump without script = IllegalStateException (Room refuses to open)
-  "Room would rather crash than silently corrupt your data"
+// CORRECT:
+@Transaction
+@Query("SELECT * FROM users WHERE id = :id")
+suspend fun getUserWithPosts(id: String): UserWithPosts
 ```
 
 ---
 
-## Q14.2 — WorkManager
+## Memory Trick
 
-> **Builds on:** [Q16.2 — Background Work Evolution](16_android_system_internals.md#q162--background-work-evolution)
-> **Connects to:** [Q10.4 — Lifecycle Scopes](10_structured_concurrency.md#q104--lifecycle-scopes-and-process-death)
-> **Reference:** [Android Docs — Schedule tasks with WorkManager](https://developer.android.com/topic/libraries/architecture/workmanager)
-
-### The Concrete Picture
-
-Starting state — background work in a plain Service (Android 8+):
 ```
-User opens app → starts Service → starts upload
-User presses home (app goes to background)
-    │
-    └── Android 8+ Oreo: kills background service within ~60 seconds
-            ← upload cancelled, no retry, user never knows
+Room compile pipeline:
+  @Entity → CREATE TABLE SQL (embedded in generated class)
+  @Dao    → generated Impl class with cursor mapping + null checks
+  @Query  → SQL validated at build time → error = build failure
+
+Flow emission: write to table → InvalidationTracker → re-query → emit.
+
+@Transaction = "ALL or NOTHING" (SQLite BEGIN...COMMIT).
+@Embedded  = same row (flat).
+@Relation  = separate SELECT (requires @Transaction).
+
+Migration missing = IllegalStateException (Room refuses to open, never silently corrupts).
 ```
 
-After WorkManager:
+---
+
+## Self-Test
+
+1. A query has a typo in the table name. When is the error caught — compile time or runtime?
+2. Trace the exact chain from `userDao.insertAll(users)` to the UI showing new data.
+3. What SQLite construct does `@Transaction` compile to?
+4. What is the difference between `@Embedded` and `@Relation` in terms of SQL executed?
+5. You bump `@Database(version = 3)` but forget to provide `MIGRATION_2_3`. What happens?
+
+---
+
+# Q14.2 — WorkManager
+
+> **Builds on:** [Q10.4 (Lifecycle scopes)](10_structured_concurrency.md#q104--lifecycle-scopes-and-process-death)
+> **Connects to:** [Q13.3 (process death)](13_android_architecture.md#q133--viewmodel-internals)
+
+---
+
+## The Core Rule
+
+```
+WorkManager = guaranteed execution via persistence + OS scheduler.
+Work is written to a Room DB before running.
+Survives: process death, device reboot, Doze mode.
+```
+
+---
+
+## Why `Service` Is Not Enough
+
+```
+User starts upload in a Service.
+User presses home → app goes to background.
+Android 8+ Oreo:
+  Background service killed within ~60 seconds.
+  Upload cancelled. No retry. User never told.
+```
+
+**Service lives in RAM. RAM dies.** WorkManager persists to disk and hands the work to the OS.
+
+---
+
+## How WorkManager Guarantees Execution
+
 ```
 WorkManager.enqueue(uploadWork)
-    │
-    ├── Persists request to WorkManager's internal Room DB
-    │       (survives process death, survives reboot)
-    │
-    ├── Registers with JobScheduler (API 23+)
-    │       (OS-managed, battery-friendly, Doze-safe)
-    │
-    └── When constraints met (CONNECTED network):
-            Worker.doWork() runs on background thread
-            Result.success() → work removed from DB
-            Result.retry()   → re-scheduled with backoff
+     │
+     ├── 1. Persist request to WorkManager's internal Room DB
+     │        (survives process death and device reboot)
+     │
+     ├── 2. Register with JobScheduler (API 23+)
+     │        (OS-managed, battery-friendly, Doze-safe)
+     │
+     └── 3. When constraints met → Worker.doWork() runs
 
-Chain: CompressWorker ──► UploadWorker ──► NotifyWorker
-  Output data from step N ──► becomes inputData for step N+1
+On reboot:
+  Android restores JobScheduler jobs from disk.
+  WorkManager sees pending work in its Room DB.
+  Work runs when constraints are met again.
 ```
 
-### Why a `Service` Doesn't Guarantee Background Work
+---
 
-Android's `Service` runs on the main thread by default (you must create a thread yourself) and is subject to OS battery-saving policies:
-
-- **Android 8+ (Oreo):** Background services killed within ~1 minute of the app going to background, unless the app is in the foreground
-- **Doze mode:** Services may be deferred significantly
-- Process death: Services can be killed by the OS at any time
-
-### WorkManager's Guarantee
-
-WorkManager guarantees execution even across:
-- Process death
-- Device reboot
-- OS kill due to memory pressure
-- Doze mode (work is deferred but not cancelled)
-
-It achieves this by persisting work requests to a Room database and using the OS's battery-friendly scheduling APIs (JobScheduler on API 23+, AlarmManager + broadcast receiver as fallback).
-
-```
-WorkManager persistence:
-Your work request → Room DB → JobScheduler (OS level)
-                                    │
-                                    ▼ (even after reboot)
-                               Work runs in Worker (background thread)
-```
-
-### `OneTimeWorkRequest` vs `PeriodicWorkRequest`
+## `OneTimeWorkRequest` vs `PeriodicWorkRequest`
 
 ```kotlin
-// OneTimeWorkRequest — runs once:
+// One-time — runs once:
 val uploadWork = OneTimeWorkRequestBuilder<UploadWorker>()
-    .setConstraints(Constraints.Builder()
-        .setRequiredNetworkType(NetworkType.CONNECTED)
-        .build())
+    .setConstraints(
+        Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
+    )
     .setInputData(workDataOf("file_path" to "/storage/photo.jpg"))
+    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
     .build()
+
 WorkManager.getInstance(context).enqueue(uploadWork)
 
-// PeriodicWorkRequest — runs repeatedly:
+// Periodic — repeats:
 val syncWork = PeriodicWorkRequestBuilder<SyncWorker>(
-    repeatInterval = 15,  // minimum is 15 minutes!
-    repeatIntervalTimeUnit = TimeUnit.MINUTES
+    repeatInterval = 15, repeatIntervalTimeUnit = TimeUnit.MINUTES  // MINIMUM 15 min
 ).build()
+
 WorkManager.getInstance(context).enqueueUniquePeriodicWork(
     "sync",
-    ExistingPeriodicWorkPolicy.KEEP,  // keep existing if already enqueued
+    ExistingPeriodicWorkPolicy.KEEP,
     syncWork
 )
 ```
 
-**Minimum period for `PeriodicWorkRequest`: 15 minutes** — Android enforces this to prevent battery drain.
+**Minimum periodic interval = 15 minutes.** Android enforces this. You cannot go lower.
 
-### Chaining Workers
+---
+
+## Chaining Workers
 
 ```kotlin
-// Chain: compress → upload → notify
+// Output of step N becomes inputData of step N+1:
 WorkManager.getInstance(context)
     .beginUniqueWork("upload_chain", ExistingWorkPolicy.REPLACE,
         OneTimeWorkRequestBuilder<CompressWorker>().build()
@@ -334,12 +338,9 @@ WorkManager.getInstance(context)
     .then(OneTimeWorkRequestBuilder<NotifyWorker>().build())
     .enqueue()
 
-// then() guarantees: CompressWorker completes BEFORE UploadWorker starts
-// Output data from CompressWorker becomes input data for UploadWorker:
-
 class CompressWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
     override suspend fun doWork(): Result {
-        val compressed = compressFile(inputData.getString("file_path")!!)
+        val compressed = compress(inputData.getString("file_path")!!)
         return Result.success(workDataOf("compressed_path" to compressed))
     }
 }
@@ -353,105 +354,140 @@ class UploadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx
 }
 ```
 
-### `ExistingWorkPolicy` Variants
+---
 
-```kotlin
-// REPLACE: cancel existing work, start new:
-WorkManager.enqueueUniqueWork("sync", ExistingWorkPolicy.REPLACE, request)
-// Use: user triggers manual refresh — cancel old sync, start fresh
-
-// KEEP: if work already exists, keep it (ignore the new request):
-WorkManager.enqueueUniqueWork("sync", ExistingWorkPolicy.KEEP, request)
-// Use: ensure only one instance runs — don't restart if already running
-
-// APPEND: add new work to run AFTER existing work:
-WorkManager.enqueueUniqueWork("sync", ExistingWorkPolicy.APPEND, request)
-// Use: sequential queue — don't run new work until old work finishes
-```
-
-### Memory Trick
+## `ExistingWorkPolicy` — Three Strategies
 
 ```
-WorkManager guarantee source:
-  "Persisted to Room → JobScheduler → runs even after reboot"
-  Service = RAM only; WorkManager = disk + OS scheduler
-
-ExistingWorkPolicy:
-  REPLACE  = cancel old, start fresh    (user-triggered manual refresh)
-  KEEP     = ignore new, keep old       (deduplicate periodic sync)
-  APPEND   = queue new after old        (ordered sequential tasks)
-
-Minimum periodic interval = 15 minutes (Android enforces, cannot go lower)
-
-CoroutineWorker vs Worker:
-  CoroutineWorker.doWork() is suspend → can call suspend functions directly
-  Worker.doWork() is blocking         → must use runBlocking (avoid in new code)
+┌──────────────────────────────────┐
+│ REPLACE → cancel old, start new  │
+│   use: manual refresh            │
+├──────────────────────────────────┤
+│ KEEP    → ignore if running      │
+│   use: dedup periodic sync       │
+├──────────────────────────────────┤
+│ APPEND  → queue after existing   │
+│   use: sequential tasks          │
+└──────────────────────────────────┘
 ```
 
 ---
 
-## Q14.3 — Paging 3
+## `CoroutineWorker` vs `Worker`
 
-> **Builds on:** [Q11.2 — Flow Operators](11_flow.md#q112--flow-operators) · [Q14.1 — Room](14_jetpack_components.md#q141--room--internals)
-> **Connects to:** [Q11.4 — Flow collection](11_flow.md#q114--flow-collection-and-lifecycle)
-> **Reference:** [Android Docs — Paging 3 library](https://developer.android.com/topic/libraries/architecture/paging/v3-overview)
-
-### The Concrete Picture
-
-Starting state — manual pagination (what Paging 3 replaces):
 ```kotlin
+// CoroutineWorker — modern, doWork() is suspend:
+class UploadWorker(...) : CoroutineWorker(ctx, params) {
+    override suspend fun doWork(): Result {
+        uploadFile()   // can call suspend functions directly
+        return Result.success()
+    }
+}
+
+// Worker — legacy, doWork() is blocking (runs on background thread):
+class UploadWorker(...) : Worker(ctx, params) {
+    override fun doWork(): Result {
+        runBlocking { uploadFile() }  // avoid in new code
+        return Result.success()
+    }
+}
+```
+
+Always use `CoroutineWorker` for new code.
+
+---
+
+## ## Traps
+
+**Trap — Using `Result.retry()` without `setBackoffCriteria`:**
+
+```kotlin
+// Without backoff, retry is immediate → floods the server:
+override suspend fun doWork(): Result {
+    return if (upload()) Result.success() else Result.retry()
+}
+// ADD backoff:
+val work = OneTimeWorkRequestBuilder<UploadWorker>()
+    .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+    .build()
+```
+
+**Trap — WorkManager is not for real-time or short-interval tasks:**
+
+WorkManager is for deferrable, guaranteed work. For sub-15-minute intervals or precise timing (media playback, location tracking), use `ForegroundService`.
+
+---
+
+## Memory Trick
+
+```
+WorkManager guarantee chain:
+  enqueue() → persist to Room DB → register with JobScheduler → run
+
+"WorkManager writes a receipt before doing work."
+  Service = no receipt. Process dies = work gone.
+  WorkManager = receipt on disk. Reboot = pick up from receipt.
+
+CoroutineWorker.doWork() = suspend.
+Worker.doWork()          = blocking (legacy).
+
+ExistingWorkPolicy:
+  REPLACE = fresh start. KEEP = deduplicate. APPEND = queue.
+
+Minimum periodic = 15 minutes. No exceptions.
+```
+
+---
+
+## Self-Test
+
+1. What happens to a `Service` running a long upload when the app goes to background on Android 8+?
+2. Trace the exact steps WorkManager takes from `enqueue()` to `doWork()` executing after a device reboot.
+3. What is the minimum repeat interval for `PeriodicWorkRequest`? Why does Android enforce this?
+4. You need to compress a file, then upload it, then send a notification. How do you model this with WorkManager?
+5. `ExistingWorkPolicy.KEEP` vs `REPLACE` — when do you pick each?
+
+---
+
+# Q14.3 — Paging 3
+
+> **Builds on:** [Q11.2 (Flow operators)](11_flow.md#q112--flow-operators) · [Q14.1 (Room)](14_jetpack_components.md#q141--room-internals)
+> **Connects to:** [Q11.4 (Flow collection)](11_flow.md#q114--flow-collection-and-lifecycle)
+
+---
+
+## The Core Rule
+
+```
+PagingSource: how to load one page (network OR DB).
+RemoteMediator: coordinates network → Room (network writes, UI reads Room).
+Room is the single source of truth — UI never reads from network directly.
+```
+
+---
+
+## The Problem — Manual Pagination
+
+```kotlin
+// WRONG — manual pagination:
 var page = 1
 fun loadMore() {
     viewModelScope.launch {
         val users = api.getUsers(page, pageSize = 20)
         _list.value = _list.value + users   // manual accumulation
         page++
-        // Problems: no offline support, no Room integration,
-        //           scroll position lost on rotation, no retry UI
+        // Problems: no offline, scroll lost on rotation, no retry UI, no Room integration
     }
 }
 ```
 
-After Paging 3 with RemoteMediator (network + Room SSoT):
-```
-User scrolls to bottom
-    │
-    ▼
-Pager detects "load more needed"
-    │
-    ▼
-RemoteMediator.load(APPEND)
-    │  api.getUsers(nextPage)          ← network fetch
-    │  db.withTransaction {
-    │      userDao.insertAll(users)    ← write to Room
-    │      remoteKeyDao.insert(key)   ← store next page number
-    │  }
-    │
-    ▼
-Room InvalidationTracker fires
-    │
-    ▼
-PagingSource (backed by Room) re-queries
-    │
-    ▼
-PagingData emitted → LazyColumn / RecyclerView shows new items
+---
 
-Offline: RemoteMediator fails → Room still has existing pages → no blank screen
-```
-
-Cursor vs offset — the bug that cursor pagination eliminates:
-```
-Offset:  page 2 = "items 20-39"  →  but if item 5 was deleted, item 20 (old) = item 19 (new)
-         → item 19 appears in BOTH page 1 and page 2 (duplicate)
-Cursor:  page 2 = "items after id=XYZ"  →  stable ID, deletions don't shift positions
-```
-
-### `PagingSource` vs `RemoteMediator`
-
-**`PagingSource`:** Defines HOW to load pages of data (from network OR local DB):
+## `PagingSource` — Single Source (Network Only)
 
 ```kotlin
 class UserPagingSource(private val api: UserApi) : PagingSource<Int, User>() {
+
     override suspend fun load(params: LoadParams<Int>): LoadResult<Int, User> {
         return try {
             val page = params.key ?: 1
@@ -466,13 +502,38 @@ class UserPagingSource(private val api: UserApi) : PagingSource<Int, User>() {
         }
     }
 
-    override fun getRefreshKey(state: PagingState<Int, User>): Int? {
-        return state.anchorPosition?.let { state.closestPageToPosition(it)?.prevKey?.plus(1) }
-    }
+    override fun getRefreshKey(state: PagingState<Int, User>): Int? =
+        state.anchorPosition?.let { state.closestPageToPosition(it)?.prevKey?.plus(1) }
 }
 ```
 
-**`RemoteMediator`:** Coordinates between network and local database. Network is the data source, Room is the local cache:
+---
+
+## `RemoteMediator` — Network + Room (SSoT)
+
+```
+User scrolls to end
+  │
+  ▼
+RemoteMediator.load(APPEND)
+  │ api.getUsers(nextPage)
+  │ db.withTransaction {
+  │   userDao.insertAll(users)
+  │   remoteKeyDao.insert(key)
+  │ }
+  │
+  ▼
+Room InvalidationTracker fires
+  │
+  ▼
+PagingSource re-queries Room
+  │
+  ▼
+PagingData emitted → UI ✓
+
+Offline: mediator fails →
+  Room pages still shown ✓
+```
 
 ```kotlin
 @OptIn(ExperimentalPagingApi::class)
@@ -480,26 +541,22 @@ class UserRemoteMediator(
     private val api: UserApi,
     private val db: AppDatabase
 ) : RemoteMediator<Int, UserEntity>() {
-    override suspend fun load(
-        loadType: LoadType,    // REFRESH, PREPEND, or APPEND
-        state: PagingState<Int, UserEntity>
-    ): MediatorResult {
+
+    override suspend fun load(loadType: LoadType, state: PagingState<Int, UserEntity>): MediatorResult {
         return try {
             val page = when (loadType) {
-                LoadType.REFRESH -> 1   // start from beginning
-                LoadType.PREPEND -> return MediatorResult.Success(endOfPaginationReached = true)
-                LoadType.APPEND -> {
-                    val remoteKey = db.remoteKeyDao().getLastKey()
-                    remoteKey?.nextKey ?: return MediatorResult.Success(endOfPaginationReached = true)
-                }
+                LoadType.REFRESH  -> 1
+                LoadType.PREPEND  -> return MediatorResult.Success(endOfPaginationReached = true)
+                LoadType.APPEND   -> db.remoteKeyDao().getLastKey()?.nextKey
+                    ?: return MediatorResult.Success(endOfPaginationReached = true)
             }
             val response = api.getUsers(page, state.config.pageSize)
             db.withTransaction {
                 if (loadType == LoadType.REFRESH) {
-                    db.userDao().clearAll()          // clear stale data on refresh
+                    db.userDao().clearAll()
                     db.remoteKeyDao().clearAll()
                 }
-                db.remoteKeyDao().insertKey(RemoteKey(nextKey = if (response.hasMore) page + 1 else null))
+                db.remoteKeyDao().insert(RemoteKey(nextKey = if (response.hasMore) page + 1 else null))
                 db.userDao().insertAll(response.users.toEntity())
             }
             MediatorResult.Success(endOfPaginationReached = !response.hasMore)
@@ -510,116 +567,185 @@ class UserRemoteMediator(
 }
 ```
 
-### Why Cursor-Based Pagination Beats Offset
+---
 
-**Offset-based problem:** "Give me items 10-20" → but if item 5 is deleted before this request, item 11 (now at position 10) appears twice (once in page 1, once in page 2).
+## Offset vs Cursor Pagination — The Bug
 
-```
-Offset pagination data shifting bug:
-Initial:    [A, B, C, D, E, F, G, H, I, J, ...]
-Page 1:     [A, B, C, D, E]  (offset 0-4)
-Delete B:   [A, C, D, E, F, G, H, I, J, ...]
-Page 2:     [E, F, G, H, I]  (offset 5-9)
-Bug: E appeared in BOTH page 1 and page 2!
-```
-
-**Cursor-based:** "Give me items after cursor X" → cursor is a stable identifier, not a position. Insertions/deletions don't shift positions.
+**Offset pagination data-shifting bug:**
 
 ```
-Cursor pagination:
-Page 1: cursor=null → [A, B, C, D, E], nextCursor = E.id
-Delete B:   [A, C, D, E, F, G, H, ...]
-Page 2: cursor=E.id → [F, G, H, I, J]  (starts after E — no duplicates!)
+Initial:   [A, B, C, D, E, F, G, ...]
+Page 1:    offset 0-4 → [A, B, C, D, E]
+Delete B:  [A, C, D, E, F, G, ...]
+Page 2:    offset 5-9 → [E, F, G, H, I]    ← E appears TWICE!
 ```
 
-### `RemoteKey` Entities — Why They're Needed
+**Cursor pagination — stable, no shifting:**
 
-`RemoteMediator` stores "what page to fetch next" for each item in a `RemoteKey` table. This is needed because:
-- Room is the source of truth (UI reads from Room)
-- Room doesn't know what "next page URL/number" is — that's network metadata
-- `RemoteKey` bridges: "for the last item in Room, what is the next network page?"
+```
+Page 1:    cursor=null  → [A, B, C, D, E], nextCursor = E.id
+Delete B:  [A, C, D, E, F, G, ...]
+Page 2:    cursor=E.id  → [F, G, H, I, J]  ← no duplicate
+```
+
+Cursor uses a stable ID, not a positional offset. Insertions and deletions don't shift results.
+
+---
+
+## `RemoteKey` Entities — Why They Exist
+
+The UI reads from Room (no pagination metadata there). The network knows which page comes next. `RemoteKey` bridges them:
 
 ```kotlin
 @Entity(tableName = "remote_keys")
 data class RemoteKey(
-    @PrimaryKey val nextKey: Int?  // next page to load, null = end of list
+    @PrimaryKey val id: Int = 0,
+    val nextKey: Int?          // null = end of list
 )
 ```
 
-### How Room Acts as Single Source of Truth in Paging 3
+For each `APPEND` load, `RemoteMediator` reads `remoteKeyDao().getLastKey()?.nextKey` to know which page to fetch next.
 
-```
-Flow:
-Pager(pagingSourceFactory = { db.userDao().pagingSource() }, remoteMediator = userRemoteMediator)
-  │
-  │  UI reads from Room (PagingSource from DB)
-  │  RemoteMediator handles loading from network → writes to Room
-  │  Room's InvalidationTracker emits to UI when data changes
-  ▼
-UI always shows Room data; network seamlessly fills Room in background
+---
+
+## ViewModel + Pager
+
+```kotlin
+@HiltViewModel
+class UserViewModel @Inject constructor(
+    private val api: UserApi,
+    private val db: AppDatabase
+) : ViewModel() {
+
+    val pagingData: Flow<PagingData<User>> = Pager(
+        config = PagingConfig(pageSize = 20, enablePlaceholders = false),
+        remoteMediator = UserRemoteMediator(api, db),
+        pagingSourceFactory = { db.userDao().pagingSource() }  // UI reads from Room
+    ).flow
+        .map { it.map { entity -> entity.toDomain() } }
+        .cachedIn(viewModelScope)                              // cache across recompositions
+}
 ```
 
 ---
 
-## Q14.4 — Thread-Safe Caching
+## ## Traps
 
-> **Builds on:** [Q7.3 — Collection pitfalls](07_collections_and_sequences.md#q73--common-collection-pitfalls) · [Q5.2 — lazy double-checked locking](05_properties_and_delegation.md#q52--lazy-internals)
-> **Connects to:** [Q17.1 — Memory Leaks](17_performance_and_memory.md#q171--memory-leaks--top-5-causes)
-> **Reference:** [Kotlin Docs — Shared mutable state and concurrency](https://kotlinlang.org/docs/shared-mutable-state-and-concurrency.html)
+**Trap — `cachedIn` missing from ViewModel:**
 
-### `Mutex.withLock` vs `synchronized` — Key Difference
-
-Both protect shared mutable state, but with different mechanics:
-
-**`synchronized` (thread-blocking):**
 ```kotlin
-val lock = Object()
-synchronized(lock) {
-    // Thread BLOCKS — OS parks the thread
-    // The thread cannot do anything else while waiting
-    doWork()
-}
+// WRONG — PagingData re-fetched on every recomposition/rotation:
+val pagingData = pager.flow
+
+// CORRECT:
+val pagingData = pager.flow.cachedIn(viewModelScope)
+// cachedIn survives recomposition and configuration changes
 ```
 
-**`Mutex.withLock` (coroutine-aware suspension):**
+**Trap — `PagingSource` from Room without `RemoteMediator` has no network:**
+
 ```kotlin
+// This only shows Room data — never fetches from network:
+pagingSourceFactory = { db.userDao().pagingSource() }
+// Must pair with RemoteMediator to get network + offline support
+```
+
+---
+
+## Memory Trick
+
+```
+PagingSource  = HOW to load one page (network OR DB, not both).
+RemoteMediator = coordinates network → Room (network writes, Room feeds PagingSource).
+
+Room as SSoT: PagingSource reads Room. RemoteMediator fills Room from network.
+
+Cursor > Offset: deletions shift offsets (duplicates). Cursors are stable IDs.
+
+RemoteKey = "next page number" stored in DB (Room doesn't know about pagination).
+
+cachedIn(viewModelScope) = survives recomposition. Always add it.
+```
+
+---
+
+## Self-Test
+
+1. What is the difference between `PagingSource` and `RemoteMediator`?
+2. Show the offset pagination bug with a concrete example of a deletion causing a duplicate.
+3. Why does `RemoteMediator` need a `RemoteKey` table?
+4. What does `cachedIn(viewModelScope)` do? What breaks without it?
+5. A user is offline. They open a screen using Paging 3 with `RemoteMediator`. What do they see?
+
+---
+
+# Q14.4 — Thread-Safe Caching
+
+> **Builds on:** [Q9.2 (Dispatchers)](09_coroutines_execution_mechanics.md#q92--coroutine-context-and-dispatchers) · [Q5.2 (lazy double-checked locking)](05_properties_and_delegation.md#q52--lazy-internals)
+> **Connects to:** [Q17.1 (Memory leaks)](17_performance_and_memory.md#q171--memory-leaks--top-5-causes)
+
+---
+
+## The Core Rule
+
+```
+synchronized  = blocks the thread (OS parks it).
+Mutex         = suspends the coroutine (thread is freed for other work).
+Use Mutex in coroutine code. synchronized in coroutines can deadlock.
+```
+
+---
+
+## `synchronized` vs `Mutex` — Thread Behavior
+
+```kotlin
+// synchronized — thread BLOCKS while waiting:
+val lock = Any()
+synchronized(lock) {
+    doWork()   // other threads trying this block sit idle in OS scheduler
+}
+
+// Mutex — coroutine SUSPENDS while waiting (thread freed):
 val mutex = Mutex()
 mutex.withLock {
-    // Coroutine SUSPENDS — the thread is FREED for other coroutines!
-    // Another coroutine can run on this thread while waiting for the lock
-    doWork()
+    doWork()   // other coroutines can run on this thread while waiting
 }
 ```
 
 ```
-Thread behavior:
-synchronized:   Thread ─[waiting]─[waiting]─[waiting]─[got lock]─[working]─►
-                         ↑ thread is BLOCKED, wasting CPU scheduling slot
+Thread A (synchronized):  ──[waiting]──[waiting]──[waiting]──[got lock]──[work]──►
+                                ↑ thread parked, wasted
 
-Mutex:          Thread ─[suspends, frees thread]───────────────[resumed]─[working]─►
-                         ↑ thread does other coroutines' work while waiting
+Thread A (Mutex):          ──[suspend]──────────────────────────[resumed]──[work]──►
+                                ↑ other coroutines ran on this thread during wait
 ```
 
-Use `Mutex` in coroutine code — `synchronized` in coroutines can deadlock on a single-threaded dispatcher.
+**Deadlock risk:** On a single-threaded dispatcher (`Dispatchers.Main`), `synchronized` can deadlock — thread is blocked waiting for a lock held by another coroutine that needs the same thread to run.
 
-### The `getOrLoad` Atomic Pattern
+---
+
+## The `getOrLoad` Pattern — Atomic Check-and-Load
 
 ```kotlin
 class ImageCache {
     private val mutex = Mutex()
     private val cache = mutableMapOf<String, Bitmap>()
 
-    suspend fun getOrLoad(url: String): Bitmap {
-        // WRONG: check then load — race condition!
-        // if (cache.containsKey(url)) return cache[url]!!
-        // cache[url] = loadImage(url)  // two coroutines might both reach here!
+    // WRONG — race condition:
+    suspend fun getOrLoadBad(url: String): Bitmap {
+        if (cache.containsKey(url)) return cache[url]!!
+        // Two coroutines both reach here simultaneously:
+        val bitmap = loadImage(url)   // DUPLICATE LOAD!
+        cache[url] = bitmap
+        return bitmap
+    }
 
-        // CORRECT: atomic check-and-load with mutex
-        cache[url]?.let { return it }  // fast path: no lock if already cached
+    // CORRECT — double-checked locking:
+    suspend fun getOrLoad(url: String): Bitmap {
+        cache[url]?.let { return it }              // fast path, no lock
 
         return mutex.withLock {
-            // Inside lock: check again (another coroutine may have loaded it)
-            cache[url] ?: run {
+            cache[url] ?: run {                    // re-check inside lock
                 val bitmap = loadImage(url)
                 cache[url] = bitmap
                 bitmap
@@ -629,60 +755,126 @@ class ImageCache {
 }
 ```
 
-**The race condition without mutex:**
-```
-Coroutine 1: check cache → miss
-Coroutine 2: check cache → miss
-Coroutine 1: loadImage(url) → result
-Coroutine 2: loadImage(url) → result  ← DUPLICATE LOAD!
-Both store result. Wasted work.
-```
-
-### `ConcurrentHashMap.computeIfAbsent` vs Coroutine Mutex
-
-```kotlin
-// ConcurrentHashMap.computeIfAbsent: thread-safe, but NOT coroutine-safe
-val cache = ConcurrentHashMap<String, Bitmap>()
-cache.computeIfAbsent(url) { loadImageBlocking(url) }  // blocking operation inside!
-// This BLOCKS the thread — don't use blocking ops inside computeIfAbsent!
-
-// Mutex: coroutine-safe, works with suspend functions:
-val mutex = Mutex()
-val cache = HashMap<String, Bitmap>()
-mutex.withLock {
-    cache.getOrPut(url) { loadImage(url) }  // can suspend here!
-}
-```
-
-**When to use `ConcurrentHashMap.computeIfAbsent`:** Pure Kotlin/Java (no coroutines), thread-based concurrency, fast non-blocking computation.
-
-**When to use `Mutex`:** Coroutine context, operation may suspend (network, DB), single-threaded dispatcher.
+**Why re-check inside the lock?** Two coroutines both miss the fast path, both enter `mutex.withLock`. The first one loads and stores. The second one acquires the lock — without re-checking, it would load again. The inner `cache[url] ?:` prevents the duplicate.
 
 ---
 
-## Master Summary: Jetpack Components in 5 Points
+## `ConcurrentHashMap.computeIfAbsent` vs Coroutine `Mutex`
+
+```kotlin
+// ConcurrentHashMap — thread-safe but NOT coroutine-safe:
+val cache = ConcurrentHashMap<String, Bitmap>()
+cache.computeIfAbsent(url) { loadImageBlocking(url) }
+// Problem: computeIfAbsent holds a lock on the bucket.
+// Calling a suspend function here blocks the thread → defeats coroutine model.
+
+// Mutex — coroutine-safe, works with suspend functions:
+val mutex = Mutex()
+val cache = HashMap<String, Bitmap>()
+mutex.withLock {
+    cache.getOrPut(url) { loadImage(url) }   // can suspend inside
+}
+```
+
+**Rule:**
+- Thread-based concurrency, fast non-blocking computation → `ConcurrentHashMap.computeIfAbsent`
+- Coroutine context, operation may suspend → `Mutex.withLock`
+
+---
+
+## `@Volatile` for Flags
+
+```kotlin
+// Visible change across threads immediately (no CPU cache lag):
+@Volatile var isRunning = false
+
+// But @Volatile alone is NOT atomic for read-modify-write:
+isRunning = !isRunning   // NOT thread-safe — read + flip + write are three operations
+// For atomic flip: use AtomicBoolean
+```
+
+---
+
+## ## Traps
+
+**Trap — `synchronized` on a single-threaded dispatcher:**
+
+```kotlin
+// Deadlock risk:
+viewModelScope.launch(Dispatchers.Main.immediate) {
+    synchronized(lock) {
+        delay(100)   // suspends — but thread is BLOCKED by synchronized → deadlock
+    }
+}
+```
+
+**Trap — Forgetting to re-check inside `mutex.withLock`:**
+
+```kotlin
+// WRONG — no inner re-check → duplicate loads:
+return mutex.withLock {
+    val bitmap = loadImage(url)    // loads even if another coroutine already did it
+    cache[url] = bitmap
+    bitmap
+}
+
+// CORRECT:
+return mutex.withLock {
+    cache[url] ?: run { /* load only if still missing */ }
+}
+```
+
+---
+
+## Memory Trick
+
+```
+synchronized = parks thread (OS call). Wrong in coroutines.
+Mutex        = suspends coroutine (cooperative). Correct in coroutines.
+
+Double-checked locking pattern:
+  1. Fast path: check cache outside lock (no contention).
+  2. Slow path: acquire lock, re-check inside lock (avoid duplicate work).
+
+ConcurrentHashMap.computeIfAbsent = blocking lambda → no suspend inside.
+Mutex.withLock = suspend-friendly → can call suspend functions.
+
+@Volatile = visibility (no CPU cache lag). NOT atomicity.
+AtomicBoolean/AtomicReference = visibility + atomicity.
+```
+
+---
+
+## Self-Test
+
+1. Why can `synchronized` deadlock in coroutines? What is the alternative?
+2. Write the correct `getOrLoad` pattern. Why is the inner re-check after acquiring the lock necessary?
+3. Can you call a `suspend` function inside `ConcurrentHashMap.computeIfAbsent`? What happens?
+4. What is the difference between `@Volatile` and `AtomicBoolean`? Which is sufficient for a running flag that's only written once?
+
+---
+
+## Phase 14 — Summary
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│  1. Room generates CREATE TABLE SQL from @Entity at compile time.     │
-│     @Transaction wraps multiple operations atomically (BEGIN/COMMIT). │
-│     Flow<List<T>> auto-emits via InvalidationTracker on any write.   │
+│  1. Room = compile-time SQL verification.                              │
+│     @Transaction = SQLite BEGIN...COMMIT (atomic, all or nothing).   │
+│     Flow re-emits via InvalidationTracker on any write.              │
+│     Migration missing → IllegalStateException (never silent corrupt). │
 │                                                                        │
-│  2. WorkManager persists work to Room DB, survives process death +    │
-│     reboot. PeriodicWork minimum: 15 minutes. Chain with .then().    │
+│  2. WorkManager = persisted to Room DB → OS scheduler (JobScheduler).│
+│     Survives process death + reboot. Minimum periodic = 15 minutes.  │
+│     CoroutineWorker for suspend. Chain with .then().                  │
 │                                                                        │
-│  3. PagingSource: how to load pages. RemoteMediator: coordinates      │
-│     network + local DB (network writes to Room; UI reads Room).      │
-│     RemoteKeys store "next page" metadata for the last loaded item.  │
+│  3. PagingSource = how to load one page.                              │
+│     RemoteMediator = network writes to Room; UI reads Room.          │
+│     Cursor > Offset (no data shifting on insert/delete).             │
+│     cachedIn(viewModelScope) = survives recomposition.               │
 │                                                                        │
-│  4. Cursor pagination beats offset — no data shifting bugs.          │
-│     Offset: item deletions shift positions → duplicates.             │
-│     Cursor: stable ID reference → no position shifting.              │
-│                                                                        │
-│  5. Mutex.withLock suspends coroutine (frees thread) while waiting.  │
-│     synchronized blocks the thread — wrong in coroutine context.     │
-│     The double-check pattern (fast path + locked slow path) prevents │
-│     duplicate loads.                                                  │
+│  4. Mutex.withLock = coroutine-safe (suspends, frees thread).        │
+│     synchronized = thread-blocking (wrong in coroutines → deadlock). │
+│     Double-check inside lock to prevent duplicate loads.             │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 

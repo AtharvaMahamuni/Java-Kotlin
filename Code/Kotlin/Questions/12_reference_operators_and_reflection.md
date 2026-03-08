@@ -1,348 +1,403 @@
-# Phase 12: Reference Operators and Reflection
+# Phase 12 — Reference Operators and Reflection
+
+> The `::` operator doesn't call a function — it wraps it in an anonymous class. `KClass` is Kotlin's reflection mirror that exposes metadata the JVM's `Class` never had. Both topics follow directly from how anonymous classes and type erasure work.
 
 ## Navigation
-[← Master Index](master_chains.md)
+
+[← Phase 11 — Flow](11_flow.md) | [→ Phase 13 — Android Architecture](13_android_architecture.md)
 
 ## Questions in This File
-- [Q12.1 — `::` Operators](#q121----operators)
+
+- [Q12.1 — `::` Function and Property References](#q121----function-and-property-references)
 - [Q12.2 — `KClass` vs `Class`](#q122--kclass-vs-class)
 
 ---
 
-## Q12.1 — `::` Operators
+# Q12.1 — `::` Function and Property References
 
-> **Builds on:** [Q4.1 — Lambda anonymous class](04_functions_lambdas_inlining.md#q41--lambda-compilation) · [Q4.2 — inline](04_functions_lambdas_inlining.md#q42--inline-noinline-crossinline)
-> **Connects to:** [Q3.3 — reified (T::class inside reified)](03_generics_and_variance.md#q33--reified-type-parameters) · [Q12.2 — KClass vs Class](12_reference_operators_and_reflection.md#q122--kclass-vs-class)
-> **Reference:** [Kotlin Docs — Callable References](https://kotlinlang.org/docs/reflection.html#callable-references)
+> **Builds on:** [Q4.1 (lambda = anonymous class)](04_functions_lambdas_inlining.md#q41--lambda-compilation) · [Q4.3 (inline eliminates the object)](04_functions_lambdas_inlining.md#q43--inline-noinline-crossinline)
+> **Connects to:** [Q3.3 (reified uses T::class)](03_generics_and_variance.md#q33--reified-type-parameters) · [Q12.2 (KClass)](#q122--kclass-vs-class)
 
-### The Concrete Picture
+---
 
-Two kinds of references — arity is the tell:
+## The Core Rule
 
 ```
-UNBOUND: String::length      → (String) -> Int       arity = 1 (receiver IS the parameter)
-  names.map(String::length)  → each String is passed as the receiver
-
-BOUND:   "hello"::length     → () -> Int              arity = 0 (receiver captured)
-  val f = "hello"::length; f()  → always "hello".length
-
-The difference: Unbound adds receiver as first parameter. Bound captures it.
+::greet == { s -> greet(s) }
+Both compile to an anonymous class implementing FunctionN.
+The only difference: :: names an existing function; lambda has its own body.
 ```
 
-Function reference vs lambda — same anonymous class:
-```kotlin
-::greet          →  Function1<String, String> { greet(it) }  // same object
-{ s -> greet(s) } → Function1<String, String> { greet(it) }  // same bytecode
-```
+---
 
-### First Principles: What Is a Function Reference?
-
-A function reference (`::myFun`) is a way to treat a function as a first-class value — to pass it around without calling it. It's essentially a shorthand for creating a lambda that calls the function:
-
-```kotlin
-fun double(x: Int) = x * 2
-
-// Lambda (creates new object each time if capturing):
-val d1: (Int) -> Int = { x -> double(x) }
-
-// Function reference (more efficient, expresses intent clearly):
-val d2: (Int) -> Int = ::double
-```
-
-### What Anonymous Class Does a Function Reference Compile To?
+## What `::` Compiles To
 
 ```kotlin
 fun greet(name: String): String = "Hello, $name!"
 val ref = ::greet
 ```
 
-**Decompiled Java:**
 ```java
-// Function reference compiles to the same FunctionN anonymous class as a lambda:
+// Decompiled — same structure as a lambda:
 Function1<String, String> ref = new Function1<String, String>() {
     @Override
     public String invoke(String name) {
-        return GreetingKt.greet(name);  // delegates to the actual function
+        return GreetingKt.greet(name);   // delegates to the actual function
     }
 };
 ```
 
-Like lambdas, non-capturing function references can be [**singletons**](00_jvm_mental_model.md#q03--class-loading-and-the-static--block) (one instance, like `object`) — the compiler may share one instance:
+Non-capturing function references are **singletons** — the compiler emits one instance per reference and reuses it:
 
 ```kotlin
-// top-level non-capturing function reference — likely a singleton:
-val ref1 = ::greet
-val ref2 = ::greet
-// ref1 === ref2 may be true (same singleton object)
+val a = ::greet
+val b = ::greet
+// a === b → true (same singleton object)
 ```
 
-### Bound vs Unbound References — The Arity Difference
-
-**Unbound reference** — the receiver must be provided explicitly (adds one parameter):
+Capturing references (bound to an instance) are **new objects per use**:
 
 ```kotlin
-// Unbound: String is NOT bound to a specific instance
-val strLength: (String) -> Int = String::length
-// Has arity 1: you must pass the String
-strLength("hello")  // 5
-strLength("world")  // 5
-```
-
-**Bound reference** — the receiver is fixed to a specific instance:
-
-```kotlin
-val hello = "hello"
-val boundLength: () -> Int = hello::length  // receiver IS "hello"
-// Has arity 0: no argument needed — receiver is already bound
-boundLength()  // 5 — always "hello".length
-```
-
-```
-Unbound: String::length           Bound: "hello"::length
-┌──────────────────────┐          ┌──────────────────────┐
-│  (String) → Int      │          │  () → Int             │
-│  receiver as param   │          │  receiver captured    │
-│  String::length("hi")│          │  "hello"::length()   │
-└──────────────────────┘          └──────────────────────┘
-Arity = 1                         Arity = 0
-```
-
-**Practical example:**
-```kotlin
-val names = listOf("Alice", "Bob", "Charlie")
-
-// Unbound — provides method reference; each String is the receiver:
-names.map(String::uppercase)       // ["ALICE", "BOB", "CHARLIE"]
-names.sortedBy(String::length)     // ["Bob", "Alice", "Charlie"]
-
-// Bound — specific object's method:
-val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd")
-dates.map(formatter::format)       // formatter is bound receiver
-```
-
-### Property References — `KProperty1`
-
-Property references use the `KProperty` hierarchy:
-
-```kotlin
-data class Box(val value: Int)
-
-// Property reference:
-val valueRef: KProperty1<Box, Int> = Box::value
-//            ^ KProperty1<T, R> — T = receiver type, R = property type
-
-val box = Box(42)
-valueRef.get(box)  // 42 — calls the getter
-```
-
-`KProperty1` vs `KProperty0`:
-- `KProperty0` — top-level property or property with no receiver: `::someTopLevelProp`
-- `KProperty1<T, R>` — member property: `T::property` (needs a receiver of type T to get)
-- `KProperty2<D, E, R>` — extension property with explicit receiver
-
-### Memory Trick
-
-```
-::fun = anonymous class FunctionN (same as lambda under the hood).
-  Non-capturing → possibly singleton (compiler shares one instance).
-  Capturing → new object each call.
-
-UNBOUND: Type::member   → receiver becomes first parameter (arity + 1).
-BOUND:   obj::member    → receiver captured (arity 0 if member takes no params).
-
-INLINE + :: = no object created.
-  inline fun filter(pred: (T) -> Boolean) — pred body pasted, ::isEven never allocated.
-
-Property reference: Box::value → KProperty1<Box, Int>.
-  .get(box) → calls getter. .set(box, 42) → calls setter (if var).
-```
-
-### Kotlin `::` vs Java `::` — Bytecode Difference
-
-**Kotlin `::` → anonymous class** (as described above)
-
-**Java `::` → `invokedynamic` + `LambdaMetafactory`**:
-```java
-// Java 8+:
-Function<String, Integer> ref = String::length;
-// Compiles to INVOKEDYNAMIC — the JVM creates the lambda object lazily,
-// potentially using method handles, not an anonymous class
-```
-
-Kotlin chose anonymous classes for predictability and to support pre-Java-8 (Android). The JVM's `LambdaMetafactory` approach can be more efficient for GC but Kotlin compensates with `inline`.
-
-### When Passing `::function` to an `inline` Function Eliminates the Object
-
-```kotlin
-inline fun <T> List<T>.myFilter(predicate: (T) -> Boolean): List<T> {
-    return filter(predicate)  // inline — predicate is pasted, not an object
-}
-
-fun isEven(n: Int) = n % 2 == 0
-
-val result = listOf(1, 2, 3, 4).myFilter(::isEven)
-// Because myFilter is inline, ::isEven's anonymous class is never created!
-// The predicate call is inlined as: if (isEven(it)) ...
+val a = myObj::method   // captures myObj → new object
+val b = myObj::method   // different object
+// a === b → false
 ```
 
 ---
 
-## Q12.2 — `KClass` vs `Class`
+## Bound vs Unbound — The Arity Rule
 
-> **Builds on:** [Q12.1 — Function References](12_reference_operators_and_reflection.md#q121----operators) · [Q3.3 — reified (uses KClass)](03_generics_and_variance.md#q33--reified-type-parameters)
-> **Connects to:** [Q3.1 — Type Erasure (reflection defeats it)](03_generics_and_variance.md#q31--type-erasure)
-> **Reference:** [Kotlin Docs — Reflection](https://kotlinlang.org/docs/reflection.html)
-
-### The Concrete Picture
-
-KClass vs Class — two mirrors of the same class:
+The rule: unbound adds the receiver as the first parameter.
 
 ```
-String::class       → KClass<String>    (Kotlin reflection — Kotlin-specific metadata)
-String::class.java  → Class<String>     (Java reflection  — available everywhere)
-
-KClass ONLY:
-  .isData          → true for data class
-  .isSealed        → true for sealed class
-  .sealedSubclasses → list of all sealed subclasses
-  .primaryConstructor → KFunction reference
-  .memberProperties   → all Kotlin properties
-
-Class ONLY:
-  .getDeclaredMethods() → raw Java methods
-  .getAnnotation(Foo::class.java) → Java annotation lookup
+UNBOUND: String::length     → (String) -> Int      arity = 1
+BOUND:   "hello"::length    → () -> Int             arity = 0 (receiver captured)
 ```
-
-Instance vs type class reference:
-```
-val btn: Widget = Button()
-btn::class          → KClass<Button>  (RUNTIME type — actual type)
-Widget::class       → KClass<Widget>  (COMPILE-TIME type — declared type)
-```
-
-### `KClass<T>` vs `Class<T>` — The Difference
-
-`Class<T>` is the Java reflection API — it's been in Java since version 1.1. `KClass<T>` is Kotlin's reflection API that adds Kotlin-specific metadata that `Class` doesn't have.
 
 ```kotlin
-val kotlinClass: KClass<String> = String::class       // Kotlin's KClass
-val javaClass: Class<String> = String::class.java     // Java's Class
-// Or:
-val javaClass2: Class<String> = String.javaClass       // from an instance
+// Unbound — receiver becomes the parameter:
+val strLength: (String) -> Int = String::length
+strLength("hello")  // 5
+
+// Bound — receiver is captured:
+val boundLength: () -> Int = "hello"::length
+boundLength()       // 5, always "hello".length
 ```
 
-### What `KClass` Exposes That `Class` Doesn't
+```
+UNBOUND:  String::length              BOUND:  "hello"::length
+┌─────────────────────┐               ┌─────────────────────┐
+│  (String) → Int     │               │  () → Int           │
+│  receiver = param   │               │  receiver captured  │
+│  arity = 1          │               │  arity = 0          │
+└─────────────────────┘               └─────────────────────┘
+```
+
+**Practical usage:**
 
 ```kotlin
-data class User(val name: String, val age: Int)
-sealed class Result<out T>
+val names = listOf("Alice", "Bob", "Charlie")
 
-val userKClass = User::class
+names.map(String::uppercase)       // unbound — each String is the receiver
+names.sortedBy(String::length)     // unbound — each String is the receiver
 
-// Kotlin-specific metadata (not in Java Class):
-userKClass.isData          // true — data class!
-userKClass.isSealed        // false
-userKClass.isOpen          // false (final by default)
-userKClass.isAbstract      // false
-userKClass.isCompanion     // false
-userKClass.objectInstance  // null (not an object)
-userKClass.primaryConstructor  // KFunction — the primary constructor!
-userKClass.memberProperties    // Set of all properties
-
-val resultKClass = Result::class
-resultKClass.isSealed          // true!
-resultKClass.sealedSubclasses  // [KClass<Result.Success>, KClass<Result.Error>, ...]
+val fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd")
+dates.map(fmt::format)             // bound — fmt captured as receiver
 ```
 
-These are impossible to get from Java's `Class`:
-```java
-// Java Class API:
-Class<User> userClass = User.class;
-userClass.isEnum();        // false
-userClass.isInterface();   // false
-// No isData(), isSealed(), primaryConstructor()!
+---
+
+## Property References — `KProperty1`
+
+```kotlin
+data class Box(val value: Int)
+
+val ref: KProperty1<Box, Int> = Box::value
+//       KProperty1<T, R>:  T = receiver type, R = return type
+
+val box = Box(42)
+ref.get(box)    // 42 — calls the getter
 ```
 
-### `widget::class` vs `Widget::class`
+`KProperty` hierarchy at a glance:
+
+```
+KProperty0<R>       — top-level property or property with no receiver
+KProperty1<T, R>    — member property (T = the object, R = the type)
+KProperty2<D, E, R> — extension property with explicit receiver
+```
+
+For `var` properties, `KMutableProperty1.set(box, newValue)` calls the setter.
+
+---
+
+## `inline` + `::` — Zero Allocation
+
+```kotlin
+inline fun <T> List<T>.myFilter(pred: (T) -> Boolean): List<T> = filter(pred)
+
+fun isEven(n: Int) = n % 2 == 0
+
+val result = listOf(1, 2, 3, 4).myFilter(::isEven)
+// myFilter is inline → pred body pasted at call site
+// ::isEven anonymous class is NEVER created
+```
+
+When the function receiving `::` is `inline`, the reference object is eliminated entirely. This is the primary reason to prefer passing `::method` over lambdas to inline functions.
+
+---
+
+## Kotlin `::` vs Java `::` — Bytecode Difference
+
+```
+Kotlin ::   → anonymous class implementing FunctionN (heap object)
+Java   ::   → INVOKEDYNAMIC + LambdaMetafactory (JVM creates at runtime via method handles)
+```
+
+Java's approach can be more GC-efficient. Kotlin chose anonymous classes for Android compatibility (pre-Java-8 ART) and compensates with `inline`.
+
+---
+
+## ## Traps
+
+**Trap 1 — Bound reference captures instance; can prevent GC:**
+
+```kotlin
+class HeavyObject {
+    val ref = this::someMethod   // captures `this` → HeavyObject can't be GC'd
+}
+```
+
+**Trap 2 — Unbound vs bound arity confusion in higher-order functions:**
+
+```kotlin
+// WRONG — type mismatch:
+val fn: () -> Int = String::length   // needs (String) -> Int, not () -> Int
+
+// CORRECT — bind first:
+val fn: () -> Int = "hello"::length
+```
+
+**Trap 3 — Non-capturing singleton only applies to TOP-LEVEL non-capturing references. Member references are not singletons:**
+
+```kotlin
+val a = String::length   // top-level/unbound → likely singleton
+val b = obj::method      // bound → new object
+```
+
+---
+
+## Memory Trick
+
+```
+:: = anonymous class FunctionN (same as lambda, different body).
+  Non-capturing → singleton (compiler shares one instance).
+  Capturing (bound) → new object per use.
+
+UNBOUND: Type::member   → receiver becomes first parameter (arity +1).
+BOUND:   obj::member    → receiver captured (arity stays same).
+
+inline + :: = zero allocation (body pasted, object never created).
+
+Property reference: Box::value → KProperty1<Box, Int>.
+  .get(box) → calls getter.
+  .set(box, v) → calls setter (only if KMutableProperty1).
+```
+
+---
+
+## Self-Test
+
+1. What JVM construct does `::greet` compile to? How does it differ from `{ s -> greet(s) }`?
+2. Why does `String::length` have arity 1 but `"hello"::length` have arity 0?
+3. `names.map(String::uppercase)` — is `String::uppercase` a new object per call? Why or why not?
+4. When does passing `::` to a function result in zero allocation? What's the mechanism?
+5. What is `KProperty1<Box, Int>` and how do you read and write through it?
+
+---
+
+# Q12.2 — `KClass` vs `Class`
+
+> **Builds on:** [Q12.1 (:: creates objects)](12_reference_operators_and_reflection.md#q121----function-and-property-references) · [Q3.3 (reified delivers T::class)](03_generics_and_variance.md#q33--reified-type-parameters)
+> **Connects to:** [Q3.1 (type erasure — reflection defeats it)](03_generics_and_variance.md#q31--type-erasure)
+
+---
+
+## The Core Rule
+
+```
+T::class        → KClass<T>   (Kotlin reflection — Kotlin-specific metadata)
+T::class.java   → Class<T>    (Java reflection  — available everywhere)
+
+Same underlying class, two different mirrors.
+```
+
+---
+
+## What Each Exposes
+
+```kotlin
+val kc = User::class     // KClass<User>
+val jc = User::class.java  // Class<User>
+```
+
+**KClass only** (Kotlin metadata — not in Class):
+
+```kotlin
+kc.isData           // true — it's a data class
+kc.isSealed         // false
+kc.isOpen           // false (final by default)
+kc.isAbstract       // false
+kc.isCompanion      // false
+kc.objectInstance   // null (not an object singleton)
+kc.primaryConstructor    // KFunction — the primary constructor
+kc.memberProperties      // all Kotlin properties as KProperty set
+kc.sealedSubclasses      // only on sealed — list of all subclasses
+```
+
+**Class only** (Java APIs):
+
+```kotlin
+jc.getDeclaredMethods()           // raw Java methods
+jc.getDeclaredFields()            // raw Java fields
+jc.getAnnotation(Foo::class.java) // Java annotation access
+jc.isEnum()
+```
+
+---
+
+## Instance vs Type Reference — Runtime vs Compile-Time
 
 ```kotlin
 class Widget
 class Button : Widget()
 
-val btn = Button()
+val btn: Widget = Button()    // declared as Widget, actual is Button
 
-// Instance reference — gets the ACTUAL runtime type:
-val instanceClass = btn::class  // KClass<Button> (Button, not Widget!)
-
-// Type reference — gets the declared type:
-val typeClass = Widget::class   // KClass<Widget>
+btn::class      // KClass<Button>  — RUNTIME type (the actual object)
+Widget::class   // KClass<Widget>  — COMPILE-TIME type (declared type)
 ```
 
-The instance reference uses the **actual runtime type** (most specific class). This follows the same principle as `getClass()` in Java:
+This follows the same rule as Java's `getClass()`:
 
 ```java
 Widget btn = new Button();
-btn.getClass()  // → Button.class (runtime type, not declared type)
+btn.getClass()   // → Button.class (runtime type, not Widget.class)
 ```
 
-**Covariance:** `btn::class` returns `KClass<out Button>` (covariant), because you can get a more specific type from an instance typed as a supertype.
+**Why covariant?** `btn::class` returns `KClass<out Button>`. Because `btn` is declared as `Widget`, the compiler can only guarantee the runtime class is *at most* `Button` — it could be a deeper subtype.
 
-### Memory Trick
+---
 
-```
-KClass = KOTLIN metadata. T::class → KClass<T>.
-Class  = JAVA reflection. T::class.java → Class<T>.
-
-KClass-only: isData, isSealed, sealedSubclasses, primaryConstructor, memberProperties.
-Class-only:  getDeclaredMethods(), Java annotation APIs.
-
-INSTANCE::class → runtime type (actual object's class). Like Java's getClass().
-TYPE::class     → compile-time type (declared class).
-
-Libraries:
-  Gson, Retrofit, Hilt → Class (Java). Use T::class.java.
-  Kotlin Serialization → KClass or KSerializer. Use T::class.
-```
-
-### When Do You Need `KClass` vs `Class`?
-
-| Library/Use Case | Needs | How to get |
-|-----------------|-------|-----------|
-| Gson | `Class<T>` | `T::class.java` |
-| Moshi | Either (reflection = Class, codegen = KClass) | varies |
-| Retrofit | `Class<T>` | `T::class.java` |
-| Kotlin Serialization | `KClass<T>` or `KSerializer<T>` | `T::class` or `serializer()` |
-| Hilt/Dagger | `Class<T>` (Java DI) | `T::class.java` |
-| Kotlin Reflect | `KClass<T>` | `T::class` |
+## Decompiled — How `T::class` Works
 
 ```kotlin
-// Common pattern: get both easily
-val kClass = User::class          // KClass<User>
-val jClass = User::class.java     // Class<User>
-// or
-val jClass2 = javaClass<User>()   // alternative
+val kc: KClass<String> = String::class
+```
+
+```java
+// Decompiled:
+KClass<String> kc = Reflection.getOrCreateKotlinClass(String.class);
+// KClass is a wrapper around Class that adds Kotlin metadata.
+// Kotlin reflection adds metadata via a separate .kotlin_module file + annotations.
+```
+
+`KClass<T>` is backed by the same `Class<T>` — it's a Kotlin wrapper that reads extra metadata stored in annotations generated by the Kotlin compiler.
+
+---
+
+## Which to Use — Library Decision Table
+
+| Library / Use | Needs | How |
+|---|---|---|
+| Gson | `Class<T>` | `T::class.java` |
+| Retrofit | `Class<T>` | `T::class.java` |
+| Hilt/Dagger | `Class<T>` | `T::class.java` |
+| Kotlin Serialization | `KClass<T>` / `KSerializer<T>` | `T::class` or `serializer()` |
+| Kotlin Reflect API | `KClass<T>` | `T::class` |
+| `isData`, `isSealed` checks | `KClass<T>` | `T::class` |
+
+---
+
+## ## Traps
+
+**Trap 1 — Using `KClass` with Java-only APIs:**
+
+```kotlin
+// WRONG — Gson expects Class, not KClass:
+Gson().fromJson(json, User::class)       // compile error
+
+// CORRECT:
+Gson().fromJson(json, User::class.java)  // Class<User>
+```
+
+**Trap 2 — Instance `::class` is the runtime type, not the declared type:**
+
+```kotlin
+fun printType(w: Widget) = println(w::class.simpleName)
+printType(Button())    // prints "Button", not "Widget"
+// Interviewers love this — it surprises people who expect Widget
+```
+
+**Trap 3 — Reflection requires `kotlin-reflect` dependency. `KClass` without it is limited:**
+
+```kotlin
+User::class.primaryConstructor   // throws if kotlin-reflect is not on classpath
+User::class.isData               // same — metadata access requires kotlin-reflect
+User::class.java                 // always works — no extra dependency
 ```
 
 ---
 
-## Master Summary: References and Reflection in 4 Points
+## Memory Trick
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  1. `::fun` creates an anonymous class implementing FunctionN.       │
-│     Bound references (instance::method) have N-1 arity.             │
-│     Unbound references (Type::method) have N arity (receiver first). │
-│                                                                       │
-│  2. Property references implement KProperty1<T, R> — need a          │
-│     receiver to get the value. Use .get(instance) to access.        │
-│                                                                       │
-│  3. KClass is Kotlin's reflection type: exposes isData, isSealed,   │
-│     primaryConstructor, sealedSubclasses — unavailable in Class.    │
-│     Get it with T::class; get Class with T::class.java.             │
-│                                                                       │
-│  4. Instance::class returns the RUNTIME type. Type::class returns    │
-│     the COMPILE-TIME type. This matters for polymorphic objects.    │
-└──────────────────────────────────────────────────────────────────────┘
+KClass = KOTLIN metadata wrapper.  T::class → KClass<T>.
+Class  = JAVA reflection.          T::class.java → Class<T>.
+
+KClass-only: isData, isSealed, sealedSubclasses, primaryConstructor, memberProperties.
+Class-only:  getDeclaredMethods(), Java annotations, isEnum().
+
+INSTANCE::class → runtime type (actual object's class). Like Java's getClass().
+TYPE::class     → compile-time type (declared class).
+
+Library rule: Java libs (Gson, Retrofit, Hilt) → need Class → use .java
+              Kotlin libs (kotlinx.serialization, Reflect) → need KClass → use ::class
+
+kotlin-reflect needed for: primaryConstructor, memberProperties, isData, isSealed.
+```
+
+---
+
+## Self-Test
+
+1. What is the difference between `btn::class` and `Widget::class` when `btn` is declared as `Widget` but holds a `Button`?
+2. `User::class.isData` — does this work without `kotlin-reflect` on the classpath?
+3. You're integrating with Gson. Do you pass `User::class` or `User::class.java`? Why?
+4. At the JVM level, is `KClass<String>` the same object as `Class<String>`? What is `KClass` built on top of?
+5. What does `Result::class.sealedSubclasses` return? Why does this require `KClass` and not `Class`?
+
+---
+
+## Phase 12 — Summary
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  :: = anonymous class FunctionN.                                 │
+│    Non-capturing → singleton. Capturing/bound → new object.     │
+│    inline + :: = zero allocation.                               │
+│                                                                  │
+│  Bound: obj::method   arity stays same. Receiver captured.     │
+│  Unbound: Type::method arity +1. Receiver is first parameter.  │
+│                                                                  │
+│  KClass = Kotlin metadata mirror of Class.                      │
+│    T::class → KClass. T::class.java → Class.                   │
+│    KClass adds: isData, isSealed, primaryConstructor, etc.     │
+│    Requires kotlin-reflect for most metadata operations.       │
+│                                                                  │
+│  INSTANCE::class → runtime type (like getClass()).             │
+│  TYPE::class     → compile-time declared type.                 │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ---

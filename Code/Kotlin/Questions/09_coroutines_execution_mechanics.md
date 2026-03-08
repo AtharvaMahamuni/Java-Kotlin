@@ -427,6 +427,19 @@ CoroutineContext (typed map):
   ExceptionHandler.Key → CoroutineExceptionHandler       (optional, last-resort handler)
 ```
 
+```
+CoroutineContext (visual):
+┌────────────────────────────┐
+│ Key         │ Value        │
+├────────────────────────────┤
+│ Job.Key     │ Job          │
+│ Dispatcher  │ Main/IO/Dflt │
+│ Name.Key    │ "MyCoroutine"│
+│ Handler.Key │ ExcptnHndlr  │
+└────────────────────────────┘
+ctx1 + ctx2 = right wins per key
+```
+
 **Why is `Dispatcher` a `ContinuationInterceptor`?**
 After each suspension, `invokeSuspend` must be called on the right thread. The `Dispatcher` intercepts the resumption and routes it to the correct thread: `interceptContinuation(continuation)` wraps the raw continuation in a `DispatchedContinuation` that posts to the right thread before calling `invokeSuspend`.
 
@@ -480,6 +493,21 @@ CoroutineScheduler (shared pool):
 ```
 
 ```
+Shared CoroutineScheduler:
+┌──────────────────────────┐
+│ W1   W2   W3  ...  W64  │
+├──────────────────────────┤
+│ Default: max=CPU cores   │
+│          NON_BLOCKING    │
+│ IO:      max=64 threads  │
+│          BLOCKING tasks  │
+└──────────────────────────┘
+Default→IO: same pool → may
+             stay same thread
+Main  →IO:  ALWAYS new thread
+```
+
+```
 Default → IO context switch:
   SAME CoroutineScheduler → may use the same physical worker thread
   Only the task label changes (NON_BLOCKING → BLOCKING)
@@ -518,6 +546,16 @@ withContext(Dispatchers.Main) {
 withContext(Dispatchers.Main.immediate) {
     updateUI()  // if already on Main: runs RIGHT NOW inline — zero queue overhead
 }
+```
+
+```
+Dispatchers.Main:
+  on Main? → Handler.post()
+             → queue latency added
+
+Dispatchers.Main.immediate:
+  on Main? → inline, runs NOW ✓
+  off Main?→ Handler.post()
 ```
 
 **Why `viewModelScope` uses `Main.immediate`:**
@@ -948,24 +986,24 @@ sharedFlow.emit(1)   // collector already registered → received ✓
 ### Start Mode Comparison
 
 ```
-Time ──────────────────────────────────────────────────────────────►
-
-DEFAULT:
-  launch() ──► [enqueued] ──────────────────► [body executes on dispatcher thread]
-               └─ cancel window ─┘
-               (can cancel here before body starts)
-
-LAZY:
-  launch() ──► [New state, nothing enqueued] ─────────────────────────────────────
-                                              start()/await() ──► [enqueued] ──► [runs]
-
-ATOMIC:
-  launch() ──► [enqueued] ──► [body runs: NO cancel possible] ──► [1st suspend] ──► ...
-                               ◄──── guaranteed execution ────►     (normal cancel from here)
-
-UNDISPATCHED:
-  launch() ──► [runs NOW on calling thread, synchronously] ──► [1st suspend] ──► [dispatcher]
-               ◄──── no dispatch, inline ────────────────►      ◄──── async ────────────────►
+START MODE COMPARISON
+┌────────────────────────────────┐
+│ DEFAULT:                       │
+│  launch()→[enqueued]→[runs]   │
+│           ←cancel window→      │
+├────────────────────────────────┤
+│ LAZY:                          │
+│  launch()→[New state, idle]    │
+│  start()/await()→[enqueued]   │
+├────────────────────────────────┤
+│ ATOMIC:                        │
+│  launch()→[runs, NO cancel]   │
+│  →1st suspend→normal cancel    │
+├────────────────────────────────┤
+│ UNDISPATCHED:                  │
+│  launch()→[runs on THIS thread]│
+│  →1st suspend→[dispatcher]     │
+└────────────────────────────────┘
 ```
 
 ---
