@@ -7,6 +7,7 @@
 - [Q7.1 — Kotlin's Collection Hierarchy](#q71--kotlins-collection-hierarchy)
 - [Q7.2 — Sequences vs Eager Collections](#q72--sequences-vs-eager-collections)
 - [Q7.3 — Common Collection Pitfalls](#q73--common-collection-pitfalls)
+- [Q7.4 — HashMap Internals, Pre-sizing, and Map Null Safety](#q74--hashmap-internals-pre-sizing-and-map-null-safety)
 
 ---
 
@@ -173,6 +174,26 @@ Zero allocation. Always use `emptyList()` when the result is known to be empty �
 ---
 
 ### `IntArray` vs `Array<Int>` — Boxing Explained
+
+**Why it matters:** wrong choice in a loop = 2.7× more memory + GC pressure.
+
+```
+           IntArray          Array<Int>
+           ────────          ──────────
+JVM type   int[]             Integer[]
+Boxing?    NO                YES (always)
+Layout     [1][2][3]         [ref][ref][ref]
+                              ↓    ↓    ↓
+                             (heap Integer objects)
+```
+
+**Quick rule:**
+```
+IntArray  → primitive int[]  → use for numeric data
+Array<Int> → boxed Integer[] → avoid in tight loops
+List<Int>  → ALWAYS boxes    → generics erase to Object,
+                               no List<int> possible on JVM
+```
 
 ```
 IntArray   → JVM int[]     → raw primitives, contiguous memory, NO boxing
@@ -729,6 +750,185 @@ LinkedHashMap(accessOrder=true):
 
 ---
 
+## Q7.4 — HashMap Internals, Pre-sizing, and Map Null Safety
+
+> **Builds on:** [Q7.1 — Collection Hierarchy](#q71--kotlins-collection-hierarchy) · [Q0.1 — JVM Primitives](00_jvm_mental_model.md)
+> **Connects to:** [Q7.3 — getOrPut / LRU](#q73--common-collection-pitfalls)
+
+---
+
+### WHY This Matters
+
+HashMap is used everywhere — caches, frequency counts, graph adjacency lists. Understanding bucket internals explains O(1) average vs worst-case, why pre-sizing matters, and why `map[key]` returns nullable.
+
+---
+
+### Interface vs Implementation — Design Pattern
+
+Kotlin/Java collections separate **what** from **how**:
+
+```
+Interface       Implementation
+─────────       ──────────────
+Map<K,V>    →   HashMap         (unordered, O(1))
+            →   LinkedHashMap   (insertion order, O(1))
+            →   TreeMap         (sorted by key, O(log n))
+
+Set<E>      →   HashSet         (unordered, O(1))
+            →   LinkedHashSet   (insertion order, O(1))
+            →   TreeSet         (sorted, O(log n))
+```
+
+**Always type your variable to the interface:**
+```kotlin
+val map: Map<Int, String> = HashMap()   // ✓ program to interface
+val map: HashMap<Int, String> = HashMap() // ✗ locks in implementation
+```
+
+---
+
+### HashMap Internals — Bucket Chain
+
+```
+hash(key) → bucket index → linked chain (or tree if long)
+
+Buckets:
+  [0] → null
+  [1] → Node(k1,v1) → Node(k5,v5) → null   ← collision chain
+  [2] → Node(k2,v2) → null
+  [3] → null
+  [4] → Node(k4,v4) → null
+```
+
+```
+lookup(key):
+  1. hash(key) → bucket index         O(1)
+  2. walk chain, equals() check        O(1) avg, O(n) worst
+  insert/delete: same structure        O(1) avg
+```
+
+**Collision note:** Java 8+ converts chains > 8 nodes into a **red-black tree** (O(log n) worst case), balancing memory vs speed automatically.
+
+---
+
+### Pre-sizing — Avoid Rehash
+
+Hash tables have a **load factor** (default 0.75). When `size > capacity × 0.75`:
+```
+resize → new array (2× size) → rehash ALL entries → O(n)
+```
+
+If you know the input size, pre-size to avoid multiple resizes:
+```kotlin
+// BAD: starts at capacity 16, rehashes at 12, 24, 48...
+val map = HashMap<Int, Int>()
+
+// GOOD: single allocation, no rehash
+val map = HashMap<Int, Int>(nums.size)
+val set = HashSet<Int>(nums.size)
+```
+
+**Formula:** `initialCapacity = expectedSize / 0.75 + 1`
+(Kotlin/Java helper: `HashMap(expectedSize * 4 / 3 + 1)` is precise)
+
+---
+
+### LinkedHashMap vs TreeMap — When to Use Each
+
+```
+HashMap        → fastest, no order needed
+LinkedHashMap  → need insertion order (default setOf/mapOf in Kotlin)
+TreeMap        → need sorted keys (range queries, floor/ceiling)
+```
+
+```kotlin
+val freq = TreeMap<Char, Int>()
+freq.floorKey('m')    // largest key ≤ 'm' — O(log n)
+freq.ceilingKey('m')  // smallest key ≥ 'm' — O(log n)
+freq.subMap('a','f')  // range slice — NavigableMap API
+```
+
+---
+
+### Map Null Safety — `map[key]` Returns `V?`
+
+`map[key]` returns `V?` because the key might not exist.
+
+```kotlin
+val map = mapOf(1 to "a", 2 to "b")
+
+val v = map[3]          // → null (V? = String?)
+val v = map[1]!!        // → "a" but crashes if key absent — avoid
+
+// Safe patterns:
+val v = map[key] ?: "default"           // elvis — default on miss
+val v = map.getOrDefault(key, "n/a")    // explicit default
+val v = map.getOrElse(key) { compute(key) }  // lazy default
+
+// Check before use:
+if (key in map) {
+    val v = map[key]!!   // safe here — key confirmed present
+}
+```
+
+**## Trap: two-argument `get` doesn't exist** — `map.get(key, default)` is NOT valid Kotlin. Use `getOrDefault`.
+
+---
+
+### Choosing the Right Collection — Decision Tree
+
+```
+Need ordered?
+├── No  → HashMap / HashSet        (O(1), less memory)
+├── Insertion order → LinkedHashMap / LinkedHashSet
+└── Sorted order   → TreeMap / TreeSet   (O(log n))
+
+Large numeric data?
+├── Yes → IntArray / LongArray / DoubleArray  (no boxing)
+└── No  → List<Int> is fine
+
+Know size upfront?
+└── Yes → HashMap(size) / HashSet(size)  (avoid rehash)
+```
+
+---
+
+### Memory Trick
+
+```
+HashMap internals:
+  hash(key) → bucket → chain → O(1) avg, O(n) worst
+  chain → tree (> 8 nodes) → O(log n) worst — Java 8+ auto
+  resize at 75% capacity → O(n) rehash all entries
+  pre-size: HashMap(n) avoids multiple rehashes for known n
+
+Interface types:
+  Map/Set/List = interfaces (no storage)
+  HashMap/TreeMap = implementations (storage)
+  Always declare as interface type for flexibility
+
+map[key] = V?  (not V — key may be absent)
+  ?: "default"         — safe
+  getOrDefault(k, v)   — safe
+  !!                   — throws if absent, avoid
+
+Sorted? → TreeMap/TreeSet O(log n)
+Order?  → LinkedHashMap/LinkedHashSet (Kotlin default for setOf/mapOf)
+Fast?   → HashMap/HashSet O(1)
+Nums?   → IntArray (no boxing) > List<Int> (always boxes)
+```
+
+### Self-Test
+
+1. Draw the internal structure of a `HashMap` with 5 entries. Where do collisions go? What happens when a chain exceeds 8 nodes (Java 8+)?
+2. `HashMap<Int,Int>` for 10,000 entries — how many resizes with default capacity? How do you avoid them?
+3. `map[key]` — what type does it return and why? Write three safe access patterns.
+4. You need to iterate map entries in sorted-key order. Which implementation? What's the lookup cost?
+5. `setOf(1,2,3)` — which Java class backs it? Why NOT `HashSet`?
+6. You have `nums: IntArray` — should you convert it to `List<Int>` for frequency counting? What's the cost?
+
+---
+
 ## Master Summary: Collections and Sequences
 
 ```
@@ -758,6 +958,14 @@ LinkedHashMap(accessOrder=true):
    groupBy  = eager lists (all elements in memory); groupingBy = one-pass aggregate
    getOrPut = NOT atomic (check + insert = two ops); fix: ConcurrentHashMap.computeIfAbsent
    LinkedHashMap(accessOrder=true) + removeEldestEntry = LRU cache (android.util.LruCache pattern)
+
+4. HASHMAP INTERNALS + PRE-SIZING + NULL SAFETY
+   hash(key) → bucket → chain (→ tree if >8 nodes, Java 8+) = O(1) avg
+   resize at 75% capacity → O(n) rehash; pre-size: HashMap(n) avoids repeated resizes
+   Interface types: Map/Set/List (declare as) vs HashMap/TreeMap (implement with)
+   Sorted keys → TreeMap O(log n); insertion order → LinkedHashMap; fast → HashMap O(1)
+   map[key] = V? (nullable — key may be absent); use ?: or getOrDefault, avoid !!
+   Numeric arrays: IntArray → int[] (no boxing); List<Int> → always boxes (generics erase to Object)
 ```
 
 ---
