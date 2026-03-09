@@ -33,7 +33,6 @@ CHAPTERS = [
     ("k00", f"{BASE}/Kotlin/Questions/00_jvm_mental_model.md",          "K00 — JVM Mental Model",             "Kotlin"),
     ("k01", f"{BASE}/Kotlin/Questions/01_type_system_foundations.md",   "K01 — Type System Foundations",      "Kotlin"),
     ("k02", f"{BASE}/Kotlin/Questions/02_classes_and_objects.md",       "K02 — Classes & Objects",            "Kotlin"),
-    ("k02b",f"{BASE}/Kotlin/Questions/02_5_initialization_mechanics.md","K02.5 — Initialization Mechanics",   "Kotlin"),
     ("k03", f"{BASE}/Kotlin/Questions/03_generics_and_variance.md",     "K03 — Generics & Variance",          "Kotlin"),
     ("k04", f"{BASE}/Kotlin/Questions/04_functions_lambdas_inlining.md","K04 — Functions, Lambdas & Inlining","Kotlin"),
     ("k05", f"{BASE}/Kotlin/Questions/05_properties_and_delegation.md", "K05 — Properties & Delegation",      "Kotlin"),
