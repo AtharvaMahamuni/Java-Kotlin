@@ -89,6 +89,88 @@
 
 ---
 
+## Direct Section Links
+
+### 00 — Why RxJava?
+[RX.00.1 The Callback Problem](00_why_rxjava.md#rx001--the-callback-problem) |
+[RX.00.2 What Reactive Means](00_why_rxjava.md#rx002--what-reactive-means) |
+[RX.00.3 RxJava vs Coroutines/Flow](00_why_rxjava.md#rx003--rxjava-vs-coroutinesflow-when-each-wins)
+
+### 01 — Observer Pattern
+[RX.01.1 Classic Observer](01_observer_pattern.md#rx011--classic-observer-pattern) |
+[RX.01.2 Observable→Observer Contract](01_observer_pattern.md#rx012--rxjavas-observable--observer-contract) |
+[RX.01.3 Three Signals In Depth](01_observer_pattern.md#rx013--the-three-signals-in-depth) |
+[RX.01.4 Interview Traps](01_observer_pattern.md#rx014--interview-traps)
+
+### 02 — Observable Types
+[RX.02.1 The Five Types](02_observable_types.md#rx021--the-five-types) |
+[RX.02.2 Cold vs Hot](02_observable_types.md#rx022--cold-vs-hot-observable) |
+[RX.02.3 Lazy Creation](02_observable_types.md#rx023--lazy-creation-nothing-happens-until-subscribe) |
+[RX.02.4 Interview Traps](02_observable_types.md#rx024--interview-traps)
+
+### 03 — Operators
+[RX.03.1 Category Table](03_operators.md#rx031--operator-categories) |
+[RX.03.2 Flattening Operators](03_operators.md#rx032--the-flattening-operators-most-confused-group) |
+[RX.03.3 Filter Operators](03_operators.md#rx033--filter-operators) |
+[RX.03.4 Combine Operators](03_operators.md#rx034--combine-operators) |
+[RX.03.5 Utility Operators](03_operators.md#rx035--utility-operators-side-effects) |
+[RX.03.6 Interview Traps](03_operators.md#rx036--interview-traps)
+
+### 04 — Schedulers
+[RX.04.1 Scheduler Types](04_schedulers.md#rx041--scheduler-types) |
+[RX.04.2 subscribeOn vs observeOn](04_schedulers.md#rx042--subscribeon-vs-observeon) |
+[RX.04.3 Multiple Calls](04_schedulers.md#rx043--multiple-subscribeon--observeon-calls) |
+[RX.04.4 Threading Reality](04_schedulers.md#rx044--threading-reality-what-actually-happens) |
+[RX.04.5 Interview Traps](04_schedulers.md#rx045--interview-traps)
+
+### 05 — Subjects
+[RX.05.1 What Is a Subject](05_subjects.md#rx051--what-is-a-subject) |
+[RX.05.2 The Four Subject Types](05_subjects.md#rx052--the-four-subject-types) |
+[RX.05.3 Subject vs Observable.create](05_subjects.md#rx053--when-to-use-subject-vs-observablecreate) |
+[RX.05.4 Interview Traps](05_subjects.md#rx054--interview-traps)
+
+### 06 — Error Handling
+[RX.06.1 Core Rule](06_error_handling.md#rx061--the-core-rule-onerror-is-terminal) |
+[RX.06.2 onErrorReturn](06_error_handling.md#rx062--onerrorreturn-fallback-value) |
+[RX.06.3 onErrorResumeNext](06_error_handling.md#rx063--onerrorresumenext-fallback-stream) |
+[RX.06.4 retry / retryWhen](06_error_handling.md#rx064--retry-and-retrywhen) |
+[RX.06.5 Decision Tree](06_error_handling.md#rx065--error-handling-decision-tree) |
+[RX.06.6 Interview Traps](06_error_handling.md#rx066--interview-traps)
+
+### 07 — Backpressure & Flowable
+[RX.07.1 The Problem](07_backpressure_flowable.md#rx071--the-backpressure-problem) |
+[RX.07.2 BackpressureStrategy](07_backpressure_flowable.md#rx072--backpressurestrategy-comparison) |
+[RX.07.3 Observable vs Flowable](07_backpressure_flowable.md#rx073--observable-vs-flowable-decision) |
+[RX.07.4 Creation Patterns](07_backpressure_flowable.md#rx074--flowable-creation-patterns) |
+[RX.07.5 Interview Traps](07_backpressure_flowable.md#rx075--interview-traps)
+
+### 08 — Disposables & Lifecycle
+[RX.08.1 Disposable Contract](08_disposables_lifecycle.md#rx081--the-disposable-contract) |
+[RX.08.2 CompositeDisposable Pattern](08_disposables_lifecycle.md#rx082--compositedisposable-the-viewmodel-pattern) |
+[RX.08.3 Memory Leak Anatomy](08_disposables_lifecycle.md#rx083--memory-leak-anatomy) |
+[RX.08.4 RxLifecycle vs Manual](08_disposables_lifecycle.md#rx084--rxlifecycle-vs-manual-dispose) |
+[RX.08.5 isDisposed Check](08_disposables_lifecycle.md#rx085--isdisposed-check-in-callbacks) |
+[RX.08.6 Interview Traps](08_disposables_lifecycle.md#rx086--interview-traps)
+
+### 09 — Android Patterns
+[RX.09.1 Retrofit Pattern](09_android_patterns.md#rx091--retrofit--rxjava-singleresponse-pattern) |
+[RX.09.2 Room Pattern](09_android_patterns.md#rx092--room--rxjava-flowablelistt-live-queries) |
+[RX.09.3 Search + debounce](09_android_patterns.md#rx093--search-with-debounce--switchmap) |
+[RX.09.4 ViewModel Template](09_android_patterns.md#rx094--viewmodel--compositedisposable-complete-template) |
+[RX.09.5 RxJava vs Flow Migration](09_android_patterns.md#rx095--rxjava-vs-flow-migration-decision-table)
+
+### 10 — Decision Maps
+[RX.10.1 Which Type?](10_decision_maps.md#rx101--which-observable-type) |
+[RX.10.2 Which Flattening Op?](10_decision_maps.md#rx102--which-flattening-operator) |
+[RX.10.3 Which Subject?](10_decision_maps.md#rx103--which-subject) |
+[RX.10.4 Which Scheduler?](10_decision_maps.md#rx104--which-scheduler) |
+[RX.10.5 Which Backpressure?](10_decision_maps.md#rx105--which-backpressure-strategy) |
+[RX.10.6 Error Decision](10_decision_maps.md#rx106--error-handling-decision) |
+[RX.10.7 Operator Cheat Sheet](10_decision_maps.md#rx107--one-page-operator-cheat-sheet) |
+[RX.10.8 Pattern Quick Reference](10_decision_maps.md#rx108--full-pattern-quick-reference)
+
+---
+
 ## Connection to Other Notes
 
 | RxJava Concept | Related File |

@@ -12,7 +12,7 @@ from datetime import datetime
 BASE   = "/home/atharva-mahamuni/Desktop/Java-Kotlin/Java-Kotlin/Code"
 OUTPUT = "/home/atharva-mahamuni/Desktop/Java-Kotlin/Java-Kotlin/StudyNotes.epub"
 BOOK_ID = str(uuid.uuid4())
-TITLE   = "Java · Kotlin · Android — Complete Interview Study Notes"
+TITLE   = "Java · Kotlin · Android · RxJava — Complete Interview Study Notes"
 AUTHOR  = "Study Notes"
 LANG    = "en"
 
@@ -56,6 +56,29 @@ CHAPTERS = [
     ("a03", f"{BASE}/Android/Questions/A3_architecture_patterns.md",    "A3 — Architecture Patterns",         "Android"),
     ("a04", f"{BASE}/Android/Questions/A4_offline_and_data.md",         "A4 — Offline & Data Layer",          "Android"),
     ("a05", f"{BASE}/Android/Questions/A5_jetpack_compose.md",          "A5 — Jetpack Compose",               "Android"),
+    # RxJava
+    ("rx_idx", f"{BASE}/RxJava/00_index.md",                           "RX — Index & Study Tracks",          "RxJava"),
+    ("rx00",   f"{BASE}/RxJava/00_why_rxjava.md",                      "RX00 — Why RxJava?",                 "RxJava"),
+    ("rx01",   f"{BASE}/RxJava/01_observer_pattern.md",                "RX01 — Observer Pattern",            "RxJava"),
+    ("rx02",   f"{BASE}/RxJava/02_observable_types.md",                "RX02 — Observable Types",            "RxJava"),
+    ("rx03",   f"{BASE}/RxJava/03_operators.md",                       "RX03 — Operators",                   "RxJava"),
+    ("rx04",   f"{BASE}/RxJava/04_schedulers.md",                      "RX04 — Schedulers",                  "RxJava"),
+    ("rx05",   f"{BASE}/RxJava/05_subjects.md",                        "RX05 — Subjects",                    "RxJava"),
+    ("rx06",   f"{BASE}/RxJava/06_error_handling.md",                  "RX06 — Error Handling",              "RxJava"),
+    ("rx07",   f"{BASE}/RxJava/07_backpressure_flowable.md",           "RX07 — Backpressure & Flowable",     "RxJava"),
+    ("rx08",   f"{BASE}/RxJava/08_disposables_lifecycle.md",           "RX08 — Disposables & Lifecycle",     "RxJava"),
+    ("rx09",   f"{BASE}/RxJava/09_android_patterns.md",                "RX09 — Android Patterns",            "RxJava"),
+    ("rx10",   f"{BASE}/RxJava/10_decision_maps.md",                   "RX10 — Decision Maps",               "RxJava"),
+    # Vocabulary
+    ("v_idx",  f"{BASE}/Vocabulary/00_index.md",                       "VOC — Index (185 Questions)",        "Vocabulary"),
+    ("v01",    f"{BASE}/Vocabulary/01_java_core_language.md",          "VOC01 — Java Core Language",         "Vocabulary"),
+    ("v02",    f"{BASE}/Vocabulary/02_jvm_architecture_memory.md",     "VOC02 — JVM Architecture & Memory",  "Vocabulary"),
+    ("v03",    f"{BASE}/Vocabulary/03_java_serialization_concurrency.md","VOC03 — Serialization & Concurrency","Vocabulary"),
+    ("v04",    f"{BASE}/Vocabulary/04_kotlin_basics_classes.md",       "VOC04 — Kotlin Basics & Classes",    "Vocabulary"),
+    ("v05",    f"{BASE}/Vocabulary/05_kotlin_collections_coroutines.md","VOC05 — Collections & Coroutines",  "Vocabulary"),
+    ("v06",    f"{BASE}/Vocabulary/06_android_framework_components.md","VOC06 — Android Framework",          "Vocabulary"),
+    ("v07",    f"{BASE}/Vocabulary/07_android_build_system.md",        "VOC07 — Android Build System",       "Vocabulary"),
+    ("v08",    f"{BASE}/Vocabulary/08_android_architecture_performance.md","VOC08 — Architecture & Performance","Vocabulary"),
 ]
 
 # ─── Markdown → XHTML Converter ───────────────────────────────────────────────
@@ -415,6 +438,8 @@ a:hover { text-decoration: underline; }
   margin-bottom: 0.5em;
 }
 .toc-subject { font-size: 1.3em; font-weight: bold; margin-top: 1.5em; color: #2255aa; border-bottom: 1px solid #2255aa; }
+.toc-subject-rxjava { font-size: 1.3em; font-weight: bold; margin-top: 1.5em; color: #7e5109; border-bottom: 1px solid #f5cba7; }
+.toc-subject-vocab  { font-size: 1.3em; font-weight: bold; margin-top: 1.5em; color: #6c3483; border-bottom: 1px solid #d7bde2; }
 .toc-item { margin: 0.3em 0 0.3em 1.5em; }
 '''
 
@@ -435,6 +460,8 @@ def make_cover():
     .java   { background: #e8f4fd; color: #1a5276; border: 1px solid #aed6f1; }
     .kotlin { background: #fef9e7; color: #7d6608; border: 1px solid #f9e79f; }
     .android{ background: #e9f7ef; color: #1e8449; border: 1px solid #a9dfbf; }
+    .rxjava { background: #fdebd0; color: #7e5109; border: 1px solid #f5cba7; }
+    .vocab  { background: #f4ecf7; color: #6c3483; border: 1px solid #d7bde2; }
   </style>
 </head>
 <body>
@@ -443,11 +470,15 @@ def make_cover():
     <p class="cover-sub">Complete Interview Study Notes</p>
     <br/>
     <span class="cover-badge java">10 Java Chapters</span>
-    <span class="cover-badge kotlin">20 Kotlin Chapters</span>
+    <span class="cover-badge kotlin">19 Kotlin Chapters</span>
     <span class="cover-badge android">6 Android Chapters</span>
+    <br/>
+    <span class="cover-badge rxjava">12 RxJava Chapters</span>
+    <span class="cover-badge vocab">9 Vocabulary Chapters</span>
     <br/><br/>
     <p style="color:#888; font-size:0.9em;">JVM internals &#183; Concurrency &#183; Coroutines &#183; Flow<br/>
-    Architecture &#183; Compose &#183; Performance &#183; Testing</p>
+    Architecture &#183; Compose &#183; Performance &#183; Testing<br/>
+    RxJava streams &#183; Operators &#183; Schedulers &#183; 185 Q&amp;A</p>
   </div>
 </body>
 </html>'''
@@ -471,7 +502,7 @@ def make_toc(chapters):
 </head>
 <body>
   <h1>Master Index</h1>
-  <p style="color:#555; font-size:0.9em;">36 chapters covering Java (J0–J9), Kotlin (K00–K18), and Android (A0–A5)</p>
+  <p style="color:#555; font-size:0.9em;">57 chapters covering Java (J0–J9), Kotlin (K00–K18), Android (A0–A5), RxJava (RX00–RX10), and Vocabulary (185 Q&amp;A)</p>
   {body}
 </body>
 </html>'''
